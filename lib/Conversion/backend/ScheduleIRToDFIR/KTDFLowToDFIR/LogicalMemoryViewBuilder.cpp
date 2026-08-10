@@ -163,13 +163,15 @@ mlir::AffineMap buildLinearizationMap(mlir::MLIRContext* ctx,
 }
 
 /// Phase 3b: replace Source A chains with get_logical_memory_view.
-/// Emits the view op and RAUWs the memref.cast result inline; does not
-/// populate `replacements` (Source A handles its own erasure).
+/// Emits the view op and RAUWs the chain tail inline; does not populate
+/// `replacements` (Source A handles its own erasure).
 ///
-/// A single ktdp.construct_memory_view may feed multiple memory_space_cast /
-/// reinterpret_cast chains (one per access-tile offset computed from the same
-/// base view). All such chains are replaced before the cmv is erased to avoid
-/// dangling uses.
+/// A single ktdp.construct_memory_view may feed multiple ViewLikeOpInterface
+/// chains (one per access-tile offset computed from the same base view). Each
+/// chain is walked generically via ViewLikeOpInterface; a reinterpret_cast is
+/// captured opportunistically for offset extraction if present (the MLIR
+/// canonicalizer may fold it away when its offset is zero). All chains are
+/// replaced before the cmv is erased to avoid dangling uses.
 mlir::LogicalResult replaceSourceAChains(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
@@ -203,33 +205,33 @@ mlir::LogicalResult replaceSourceAChains(
     auto plain_type =
         mlir::MemRefType::get(src_type.getShape(), src_type.getElementType());
 
-    // Collect all memory_space_cast users up front so we can iterate safely
+    // Collect all ViewLikeOpInterface users up front so we can iterate safely
     // while modifying the use-list.
-    llvm::SmallVector<mlir::memref::MemorySpaceCastOp> msc_users;
+    llvm::SmallVector<mlir::ViewLikeOpInterface> users;
     for (auto* user : cmv.getResult().getUsers()) {
-      if (auto msc = mlir::dyn_cast<mlir::memref::MemorySpaceCastOp>(user))
-        msc_users.push_back(msc);
+      if (auto viewLikeOp = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user))
+        users.push_back(viewLikeOp);
     }
-    if (msc_users.empty())
+    if (users.empty())
       return cmv.emitError(
-          "construct_memory_view: expected memory_space_cast user");
+          "construct_memory_view: no ViewLikeOpInterface users found");
 
-    for (auto msc : msc_users) {
-      // Find reinterpret_cast user.
+    for (auto viewLikeOp : users) {
+      // Walk forward through ViewLikeOpInterface ops, capturing rc if present
+      // for offset extraction.
       mlir::memref::ReinterpretCastOp rc;
-      for (auto* user : msc.getDest().getUsers()) {
-        rc = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(user);
-        if (rc) break;
-      }
-      if (!rc)
-        return msc.emitError(
-            "memory_space_cast: expected reinterpret_cast user");
-
-      // Find memref.cast user (optional - may not exist).
-      mlir::memref::CastOp mc;
-      for (auto* user : rc.getResult().getUsers()) {
-        mc = mlir::dyn_cast<mlir::memref::CastOp>(user);
-        if (mc) break;
+      mlir::Value cursor = viewLikeOp.getViewDest();
+      llvm::SmallVector<mlir::Operation*> intermediates;
+      intermediates.push_back(viewLikeOp.getOperation());
+      while (cursor.hasOneUse()) {
+        mlir::Operation* user = *cursor.getUsers().begin();
+        auto view = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user);
+        if (!view)
+          break;
+        else if (!rc)
+          rc = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(user);
+        intermediates.push_back(user);
+        cursor = view.getViewDest();
       }
 
       // Compute start_address = base_addr + reinterpret_offset, where the
@@ -237,8 +239,18 @@ mlir::LogicalResult replaceSourceAChains(
       // (e.g. a per-compute-tile offset). getConstifiedMixedOffset() yields an
       // IntegerAttr for a static offset or the SSA Value for a dynamic one.
       mlir::Value start_address = cmv.getOffset();
-      mlir::OpFoldResult reinterpret_offset = rc.getConstifiedMixedOffset();
-      builder.setInsertionPointAfter(rc);
+
+      mlir::OpFoldResult reinterpret_offset;
+      if (rc) {
+        reinterpret_offset = rc.getConstifiedMixedOffset();
+        builder.setInsertionPointAfter(rc);
+      } else {
+        // The canonicalizer only folds away a reinterpret_cast when its offset
+        // is 0, so the absence of rc guarantees the original offset was zero.
+        reinterpret_offset = mlir::OpFoldResult(builder.getIndexAttr(0));
+        builder.setInsertionPointAfter(cursor.getDefiningOp());
+      }
+
       if (auto offset_attr =
               mlir::dyn_cast<mlir::Attribute>(reinterpret_offset)) {
         // Static offset: add a constant, skipping the no-op zero case.
@@ -261,34 +273,31 @@ mlir::LogicalResult replaceSourceAChains(
       }
 
       // Get from_unit.
-      auto ms = getMemorySpaceAttr(msc.getDest().getType());
-      if (!ms) return msc.emitError("memory_space_cast: no memory space");
+      auto ms = getMemorySpaceAttr(cursor.getType());
+      if (!ms)
+        return cmv.emitError(
+            "construct_memory_view: no memory space found in chain");
       auto it = resolved_units.find(*ms);
       if (it == resolved_units.end())
         return cmv.emitError("no resolved unit for memory space");
       mlir::Value from_unit = it->second;
 
       // Emit get_logical_memory_view with plain result type (no memory space,
-      // no strided layout). The builder is already positioned after rc (and
-      // after any offset arithmetic just emitted), so no setInsertionPoint
-      // needed here.
+      // no strided layout). The builder is already positioned after the last
+      // chain op (and after any offset arithmetic just emitted), so no
+      // setInsertionPoint needed here.
       auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
           builder, cmv.getLoc(), plain_type, from_unit, start_address,
           mlir::AffineMapAttr::get(layout_map));
 
-      // Replace all uses of the old chain tail with the new view.
-      // The tail is either memref.cast (if present) or reinterpret_cast.
-      if (mc) {
-        mc.getDest().replaceAllUsesWith(view_op.getData());
-        mc.erase();
-      } else {
-        rc.getResult().replaceAllUsesWith(view_op.getData());
-      }
+      // cursor is the tail of the chain, replace all its users with the new
+      // view.
+      cursor.replaceAllUsesWith(view_op.getData());
 
-      // Erase the now-dead chain ops for this msc: reinterpret_cast and
-      // memory_space_cast. The cmv is erased once all chains are done.
-      rc.erase();
-      msc.erase();
+      // Erase the now-dead chain tail-to-head. msc, rc and any other
+      // intermediates are all in the vector; reverse order handles
+      // dependencies.
+      for (auto* op : llvm::reverse(intermediates)) op->erase();
     }
 
     // All chains sourced from this cmv have been replaced; erase it now.
