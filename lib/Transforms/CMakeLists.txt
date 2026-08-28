@@ -36,6 +36,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     DataflowSchedulerDialects::KTDFDialect
     DataflowSchedulerDialects::KTDFTransforms
     DataflowSchedulerDialects::KTDFArchAnalysis
+    DataflowSchedulerDialects::KTDFArchTransforms
     DataflowScheduler::KTDFTransforms
     DataflowScheduler::KTDFUtils
     DataflowScheduler::TransformUtils
