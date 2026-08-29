@@ -21,11 +21,18 @@
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/Support/DebugLog.h>
 #include <llvm/Support/LogicalResult.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/IR/OpDefinition.h>
 #include <mlir/IR/Operation.h>
 #include <mlir/IR/Visitors.h>
+#include <mlir/Interfaces/LoopLikeInterface.h>
 #include <mlir/Interfaces/SideEffectInterfaces.h>
+#include <mlir/Interfaces/ViewLikeInterface.h>
 #include <mlir/Support/WalkResult.h>
+#include <mlir/Transforms/LoopInvariantCodeMotionUtils.h>
+
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDF/Transforms/CodeMotion.h"
 
 #define DEBUG_TYPE "dataflow-scheduler-hoisting"
 
@@ -35,64 +42,42 @@ namespace {
 
 const auto kSkipRegions = mlir::OpPrintingFlags().skipRegions();
 
-}  // namespace
+/// Finds the topmost Region which dominates all uses held by @p op and its
+/// children.
+[[nodiscard]] auto findSSAEarliestDominator(mlir::Operation* op)
+    -> mlir::Region* {
+  // Walk upwards once to collect all ancestor regions.
+  llvm::SmallVector<mlir::Region*> parent_regions;
+  for (auto* parent = op->getParentRegion(); parent;
+       parent = parent->getParentRegion()) {
+    parent_regions.push_back(parent);
+  }
 
-auto scheduler::getSSADominators(mlir::Operation* op)
-    -> llvm::SmallVector<mlir::Region*> {
-  // Maintain a linear-scan set of dominating regions.
-  llvm::SmallVector<mlir::Region*> dominators;
-  const auto add_dominator = [&](mlir::Region* region) {
-    auto it = dominators.begin();
-    for (; it != dominators.end(); ++it) {
-      if (region->isAncestor(*it)) {
-        // The new region is the same as or above a known dominator, so no
-        // changes are necessary.
-        return;
-      }
-      if ((*it)->isAncestor(region)) {
-        // We've found a dominator above the new region, which means we can
-        // reduce our set of dominators.
-        break;
+  const auto visitor = [&](mlir::Operation* child) -> mlir::WalkResult {
+    for (auto operand : child->getOperands()) {
+      // Erase all regions above the one where the operand is defined.
+      if (const auto it = llvm::find(parent_regions, operand.getParentRegion());
+          it != parent_regions.end()) {
+        parent_regions.erase(std::next(it), parent_regions.end());
+        if (parent_regions.size() == 1) {
+          // The last remaining region (op->getParentRegion()) is the trivial
+          // dominator.
+          return mlir::WalkResult::interrupt();
+        }
       }
     }
 
-    if (it == dominators.end()) {
-      // We record a new, unrelated dominator.
-      dominators.push_back(region);
-      return;
+    if (child->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>()) {
+      return mlir::WalkResult::skip();
     }
-
-    // Replace the old dominator with the more narrow region.
-    *it = region;
-
-    // We know that all dominators preceeding it aren't descendants of region.
-    // But dominators after it might still be, in which case they are now
-    // obsolete and can be removed.
-    dominators.erase(std::remove_if(std::next(it), dominators.end(),
-                                    [&](mlir::Region* dominator) -> bool {
-                                      return dominator->isAncestor(region);
-                                    }),
-                     dominators.end());
+    return mlir::WalkResult::advance();
   };
+  op->walk<mlir::WalkOrder::PreOrder>(visitor);
 
-  op->walk<mlir::WalkOrder::PreOrder>(
-      [&](mlir::Operation* child) -> mlir::WalkResult {
-        // Record all sources of operands originating from outside the op.
-        for (auto operand : child->getOperands()) {
-          auto* const source = operand.getParentRegion();
-          if (!op->isAncestor(source->getParentOp())) {
-            add_dominator(source);
-          }
-        }
-
-        if (child->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>()) {
-          return mlir::WalkResult::skip();
-        }
-        return mlir::WalkResult::advance();
-      });
-
-  return dominators;
+  return parent_regions.back();
 }
+
+}  // namespace
 
 auto scheduler::findHoistingTarget(
     mlir::Operation* op,
@@ -104,9 +89,8 @@ auto scheduler::findHoistingTarget(
   }
 
   auto* result = op;
-
   const auto has_uses = !op->use_empty();
-  const auto dominators = getSSADominators(op);
+  auto* const ssa_dominator = findSSAEarliestDominator(op);
 
   while (auto* const target = result->getParentOp()) {
     if (has_uses &&
@@ -119,9 +103,8 @@ auto scheduler::findHoistingTarget(
       break;
     }
 
-    if (llvm::any_of(dominators, [&](mlir::Region* dominator) -> bool {
-          return !dominator->isAncestor(target->getParentRegion());
-        })) {
+    auto* const source = result->getParentRegion();
+    if (source == ssa_dominator) {
       // The uses would no longer be reached by the definitions if we hoist to
       // the parent region.
       LDBG() << "can't hoist " << mlir::OpWithFlags(op, kSkipRegions);
@@ -130,7 +113,7 @@ auto scheduler::findHoistingTarget(
       break;
     }
 
-    if (!should_hoist_out_of(result->getParentRegion())) {
+    if (!should_hoist_out_of(source)) {
       break;
     }
 
@@ -138,6 +121,44 @@ auto scheduler::findHoistingTarget(
   }
 
   return result;
+}
+
+auto scheduler::hoistInvariants(mlir::Operation* source) -> size_t {
+  if (auto iface = mlir::dyn_cast<mlir::LoopLikeOpInterface>(source); iface) {
+    // Hoist all pure operations without inter-iteration dependencies directly
+    // in front of the loop.
+    return mlir::moveLoopInvariantCode(iface);
+  }
+
+  if (auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(source); generic) {
+    // Hoist all pure operations without inter-iteration dependencies directly
+    // in front of the 'linalg.generic' operation.
+    return mlir::moveLoopInvariantCode(
+        {&generic.getBodyRegion()},
+        [&](mlir::Value value, mlir::Region* /*region*/) -> bool {
+          return value.getParentRegion()->isProperAncestor(
+              &generic.getBodyRegion());
+        },
+        [&](mlir::Operation* op, mlir::Region* /*region*/) -> bool {
+          return mlir::isPure(op);
+        },
+        [&](mlir::Operation* op, mlir::Region* /*region*/) {
+          op->moveBefore(generic);
+        });
+  }
+
+  if (auto pipeline = mlir::dyn_cast<mlir::ktdf::PipelineOp>(source);
+      pipeline) {
+    // Hoist all pure operations without dependencies directly in front of the
+    // 'ktdf.pipeline' operation.
+    return mlir::ktdf::hoistPipelineContents(
+        pipeline, [&](mlir::Operation* op) -> mlir::ktdf::PipelineAnchor {
+          return mlir::isPure(op) ? mlir::ktdf::PipelineAnchor::Parent
+                                  : mlir::ktdf::PipelineAnchor::Stage;
+        });
+  }
+
+  return 0;
 }
 
 namespace {
@@ -150,6 +171,14 @@ auto visitRestrictedUsersIn(
         visitor) -> llvm::LogicalResult {
   // Process just the users, since the location is restricted.
   for (auto* const user : restricted.getUsers()) {
+    if (llvm::isa<mlir::ViewLikeOpInterface>(user)) {
+      // There are potentially aliasing values.
+      LDBG() << "giving up on " << restricted;
+      LDBG() << "  potential alias via "
+             << mlir::OpWithFlags(user, kSkipRegions);
+      return llvm::failure();
+    }
+
     if (user->getParentRegion()->isProperAncestor(region)) {
       // User is outside the region.
       continue;
@@ -181,62 +210,6 @@ auto visitRestrictedUsersIn(
 }
 
 }  // namespace
-
-auto scheduler::findDominatingWritesIn(mlir::Value restricted,
-                                       mlir::Region* region,
-                                       mlir::DominanceInfo& dominance)
-    -> std::optional<llvm::SmallVector<mlir::Operation*>> {
-  // Maintain a linear-scan set of candidates.
-  llvm::SmallVector<mlir::Operation*> candidates;
-  const auto add_candidate = [&](mlir::Operation* op) {
-    auto it = candidates.begin();
-    for (; it != candidates.end(); ++it) {
-      if (dominance.dominates(*it, op)) {
-        // An existing candidate is the same as or dominates op, so no change
-        // is necessary.
-        return;
-      }
-      if (dominance.dominates(op, *it)) {
-        // We've found a candidate that is dominated by the new op, which means
-        // we can reduce our set of candidates.
-        break;
-      }
-    }
-
-    if (it == candidates.end()) {
-      // We record a new, unrelated candidate.
-      candidates.push_back(op);
-      return;
-    }
-
-    // Replace the old candidate with its dominator.
-    *it = op;
-
-    // We know that all candidates preceeding it aren't dominated by op. But
-    // candidates after it might still be, in which case they are now obsolete
-    // and can be removed.
-    candidates.erase(std::remove_if(std::next(it), candidates.end(),
-                                    [&](mlir::Operation* candidate) -> bool {
-                                      return dominance.dominates(op, candidate);
-                                    }),
-                     candidates.end());
-  };
-
-  // Visit all users with write effects.
-  const auto visit_effects =
-      [&](mlir::Operation* user,
-          mlir::ArrayRef<mlir::MemoryEffects::EffectInstance> /*effects*/)
-      -> llvm::LogicalResult {
-    add_candidate(user);
-    return llvm::success();
-  };
-  if (failed(visitRestrictedUsersIn<mlir::MemoryEffects::Write>(
-          restricted, region, visit_effects))) {
-    return std::nullopt;
-  }
-
-  return candidates;
-}
 
 auto scheduler::findSingleWriteIn(mlir::Value restricted, mlir::Region* region)
     -> mlir::Operation* {

@@ -29,6 +29,7 @@
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   hoist-invariants
+// CHECK-NEXT:   hoist-constant-storage
 // CHECK-NEXT:   )
 // CHECK-NEXT:   )
 // CHECK-NEXT:   path-expansion

@@ -421,18 +421,95 @@ def ApplyDevicePatternsPass : Pass<"apply-device-patterns", "mlir::func::FuncOp"
 def HoistInvariantsPass : Pass<"hoist-invariants", "mlir::func::FuncOp"> {
   let summary = "Hoist invariants out of pipelines and loops";
   let description = [{
+    Given a pure operation that is invariant under the pipeline or loop 
+    structure it is contained in, hoists the invariant to the surrounding scope.
 
+    Example:
+    ```mlir
+    scf.for ... {
+      ktdf.pipeline {
+        ktdf.stage {
+          linalg.generic ... {
+          ^bb0(%arg0: i32):
+            %cst0 = arith.constant 0 : i32
+            arith.addi %cst0, %arg0 : i32
+          }
+        }
+      }
+    }
+    ```
+
+    Is transformed into:
+    ```mlir
+    %cst0 = arith.constant 0 : i32
+    scf.for ... {
+      ktdf.pipeline {
+        ktdf.stage {
+          linalg.generic ... {
+          ^bb0(%arg0: i32):
+            arith.addi %cst0, %arg0 : i32
+          }
+        }
+      }
+    }
+    ```
   }];
-
-  let dependentDialects = [
-    "mlir::ktdf::KTDFDialect",
-    "mlir::linalg::LinalgDialect",
-    "mlir::scf::SCFDialect"
-  ];
 
   let statistics = [
     Statistic<"num_hoisted", "num-hoisted", "Number of hoisted operations">,
-    Statistic<"invariant_writes", "invariant-writes", "Number of hoisted invariant writes">
+  ];
+}
+
+def HoistConstantStoragePass : Pass<"hoist-constant-storage", "mlir::func::FuncOp"> {
+  let summary = "Hoists memory allocations with constant contents";
+  let description = [{
+    Given an allocation that is used to hold a constant value, hoists the 
+    allocation and its write to the surrounding scope. If the write is in a
+    pipeline, it will be hoisted into a sub-pipeline.
+
+    Example:
+    ```mlir
+    scf.for ... {
+      ktdf.pipeline {
+        ktdf.stage {
+          %cst = arith.constant 1.0 : f16
+          %alloc = memref.alloc() : memref<f16, "UNIT">
+          memref.store %cst, %alloc : memref<f16, "UNIT">
+          linalg.generic ...
+            ins(%alloc: memref<f16, "UNIT">)
+            outs(...)
+        } {applicable_units = ["UNIT"]}
+      }
+    }
+    ```
+
+    Is transformed into:
+    ```mlir
+    %cst = arith.constant 1.0 : f16
+    %alloc = memref.alloc() : memref<f16, "UNIT">
+    ktdf.pipeline {
+      ktdf.stage {
+        memref.store %cst, %alloc : memref<f16, "UNIT">
+      } {applicable_units = ["UNIT"]}
+    }
+    scf.for ... {
+      ktdf.pipeline {
+        ktdf.stage {
+          linalg.generic ...
+            ins(%alloc: memref<f16, "UNIT">)
+            outs(...)
+        } {applicable_units = ["UNIT"]}
+      }
+    }
+    ```
+  }];
+
+  let dependentDialects = [
+    "mlir::ktdf::KTDFDialect"
+  ];
+
+  let statistics = [
+    Statistic<"num_hoisted", "num-hoisted", "Number of hoisted constant storage allocations">,
   ];
 }
 

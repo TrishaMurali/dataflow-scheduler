@@ -20,17 +20,9 @@
 #define DATAFLOW_SCHEDULER_TRANSFORMS_UTILS_HOISTING_H_
 
 #include <llvm/ADT/SmallVector.h>
-#include <mlir/IR/Dominance.h>
 #include <mlir/IR/Operation.h>
 
 namespace scheduler {
-
-/// Obtains the smallest set of SSA dominators of @p op .
-///
-/// A region SSA dominates @p op if it or one of its parents defines a value
-/// used by @p op or any of its descendants.
-[[nodiscard]]
-auto getSSADominators(mlir::Operation* op) -> llvm::SmallVector<mlir::Region*>;
 
 /// Finds the topmost operation to which @p op can be hoisted according to SSA.
 [[nodiscard]]
@@ -39,15 +31,12 @@ auto findHoistingTarget(
     llvm::function_ref<bool(mlir::Region*)> should_hoist_out_of)
     -> mlir::Operation*;
 
-/// Finds the smallest set of dominating writes to @p restricted in @p region .
+/// Hoists pure operations out of @p source .
 ///
-/// The location @p restricted is assumed to not be aliased by any other value.
-/// If the result is present, it indicates the smallest set of ops writing to
-/// @p restricgted that together dominate all others.
-[[nodiscard]]
-auto findDominatingWritesIn(mlir::Value restricted, mlir::Region* region,
-                            mlir::DominanceInfo& dominance)
-    -> std::optional<llvm::SmallVector<mlir::Operation*>>;
+/// Allows hoisting from loops, 'ktdf.pipeline' and 'linalg.generic' operations.
+///
+/// @return Number of hoisted operations.
+auto hoistInvariants(mlir::Operation* source) -> size_t;
 
 /// Finds the single write to @p restricted in @p region .
 ///
