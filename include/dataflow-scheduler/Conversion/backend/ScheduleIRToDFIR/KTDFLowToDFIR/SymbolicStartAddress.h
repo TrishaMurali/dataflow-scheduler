@@ -295,6 +295,25 @@ struct Displacement {
 mlir::FailureOr<Displacement> takeDisplacementApart(
     mlir::OpFoldResult offset, mlir::dataflow::ProgramUnitOp pu);
 
+/// Returns the symbol id standing for \p value and declares in the entry block
+/// of \p program what that symbol is.
+///
+/// A register filled with a runtime scalar uses a symbol the way a start
+/// address does: the DataflowIR carries the id, and whatever resolves the
+/// symbols writes the value in. The arithmetic computing the value is rebuilt
+/// in the entry block
+/// with one symbol per step, since a definition is a single operator over
+/// symbols and constants.
+///
+/// If \p value is one of the run's inputs, that input's own symbol is returned
+/// and nothing is declared.
+///
+/// Fails if \p value is not an expression over exactly one input, or if a step
+/// of it cannot be written as a definition.
+mlir::FailureOr<int64_t> declareScalarSymbol(mlir::Value value,
+                                             mlir::func::FuncOp program,
+                                             SymbolAllocator& symbols);
+
 /// Emits the start address \p taken describes, displaced by \p displacement and
 /// divided by \p word_size, at \p builder's insertion point, and returns what
 /// the view should read.

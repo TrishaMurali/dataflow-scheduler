@@ -665,3 +665,101 @@ mlir::Value scheduler::createSymbolicStartAddress(mlir::OpBuilder& builder,
   symbol->setAttr("SymbolId", builder.getI64IntegerAttr(symbol_id));
   return symbol.getResult();
 }
+
+//===----------------------------------------------------------------------===//
+// Symbols for runtime scalars
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Gets \p op as one step of an expression: its operator, and the constant each
+/// of its operands carries.
+ExpressionStep stepOf(mlir::Operation* op) {
+  ExpressionStep step{op->getName(), {}};
+  for (mlir::Value operand : op->getOperands())
+    step.operands.push_back(mlir::getConstantIntValue(operand));
+  return step;
+}
+
+/// Gets the value \p id is already declared on in \p entry, null if it is not.
+mlir::Value declaredIn(mlir::Block& entry, int64_t id) {
+  for (auto declaration : entry.getOps<mlir::symbol::CreateIdOp>())
+    if (declaration.getSymbolId() == id) return declaration.getInput();
+  return nullptr;
+}
+
+/// Collects into \p steps the operations computing \p value, operands before
+/// results, and sets \p root to the input they start from.
+///
+/// Fails if there is no single input to start from, or if a step cannot be
+/// written as a definition.
+mlir::LogicalResult collectSteps(mlir::Value value,
+                                 const SymbolAllocator& symbols,
+                                 mlir::Value& root,
+                                 llvm::SmallVectorImpl<mlir::Operation*>& steps,
+                                 llvm::DenseSet<mlir::Operation*>& seen) {
+  if (symbols.inputSymbolIdFor(value).has_value()) {
+    if (root && root != value) return mlir::failure();
+    root = value;
+    return mlir::success();
+  }
+
+  mlir::Operation* op = value.getDefiningOp();
+  if (!op) return mlir::failure();
+  if (op->getNumResults() != 1 || op->getNumRegions() != 0 ||
+      !mlir::isMemoryEffectFree(op)) {
+    return mlir::failure();
+  }
+  if (!seen.insert(op).second) return mlir::success();
+
+  for (mlir::Value operand : op->getOperands())
+    if (mlir::failed(collectSteps(operand, symbols, root, steps, seen)))
+      return mlir::failure();
+
+  steps.push_back(op);
+  return mlir::success();
+}
+
+}  // namespace
+
+mlir::FailureOr<int64_t> scheduler::declareScalarSymbol(
+    mlir::Value value, mlir::func::FuncOp program, SymbolAllocator& symbols) {
+  mlir::Value root;
+  llvm::SmallVector<mlir::Operation*> steps;
+  llvm::DenseSet<mlir::Operation*> seen;
+  if (mlir::failed(collectSteps(value, symbols, root, steps, seen)) || !root) {
+    LDBG(1) << "  " << value << " is not an expression over one input";
+    return mlir::failure();
+  }
+
+  int64_t id = *symbols.inputSymbolIdFor(root);
+  if (steps.empty()) return id;
+
+  // The arithmetic is rebuilt next to the program: the DataflowIR handed to
+  // code generation must not read a value only a caller could supply.
+  mlir::Block& entry = program.getBody().front();
+  mlir::OpBuilder builder(program.getContext());
+  builder.setInsertionPoint(entry.getTerminator());
+
+  mlir::IRMapping mapping;
+  DerivedKey key;
+  key.root = root;
+  for (mlir::Operation* step : steps) {
+    mlir::Operation* clone = builder.clone(*step, mapping);
+    if (clone->hasTrait<mlir::OpTrait::ConstantLike>()) continue;
+
+    key.expression.push_back(stepOf(step));
+    id = symbols.derivedIdFor(key).first;
+
+    // One declaration per id, since two would say the symbol is two different
+    // things.
+    if (mlir::Value declared = declaredIn(entry, id)) {
+      mapping.map(step->getResult(0), declared);
+      clone->erase();
+      continue;
+    }
+    mlir::symbol::CreateIdOp::create(builder, step->getLoc(),
+                                     clone->getResult(0), id);
+  }
+  return id;
+}

@@ -533,8 +533,11 @@ struct LowerLinalgGenericPattern
 struct LowerLinalgFillPattern
     : public mlir::OpRewritePattern<mlir::linalg::FillOp> {
   LowerLinalgFillPattern(mlir::MLIRContext* context,
-                         arch_view::ResourceKinds& resource_kinds)
-      : OpRewritePattern(context), resource_kinds_(resource_kinds) {}
+                         arch_view::ResourceKinds& resource_kinds,
+                         scheduler::SymbolAllocator& symbols)
+      : OpRewritePattern(context),
+        resource_kinds_(resource_kinds),
+        symbols_(symbols) {}
 
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::FillOp fill_op,
@@ -544,26 +547,46 @@ struct LowerLinalgFillPattern
       return rewriter.notifyMatchFailure(fill_op,
                                          "must have exactly one operand");
     }
-    auto* const fill_def = fill_op.getInputs()[0].getDefiningOp();
+    const mlir::Value filled = fill_op.getInputs()[0];
+    auto* const fill_def = filled.getDefiningOp();
     mlir::Attribute value;
-    if (!fill_def || !mlir::m_Constant(&value).match(fill_def)) {
-      return rewriter.notifyMatchFailure(fill_op,
-                                         "fill value must be a constant");
+    const bool is_constant =
+        fill_def && mlir::m_Constant(&value).match(fill_def);
+
+    // A fill value the compiler does not know becomes a symbol: the bitstream
+    // carries the id, and whatever resolves the symbols writes the value in.
+    // What the symbol is is declared next to the program.
+    int64_t symbol_id = 0;
+    if (!is_constant) {
+      auto program = fill_op->getParentOfType<mlir::func::FuncOp>();
+      if (!program) {
+        return rewriter.notifyMatchFailure(fill_op, "fill is in no function");
+      }
+      const auto declared =
+          scheduler::declareScalarSymbol(filled, program, symbols_);
+      if (mlir::failed(declared)) {
+        return rewriter.notifyMatchFailure(
+            fill_op, "fill value is neither a constant nor a symbol");
+      }
+      symbol_id = *declared;
     }
+
     llvm::APInt fill_bits;
-    if (const auto attr = mlir::dyn_cast<mlir::FloatAttr>(value)) {
-      fill_bits = attr.getValue().bitcastToAPInt();
-    } else if (const auto attr = mlir::dyn_cast<mlir::IntegerAttr>(value)) {
-      fill_bits = attr.getValue();
-    } else {
-      return rewriter.notifyMatchFailure(fill_op,
-                                         "fill value must be int or float");
+    if (is_constant) {
+      if (const auto attr = mlir::dyn_cast<mlir::FloatAttr>(value)) {
+        fill_bits = attr.getValue().bitcastToAPInt();
+      } else if (const auto attr = mlir::dyn_cast<mlir::IntegerAttr>(value)) {
+        fill_bits = attr.getValue();
+      } else {
+        return rewriter.notifyMatchFailure(fill_op,
+                                           "fill value must be int or float");
+      }
+      if (fill_bits.getBitWidth() > 64) {
+        return rewriter.notifyMatchFailure(
+            fill_op, "fill value must not exceed 64 bits");
+      }
+      fill_bits = fill_bits.zext(64U);
     }
-    if (fill_bits.getBitWidth() > 64) {
-      return rewriter.notifyMatchFailure(fill_op,
-                                         "fill value must not exceed 64 bits");
-    }
-    fill_bits = fill_bits.zext(64U);
 
     // Derive output vector type from the output operand (memref or tensor).
     mlir::Value out_operand = fill_op.getOutputs()[0];
@@ -583,9 +606,14 @@ struct LowerLinalgFillPattern
     // Step 1: vectorchain.constant_bitstream {value = [0x0]} : vector<1xT>
     mlir::VectorType seed_type = mlir::VectorType::get({1}, elem_type);
     mlir::ArrayAttr value_attr = rewriter.getArrayAttr(
-        {mlir::IntegerAttr::get(rewriter.getI64Type(), fill_bits)});
+        {is_constant
+             ? mlir::IntegerAttr::get(rewriter.getI64Type(), fill_bits)
+             : mlir::IntegerAttr::get(rewriter.getI64Type(), symbol_id)});
     auto bitstream = mlir::vectorchain::ConstantBitstreamOp::create(
         rewriter, loc, seed_type, value_attr);
+    if (!is_constant) {
+      bitstream->setAttr("is_symbol", rewriter.getBoolAttr(true));
+    }
 
     // Step 2: vectorchain.shuffle — splat to vector<NxT>
     mlir::ArrayAttr indices_attr = rewriter.getArrayAttr(
@@ -611,14 +639,16 @@ struct LowerLinalgFillPattern
 
  private:
   arch_view::ResourceKinds& resource_kinds_;
+  scheduler::SymbolAllocator& symbols_;
 };
 
 }  // namespace
 
 void scheduler::populateLinalgLoweringPatterns(
-    mlir::RewritePatternSet& patterns,
-    arch_view::ResourceKinds& resource_kinds) {
+    mlir::RewritePatternSet& patterns, arch_view::ResourceKinds& resource_kinds,
+    SymbolAllocator& symbols) {
   patterns.add<LowerLinalgGenericPattern>(patterns.getContext(),
                                           resource_kinds);
-  patterns.add<LowerLinalgFillPattern>(patterns.getContext(), resource_kinds);
+  patterns.add<LowerLinalgFillPattern>(patterns.getContext(), resource_kinds,
+                                       symbols);
 }

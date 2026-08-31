@@ -841,11 +841,11 @@ struct LowerOpaquePattern : mlir::OpRewritePattern<mlir::ktdf::OpaqueOp> {
 mlir::LogicalResult scheduler::runOperationLowerings(
     mlir::func::FuncOp func,
     const scheduler::SchedulerExtContext& scheduler_ctx,
-    const ResourceToUnits& components,
-    arch_view::ResourceKinds& resource_kinds) {
+    const ResourceToUnits& components, arch_view::ResourceKinds& resource_kinds,
+    SymbolAllocator& symbols) {
   // Lower linalg.generic compute operations and FIFO operations
   mlir::RewritePatternSet patterns(func.getContext());
-  populateLinalgLoweringPatterns(patterns, resource_kinds);
+  populateLinalgLoweringPatterns(patterns, resource_kinds, symbols);
   patterns.add<LowerMemRefCopyFromFifoPattern>(func.getContext(),
                                                resource_kinds);
   patterns.add<LowerReadFromFifoPattern>(func.getContext(), resource_kinds,

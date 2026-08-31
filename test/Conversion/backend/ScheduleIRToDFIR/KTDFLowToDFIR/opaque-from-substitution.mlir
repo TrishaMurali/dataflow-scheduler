@@ -10,7 +10,7 @@
 
 // RUN: dataflow-scheduler-opt %s -pass-pipeline="builtin.module( \
 // RUN:   func.func(ktdfarch-apply-patterns{groups=pre_scheduling}), \
-// RUN:   hoist-registers, \
+// RUN:   materialize-registers, \
 // RUN:   address-assignment, \
 // RUN:   ktdflowering-to-dfir)" | FileCheck %s
 

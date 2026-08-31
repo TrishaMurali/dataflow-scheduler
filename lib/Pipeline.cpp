@@ -60,12 +60,14 @@ void scheduler::buildSchedulerOptimizationPipeline(
   //     constraints in the IR.
   //  -> Apply patterns that introduce or rewrite mapping constraints or
   //     interact with 'ktdf'.
-  pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
-      createApplyDevicePatternsPass({"pre_scheduling"}));
-
+  {
+    auto& nested = pm.nest<mlir::ModuleOp>().nest<mlir::func::FuncOp>();
+    nested.addPass(createApplyDevicePatternsPass({"pre_scheduling"}));
+    nested.addPass(createHoistInvariantsPass());
+  }
   // The patterns above rewrite inside a generic's body and can only insert
   // where they matched, so the registers they need land there.
-  pm.addPass(createHoistRegistersPass());
+  pm.addPass(createMaterializeRegistersPass());
   {
     auto& nested = pm.nest<mlir::ModuleOp>().nest<mlir::func::FuncOp>();
     nested.addPass(createHoistInvariantsPass());

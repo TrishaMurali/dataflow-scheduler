@@ -20,13 +20,15 @@
 #define DATAFLOW_SCHEDULER_CONVERSION_KTDFLOWTODFIR_LINALGLOWERING_H_
 
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/SymbolicStartAddress.h"
 #include "mlir/IR/PatternMatch.h"
 
 namespace scheduler {
 
 /// Register LowerLinalgGenericPattern into the given pattern set.
 void populateLinalgLoweringPatterns(mlir::RewritePatternSet& patterns,
-                                    arch_view::ResourceKinds& resource_kinds);
+                                    arch_view::ResourceKinds& resource_kinds,
+                                    SymbolAllocator& symbols);
 
 }  // namespace scheduler
 

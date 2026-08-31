@@ -16,7 +16,7 @@
 // RUN:   -ktdfarch-apply-patterns=groups=pre_scheduling \
 // RUN:   | FileCheck %s --check-prefix=SUBST
 // RUN: dataflow-scheduler-opt %s \
-// RUN:   -ktdfarch-apply-patterns=groups=pre_scheduling -hoist-registers \
+// RUN:   -ktdfarch-apply-patterns=groups=pre_scheduling -materialize-registers \
 // RUN:   | FileCheck %s
 
 // The substitution on its own leaves the registers in the body, one element
@@ -33,7 +33,7 @@
 // SUBST:        %[[E:.*]] = memref.load %[[OUT]][] : memref<f16, "SFU_REG">
 // SUBST-NEXT:   linalg.yield %[[E]] : f16
 
-// Hoisted, every register stands in front of the generic and holds 64 lanes of
+// Made real, every register stands in front of the generic and holds 64 lanes of
 // f16: the tile the generic covers, and what the device gives that element. The
 // constant is filled across the whole of its own.
 // CHECK:      %[[C0:.*]] = arith.constant {ktdf_arch.maps_to = "SFU_REG"} 1.000000e+00 : f16

@@ -273,7 +273,37 @@ void ComputeGroupExtractionPass::buildAccessTileEqClasses(
   }
 }
 
-// Helper function to recursively collect iter args from operand dependencies
+// Gets the values \p op reads and does not define: its operands, and whatever
+// its regions read from outside them. A compute op can read a scalar in its
+// body rather than through its operands, as the base and the stride of an
+// address computation are read, and the group depends on that as much as on an
+// operand.
+static auto valuesReadFromAbove(mlir::Operation* op)
+    -> llvm::SmallVector<mlir::Value> {
+  // Ordered, because the order they are found in is the order they become
+  // parameters of the extracted function in.
+  llvm::SmallVector<mlir::Value> used;
+  llvm::DenseSet<mlir::Value> seen;
+
+  op->walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation* child) {
+    for (mlir::Value operand : child->getOperands()) {
+      if (!operand.getParentRegion()->isAncestor(op->getParentRegion())) {
+        continue;
+      }
+      if (seen.insert(operand).second) used.push_back(operand);
+    }
+
+    // Nothing inside an op isolated from above reads a value from out here.
+    if (child->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>()) {
+      return mlir::WalkResult::skip();
+    }
+    return mlir::WalkResult::advance();
+  });
+
+  return used;
+}
+
+// Helper function to recursively collect iter args from what an op reads
 static void collectArgsUsed(mlir::Value val,
                             llvm::DenseSet<mlir::Operation*>& visited,
                             llvm::SmallVectorImpl<mlir::Value>& args,
@@ -294,9 +324,9 @@ static void collectArgsUsed(mlir::Value val,
   if (visited.count(op)) return;
   visited.insert(op);
 
-  // Recursively collect from operands
-  for (mlir::Value operand : op->getOperands()) {
-    collectArgsUsed(operand, visited, args, args_visited);
+  // Recursively collect from what it reads
+  for (mlir::Value read : valuesReadFromAbove(op)) {
+    collectArgsUsed(read, visited, args, args_visited);
   }
 }
 
@@ -314,9 +344,9 @@ static void materializeDependency(mlir::Value val, mlir::IRMapping& mapper,
 
   mlir::Operation* op = val.getDefiningOp();
 
-  // Ensure all operands of the ancestor are cloned first
-  for (mlir::Value operand : op->getOperands()) {
-    materializeDependency(operand, mapper, builder);
+  // Ensure everything the ancestor reads is cloned first
+  for (mlir::Value read : valuesReadFromAbove(op)) {
+    materializeDependency(read, mapper, builder);
   }
 
   // Now clone the ancestor itself into the new block
@@ -355,8 +385,8 @@ void ComputeGroupExtractionPass::extractComputeGroup(
   llvm::DenseSet<mlir::Operation*> visited;
   llvm::DenseSet<mlir::Value> args_visited;
   for (mlir::Operation* op : ops_to_move) {
-    for (mlir::Value operand : op->getOperands()) {
-      collectArgsUsed(operand, visited, args, args_visited);
+    for (mlir::Value used : valuesReadFromAbove(op)) {
+      collectArgsUsed(used, visited, args, args_visited);
     }
   }
 
@@ -409,8 +439,8 @@ void ComputeGroupExtractionPass::extractComputeGroup(
   // Step 1: Materialize all dependencies for the entire range.
   // (e.g. arith.constants, construct_memory_views, construct_access_tiles)
   for (mlir::Operation* op : ops_to_move) {
-    for (mlir::Value operand : op->getOperands()) {
-      materializeDependency(operand, mapper, builder);
+    for (mlir::Value used : valuesReadFromAbove(op)) {
+      materializeDependency(used, mapper, builder);
     }
   }
 

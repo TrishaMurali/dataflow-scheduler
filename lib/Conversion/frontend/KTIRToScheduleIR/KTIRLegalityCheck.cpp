@@ -61,6 +61,12 @@ namespace {
     return true;
   }
 
+  // Accept an index cast. A kernel holds a runtime scalar as index and casts it
+  // where it is used -- the base and the stride of an address computation, say.
+  if (mlir::isa<mlir::arith::IndexCastUIOp>(op)) {
+    return true;
+  }
+
   // Reject everything else.
   return false;
 }

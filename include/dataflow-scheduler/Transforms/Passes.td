@@ -347,18 +347,20 @@ def EnsureDeviceDeclarationPass
   ];
 }
 
-def HoistRegistersPass : Pass<"hoist-registers", "mlir::ModuleOp"> {
-  let summary = "Move the registers a generic body uses in front of it";
+def MaterializeRegistersPass : Pass<"materialize-registers", "mlir::ModuleOp"> {
+  let summary = "Make the registers a generic body uses real, in front of it";
   let description = [{
-    Visits every nested `linalg.generic` and attempts to hoist out registers
-    (in the form of materialized `memref.alloc` and non-materialized 
-    `arith.constant` with `ktdf_arch.maps_to` attributes).
-    
-    Hoisting requires the cardinality of the `linalg.generic` iteration domain
-    to be statically known, and all consumers of the registers to be either
-    `memref.load`, `memref.store` or `ktdf.opaque`. Hoisted register sizes are
+    Visits every nested `linalg.generic` and makes the registers it uses real
+    in front of it: an allocation the body carries, and an `arith.constant`
+    with a `ktdf_arch.maps_to` attribute, which needs an allocation and a fill
+    of its own.
+
+    This requires the cardinality of the `linalg.generic` iteration domain to
+    be statically known, and all consumers of the registers to be either
+    `memref.load`, `memref.store` or `ktdf.opaque`. Register sizes are
     increased to match the iteration domain, but scalar users remain fixed to
-    the first element of the allocated segment.
+    the first element of the allocated segment. A store of a value the body
+    does not compute per element fills every element instead.
 
     Example:
     ```mlir

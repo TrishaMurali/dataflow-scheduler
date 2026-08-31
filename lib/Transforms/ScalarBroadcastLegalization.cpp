@@ -404,6 +404,47 @@ static mlir::Value widenMemrefAlloc(mlir::Value private_result,
   return private_result;
 }
 
+/// Widens the slot \p private_result hands out to \p new_num_elements, and
+/// returns it.
+///
+/// A slot's width is part of its type, carried by the allocation it comes from
+/// and by the result the pipeline hands it out as, so both are re-typed. What
+/// arrives is still one element -- the transfer splats it -- but the read that
+/// takes it is the compute's width, and a read has to match the slot it reads.
+static mlir::Value widenFifoSlot(mlir::Value private_result,
+                                 int64_t new_num_elements,
+                                 mlir::OpBuilder& builder) {
+  auto priv_op = private_result.getDefiningOp<mlir::ktdf::PrivateOp>();
+  if (!priv_op) return private_result;
+
+  const auto result_idx =
+      mlir::cast<mlir::OpResult>(private_result).getResultNumber();
+  mlir::ktdf::PrivateYieldOp yield = priv_op.getYieldOp();
+  auto allocated = mlir::dyn_cast<mlir::OpResult>(yield.getOperand(result_idx));
+  if (!allocated) return private_result;
+  auto alloc_op = allocated.getDefiningOp<mlir::ktdf::FifoAllocateOp>();
+  if (!alloc_op) return private_result;
+
+  auto slot = mlir::cast<mlir::ktdf::FifoSlotType>(allocated.getType());
+  if (slot.getNumElements() == new_num_elements) return private_result;
+  auto wider = mlir::ktdf::FifoSlotType::get(slot.getContext(), slot.getSrc(),
+                                             slot.getDest(), new_num_elements,
+                                             slot.getElementType());
+
+  // The allocation again, that slot wider. Only the one result changes type;
+  // the others are handed on as they were.
+  llvm::SmallVector<mlir::Type> slots(alloc_op->getResultTypes());
+  slots[allocated.getResultNumber()] = wider;
+  builder.setInsertionPoint(alloc_op);
+  auto new_alloc = mlir::ktdf::FifoAllocateOp::create(
+      builder, alloc_op.getLoc(), slots, alloc_op.getOperands());
+  alloc_op->replaceAllUsesWith(new_alloc->getResults());
+  alloc_op.erase();
+
+  private_result.setType(wider);
+  return private_result;
+}
+
 /// Apply all mutations for one BroadcastLegalizationSite.
 static void applyTransformation(const BroadcastLegalizationSite& site,
                                 mlir::OpBuilder& builder) {
@@ -441,8 +482,19 @@ static void applyTransformation(const BroadcastLegalizationSite& site,
             llvm::ArrayRef<int64_t>(new_src_static));
       }
     } else {
-      // FIFO hop: mark with transfer_mode="splat".
+      // FIFO hop: mark with transfer_mode="splat", widen the slot it splats
+      // into, and say so on the transfer. The source stays the one element that
+      // arrives; it is the destination that is filled.
       hop.transfer->setAttr("transfer_mode", builder.getStringAttr("splat"));
+      widenFifoSlot(hop.transfer.getDestination(), site.vector_width, builder);
+
+      auto dest_sizes_opt = hop.transfer.getStaticDestSizesArray();
+      if (dest_sizes_opt) {
+        llvm::SmallVector<int64_t> new_dest_static(*dest_sizes_opt);
+        new_dest_static.back() = site.vector_width;
+        hop.transfer.setStaticDestSizes(
+            llvm::ArrayRef<int64_t>(new_dest_static));
+      }
     }
   }
 

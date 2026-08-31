@@ -151,7 +151,8 @@ struct KTDFLowToDFIRPass
 
       // Run operation lowerings after program units have been created
       if (mlir::failed(runOperationLowerings(func, schedulerExtContext(),
-                                             components, resource_kinds))) {
+                                             components, resource_kinds,
+                                             symbols))) {
         func.emitError("failed to run operation lowerings for ")
             << func.getName();
         return signalPassFailure();

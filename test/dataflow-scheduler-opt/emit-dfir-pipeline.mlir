@@ -23,9 +23,10 @@
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   apply-device-patterns{groups={pre_scheduling}}
+// CHECK-NEXT:   hoist-invariants
 // CHECK-NEXT:   )
 // CHECK-NEXT:   )
-// CHECK-NEXT:   hoist-registers
+// CHECK-NEXT:   materialize-registers
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   hoist-invariants
