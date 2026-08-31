@@ -42,14 +42,24 @@
 #ifndef DATAFLOW_SCHEDULER_DIALECT_KTDF_TRANSFORMS_REDUCTIONUTILS_H_
 #define DATAFLOW_SCHEDULER_DIALECT_KTDF_TRANSFORMS_REDUCTIONUTILS_H_
 
+#include <optional>
 #include <utility>
 
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 
 namespace mlir::ktdf {
+
+// ---------------------------------------------------------------------------
+// Return the loop dimension index that corresponds to the innermost reduction:
+// the rightmost input dimension (input_rank - 1), if it is a reduction
+// iterator. Returns std::nullopt if the rightmost input dimension is not a
+// reduction.
+// ---------------------------------------------------------------------------
+std::optional<unsigned> findInnerDimLoopDim(linalg::GenericOp generic_op);
 
 // ---------------------------------------------------------------------------
 // Result of StageFactory::buildFifoPrivate.

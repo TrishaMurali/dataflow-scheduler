@@ -137,9 +137,26 @@ struct KTIRLegalityCheckPass
           return mlir::WalkResult::skip();
         }
         if (mlir::isa<mlir::linalg::AddOp, mlir::linalg::MulOp,
-                      mlir::linalg::SubOp, mlir::linalg::ReduceOp,
-                      mlir::linalg::YieldOp>(op)) {
+                      mlir::linalg::SubOp, mlir::linalg::YieldOp>(op)) {
           return mlir::WalkResult::advance();
+        }
+        if (mlir::isa<mlir::linalg::ReduceOp>(op)) {
+          // Inspect the reduce body: every op must be a legal body op.
+          mlir::WalkResult bodyResult = op->getRegion(0).walk(
+              [&](mlir::Operation* inner) -> mlir::WalkResult {
+                if (!isLegalGenericBodyOp(inner)) {
+                  inner->emitError(
+                      "V1 only supports add/mul/sub compute ops; found "
+                      "unsupported compute op");
+                  return mlir::WalkResult::interrupt();
+                }
+                return mlir::WalkResult::advance();
+              });
+          if (bodyResult.wasInterrupted()) {
+            failed = true;
+            return mlir::WalkResult::interrupt();
+          }
+          return mlir::WalkResult::skip();
         }
         // Any other named linalg op is unsupported.
         op->emitError(

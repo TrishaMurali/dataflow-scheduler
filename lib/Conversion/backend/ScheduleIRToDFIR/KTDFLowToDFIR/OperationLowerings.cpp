@@ -33,6 +33,7 @@
 #include <mlir/IR/OperationSupport.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/Interfaces/ViewLikeInterface.h>
+#include <mlir/Transforms/DialectConversion.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
@@ -869,6 +870,20 @@ mlir::LogicalResult scheduler::runOperationLowerings(
 
   // Lower ktdf.parallel operations after all other lowerings are complete
   if (mlir::failed(lowerParallelOps(func))) {
+    return mlir::failure();
+  }
+
+  // After all lowering helpers have run, no ktdf or ktdf_lowering op should
+  // survive. Use an empty conversion with both dialects marked illegal so any
+  // survivor produces an explicit error rather than silently passing through.
+  mlir::ConversionTarget target(*func.getContext());
+  target.addIllegalDialect<mlir::ktdf::KTDFDialect,
+                           mlir::ktdf_lowering::KTDFLoweringDialect>();
+  target.markUnknownOpDynamicallyLegal([](mlir::Operation*) { return true; });
+  if (mlir::failed(mlir::applyPartialConversion(
+          func, target,
+          mlir::FrozenRewritePatternSet(
+              mlir::RewritePatternSet(func.getContext()))))) {
     return mlir::failure();
   }
 

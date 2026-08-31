@@ -85,8 +85,10 @@ void scheduler::buildSchedulerOptimizationPipeline(
   pm.addPass(mlir::createLoopInvariantCodeMotionPass());
   pm.addPass(mlir::ktdf::createStageCoarseningPass());
   pm.addPass(mlir::ktdf::createReductionDimChunkingPass());
+  pm.addPass(mlir::ktdf::createSplitReductionInnerOuterDimPass());
   pm.addPass(mlir::ktdf::createReductionLoopExposurePass());
   pm.addPass(mlir::ktdf::createMapReductionPartialsPass());
+  pm.addPass(mlir::ktdf::createReductionOpacificationPass());
   pm.addPass(mlir::ktdf::createBroadcastPromotionPass());
   pm.addPass(createDoubleBufferingPass(scheduler_ctx));
   // Parallelizing before tile selection is beneficial because the tile size

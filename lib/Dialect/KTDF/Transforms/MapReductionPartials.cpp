@@ -16,9 +16,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// MapReductionPartials: lower reduction linalg.generic ops whose first input
-// comes from a ktdf.read_from_fifo to buffer-semantics form backed by a
-// pre-allocated accumulator memref.
+// MapReductionPartials: lower reduction linalg.generic ops to buffer-semantics
+// form backed by pre-allocated memrefs.  Two kinds of generics are handled:
+//
+// ── Outer-dim generic (loop-exposed by ReductionLoopExposure) ────────────────
 //
 // After ReductionLoopExposure the compute stage looks like:
 //
@@ -55,6 +56,28 @@
 // The iter_arg / loop result / scf.yield operand are stripped, and any
 // write_to_fifo that consumed the loop result is patched to use %alloc.
 //
+// ── Inner-dim generic (produced by SplitReductionInnerOuterDim) ──────────────
+//
+// After the outer-dim rewrite above, %alloc_G1 (memref<D0x...xDNxf16, ms>)
+// has been RAUW'd in place of the loop result, so the inner-dim generic sees:
+//
+//   %empty = tensor.empty() : tensor<D0x...xDN-1xf16>
+//   %result = linalg.generic ins(%alloc_G1: memref<D0x...xDNxf16, ms>)
+//                            outs(%empty: tensor<D0x...xDN-1xf16>)
+//   ktdf.write_to_fifo %result, %fifo_out
+//
+// A rank-reducing subview of %alloc_G1 (size=1 on reduction dims, original
+// size on parallel dims) is used as the outs buffer; ins is the full %alloc_G1.
+// After the reduction, the full %alloc_G1 — not the subview — is written to
+// the FIFO so the downstream stage receives all partial sums.
+// The FIFO slot type is widened to match %alloc_G1's shape.
+//
+//   %sv = memref.subview %alloc_G1[0,...][D0,...,1,...][1,...]
+//             : memref<D0x...xDNxf16, ms> to memref<D0x...xDN-1xf16, strided,
+//             ms>
+//   linalg.generic ins(%alloc_G1) outs(%sv)  {original maps & iter_types}
+//   ktdf.write_to_fifo %alloc_G1, %fifo_out  // full buffer
+//
 //===----------------------------------------------------------------------===//
 
 #include <memory>
@@ -63,12 +86,14 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -101,15 +126,87 @@ static bool hasReductionIterator(linalg::GenericOp generic_op) {
 }
 
 // ---------------------------------------------------------------------------
+// Return the typed neutral-element attribute for the reduction combiner of
+// `generic_op`.
+//
+// The combiner is identified as the unique user of the output block argument
+// (outs[0], the last block argument) — that is the accumulation step.  Any
+// other ops in the body (e.g. element-wise pre-processing in a fused generic)
+// are irrelevant.
+//
+// Neutral elements per combiner:
+//   addf / subf  →  0.0
+//   mulf         →  1.0
+//   maximumf     → -inf
+//   minimumf     → +inf
+//   maxnumf      → -inf
+//   addi / subi  →  0
+//   muli         →  1
+//
+// Returns failure() (with an emitted error) if the output block argument has
+// zero or multiple users, the combiner is unrecognised, or the element type is
+// unsupported.
+// ---------------------------------------------------------------------------
+static FailureOr<TypedAttr> getNeutralAttr(linalg::GenericOp generic_op,
+                                           Type elem_type) {
+  // The output block argument is the last argument of the body block.
+  Value out_arg = generic_op.getRegion().front().getArguments().back();
+
+  // The combiner is the unique op that uses out_arg as an operand.
+  Operation* combiner =
+      out_arg.hasOneUse() ? out_arg.getUses().begin()->getOwner() : nullptr;
+  if (!combiner)
+    return generic_op.emitError(
+        "MapReductionPartials: output block argument of reduction "
+        "linalg.generic must have exactly one user (the accumulation op)");
+
+  // ── Floating-point combiners ───────────────────────────────────────────────
+  if (auto ftype = dyn_cast<FloatType>(elem_type)) {
+    const llvm::fltSemantics& sem = ftype.getFloatSemantics();
+    if (isa<arith::AddFOp, arith::SubFOp>(combiner))
+      return cast<TypedAttr>(
+          FloatAttr::get(elem_type, APFloat::getZero(sem, /*negative=*/false)));
+    if (isa<arith::MulFOp>(combiner))
+      return cast<TypedAttr>(FloatAttr::get(elem_type, APFloat(sem, 1)));
+    if (isa<arith::MaximumFOp, arith::MaxNumFOp>(combiner))
+      return cast<TypedAttr>(FloatAttr::get(
+          elem_type, APFloat::getLargest(sem, /*negative=*/true)));
+    if (isa<arith::MinimumFOp>(combiner))
+      return cast<TypedAttr>(FloatAttr::get(
+          elem_type, APFloat::getLargest(sem, /*negative=*/false)));
+    return combiner->emitError(
+        "MapReductionPartials: unsupported floating-point reduction combiner");
+  }
+
+  // ── Integer combiners ──────────────────────────────────────────────────────
+  if (auto itype = dyn_cast<IntegerType>(elem_type)) {
+    unsigned width = itype.getWidth();
+    if (isa<arith::AddIOp, arith::SubIOp>(combiner))
+      return cast<TypedAttr>(IntegerAttr::get(elem_type, APInt(width, 0)));
+    if (isa<arith::MulIOp>(combiner))
+      return cast<TypedAttr>(IntegerAttr::get(elem_type, APInt(width, 1)));
+    return combiner->emitError(
+        "MapReductionPartials: unsupported integer reduction combiner");
+  }
+
+  return generic_op.emitError(
+      "MapReductionPartials: unsupported accumulator element type — "
+      "expected float or integer");
+}
+
+// ---------------------------------------------------------------------------
 // Transform the initializer `init_val` of a loop-carried accumulator in-place,
 // emitting linalg.fill (or memref.copy) into `alloc_val` wherever the original
 // tensor value was produced.  `alloc_val` is a memref.alloc already emitted at
 // the top of the stage.
 //
+// `generic_op` is the reduction linalg.generic whose combiner determines the
+// correct neutral element for the fill.
+//
 // Three leaf cases are handled; scf.if recurses into both branches:
 //
 //   tensor.empty()
-//     → linalg.fill(%zero, %alloc) inserted just before the tensor.empty,
+//     → linalg.fill(%neutral, %alloc) inserted just before the tensor.empty,
 //       then the tensor.empty is erased.
 //
 //   ktdf.read_from_fifo ... -> tensor<...>
@@ -121,7 +218,8 @@ static bool hasReductionIterator(linalg::GenericOp generic_op) {
 //       operand 0), drop the yield operands so both yields become result-less,
 //       then rebuild the scf.if with no result types.
 // ---------------------------------------------------------------------------
-static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val) {
+static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val,
+                                             linalg::GenericOp generic_op) {
   Operation* defining_op = init_val.getDefiningOp();
   assert(defining_op &&
          "lowerIterArgInitializer: init_val must be an op result");
@@ -130,11 +228,13 @@ static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val) {
 
   // ── Case: tensor.empty ────────────────────────────────────────────────────
   if (auto empty_op = dyn_cast<tensor::EmptyOp>(defining_op)) {
+    auto neutral = getNeutralAttr(generic_op, elem_type);
+    if (failed(neutral)) return failure();
     OpBuilder builder(empty_op);
     Location loc = empty_op.getLoc();
-    Value zero = arith::ConstantOp::create(
-        builder, loc, builder.getFloatAttr(elem_type, 0.0));
-    linalg::FillOp::create(builder, loc, ValueRange{zero},
+    Value neutral_val =
+        arith::ConstantOp::create(builder, loc, neutral.value());
+    linalg::FillOp::create(builder, loc, ValueRange{neutral_val},
                            ValueRange{alloc_val});
     empty_op->erase();
     return success();
@@ -164,7 +264,7 @@ static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val) {
           cast<scf::YieldOp>(if_op.getThenRegion().front().getTerminator());
       Value then_init = then_yield.getOperand(0);
       then_yield->setOperands({});
-      if (failed(lowerIterArgInitializer(then_init, alloc_val)))
+      if (failed(lowerIterArgInitializer(then_init, alloc_val, generic_op)))
         return failure();
     }
 
@@ -173,7 +273,7 @@ static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val) {
           cast<scf::YieldOp>(if_op.getElseRegion().front().getTerminator());
       Value else_init = else_yield.getOperand(0);
       else_yield->setOperands({});
-      if (failed(lowerIterArgInitializer(else_init, alloc_val)))
+      if (failed(lowerIterArgInitializer(else_init, alloc_val, generic_op)))
         return failure();
     }
 
@@ -362,7 +462,8 @@ static LogicalResult rewriteGeneric(
 
   // Step 4b: lower the initializer — emit linalg.fill (and/or memref.copy) in
   // the right place and clean up tensor ops.
-  if (failed(lowerIterArgInitializer(outermost_init, alloc.getResult())))
+  if (failed(lowerIterArgInitializer(outermost_init, alloc.getResult(),
+                                     generic_op)))
     return failure();
 
   // Step 5: emit a new ktdf.read_from_fifo with a memref result type so the
@@ -405,6 +506,216 @@ static LogicalResult rewriteGeneric(
   return success();
 }
 
+// ---------------------------------------------------------------------------
+// Set `new_type` on a PrivateOp result and its corresponding inner value
+// (the private_yield operand at the same index).
+//
+// Always called with a direct PrivateOp result; the inner value is derived
+// by indexing into private_yield.
+//
+// Example:
+//   %2#2 = ktdf.private -> (!ktdf.fifo.slot<"A"->"B", 4xf16>, ...)
+//     → widenPrivateResult(%2#2, !ktdf.fifo.slot<"A"->"B", 32xf16>)
+//   %2#3 = ktdf.private -> (memref<4xf16, ms>, ...)
+//     → widenPrivateResult(%2#3, memref<2x16xf16, ms>)
+// ---------------------------------------------------------------------------
+static void widenPrivateResult(Value priv_res, Type new_type) {
+  auto priv_op = cast<ktdf::PrivateOp>(cast<OpResult>(priv_res).getOwner());
+  auto result_idx = cast<OpResult>(priv_res).getResultNumber();
+  Value inner = priv_op.getYieldOp().getOperand(result_idx);
+  inner.setType(new_type);
+  priv_res.setType(new_type);
+}
+
+// ---------------------------------------------------------------------------
+// Iterate the direct uses of `fifo_slot` and for each data_transfer that
+// references it update the FIFO-side static size field to reflect `new_shape`.
+// ---------------------------------------------------------------------------
+static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
+                          MLIRContext* ctx) {
+  auto new_sizes_attr = DenseI64ArrayAttr::get(ctx, new_shape);
+
+  for (Operation* user : fifo_slot.getUsers()) {
+    auto xfer = dyn_cast<ktdf::DataTransferOp>(user);
+    if (!xfer) continue;
+
+    // Only update the FIFO-side size on this transfer.  The alloc side (its
+    // size, map, and type) is left entirely unchanged — the alloc's shape is
+    // determined by its own allocation context and is shared with other
+    // transfers (e.g. the L3SU store-out) that must not be disturbed.
+    if (xfer.isSourceFifo())
+      xfer.setStaticSourceSizesAttr(new_sizes_attr);
+    else if (xfer.isDestFifo())
+      xfer.setStaticDestSizesAttr(new_sizes_attr);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lower an inner-dim reduction linalg.generic to buffer semantics.
+//
+// At this point (after rewriteGeneric has run on G1) the stage contains:
+//
+//   %result = linalg.generic ins(%alloc_G1: memref<D0x...xDNxf16, ms>)
+//                            outs(%empty:   tensor<D0x...xDN-1xf16>)
+//   ktdf.write_to_fifo %result, %fifo_out
+//
+// %alloc_G1 is already a memref (RAUW'd by rewriteGeneric).  We reuse it as
+// both input and output buffer:
+//
+//   ins  = %alloc_G1 (full memref<D0x...xDNxf16>)
+//   outs = a rank-reducing subview of %alloc_G1 with size=1 on all reduction
+//          dims (rank-reduced away) and original size on parallel dims.  This
+//          gives a strided view into alloc_G1 where reduced results are
+//          written back in-place.
+//
+// After the inner reduction, the full %alloc_G1 buffer — not the subview —
+// is sent to the FIFO so the downstream stage receives all partial sums.
+// The FIFO slot type and the paired memref.alloc in the ktdf.private block are
+// widened to match %alloc_G1's shape.
+//
+// Example (memref<2x64xf16, ms>, reduction over dim 1):
+//
+//   %sv = memref.subview %alloc_G1[0, 0][2, 1][1, 1]
+//             : memref<2x64xf16, ms> to memref<2xf16, strided<[64]>, ms>
+//   linalg.generic ins(%alloc_G1) outs(%sv)
+//   ktdf.write_to_fifo %alloc_G1, %fifo_out    // full buffer, not subview
+//
+//   // ktdf.private widened (flat count 2 → 128, shape 2xf16 → 2x64xf16):
+//   %fifo = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"A" -> "B", 128xf16>
+//   %acc  = memref.alloc() : memref<2x64xf16, ct_local>
+// ---------------------------------------------------------------------------
+static LogicalResult rewriteInnerDimGeneric(linalg::GenericOp generic_op) {
+  auto stage = generic_op->getParentOfType<ktdf::StageOp>();
+  assert(stage && "expected enclosing ktdf.stage");
+
+  OpBuilder builder(generic_op);
+  Location loc = generic_op.getLoc();
+
+  // ins[0] is a memref — either the outer-dim alloc from rewriteGeneric, or
+  // a memref-typed read_from_fifo emitted by the caller when no outer-dim
+  // loop exists.
+  Value alloc_in = generic_op.getInputs()[0];
+  auto in_memref_type = cast<MemRefType>(alloc_in.getType());
+  unsigned in_rank = in_memref_type.getRank();
+
+  // Inspect indexing maps and iterator types to classify each dim.
+  auto iter_types = generic_op.getIteratorTypesArray();
+  auto indexing_maps = generic_op.getIndexingMapsArray();
+  AffineMap in_map = indexing_maps.front();
+  AffineMap out_map = indexing_maps.back();
+  ArrayRef<int64_t> in_shape = in_memref_type.getShape();
+
+  // Build a loop-dim → input-dimension-size lookup from the input map so we
+  // can resolve sizes for dims that appear in the output map but not in a
+  // direct positional correspondence to in_shape.
+  SmallVector<int64_t> loop_dim_to_size(iter_types.size(), 1);
+  for (unsigned d = 0; d < in_rank; ++d) {
+    auto dim_expr = dyn_cast<AffineDimExpr>(in_map.getResult(d));
+    assert(dim_expr && "inner-dim input map must be identity-like");
+    loop_dim_to_size[dim_expr.getPosition()] = in_shape[d];
+  }
+
+  // SubViewOp requires offsets/sizes/strides arrays of length == source rank
+  // (in_rank).  The rank reduction is expressed by placing
+  // size=1 on reduction dimensions; inferRankReducedResultType then produces
+  // the correctly strided result type with the reduced rank.
+  unsigned out_rank = out_map.getNumResults();
+
+  // Build source-rank-sized arrays by iterating over the input map: each
+  // source dim d maps to loop dim loop_dim; if that loop dim is a reduction
+  // iterator set size=1 (to be dropped), otherwise keep the full size.
+  SmallVector<OpFoldResult> sv_offsets(in_rank, builder.getIndexAttr(0));
+  SmallVector<OpFoldResult> sv_sizes_ofr(in_rank);
+  SmallVector<OpFoldResult> sv_strides(in_rank, builder.getIndexAttr(1));
+  for (unsigned d = 0; d < in_rank; ++d) {
+    auto dim_expr = dyn_cast<AffineDimExpr>(in_map.getResult(d));
+    assert(dim_expr && "inner-dim input map must be identity-like");
+    unsigned loop_dim = dim_expr.getPosition();
+    int64_t sz = (iter_types[loop_dim] == utils::IteratorType::reduction)
+                     ? 1
+                     : loop_dim_to_size[loop_dim];
+    sv_sizes_ofr[d] = builder.getIndexAttr(sz);
+  }
+
+  // Rank-reduced result shape: parallel dims only, in out_map order, so the
+  // subview result rank matches the output indexing map.
+  SmallVector<int64_t> sv_result_shape;
+  for (unsigned d = 0; d < out_rank; ++d) {
+    auto dim_expr = dyn_cast<AffineDimExpr>(out_map.getResult(d));
+    assert(dim_expr && "inner-dim output map must be identity-like");
+    unsigned loop_dim = dim_expr.getPosition();
+    if (iter_types[loop_dim] != utils::IteratorType::reduction)
+      sv_result_shape.push_back(loop_dim_to_size[loop_dim]);
+  }
+
+  // Let SubViewOp infer the correct strided layout from the source memref.
+  auto sv_result_type =
+      cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+          sv_result_shape, in_memref_type, sv_offsets, sv_sizes_ofr,
+          sv_strides));
+
+  auto subview =
+      memref::SubViewOp::create(builder, loc, sv_result_type, alloc_in,
+                                sv_offsets, sv_sizes_ofr, sv_strides);
+
+  // Buffer linalg.generic: ins = full alloc_in, outs = rank-reduced subview.
+  // Original maps and iterator_types are preserved — they already express the
+  // correct ins/outs rank relationship.
+  auto buf_generic = linalg::GenericOp::create(
+      builder, loc,
+      /*resultTensorTypes=*/TypeRange{},
+      /*inputs=*/ValueRange{alloc_in},
+      /*outputs=*/ValueRange{subview.getResult()},
+      generic_op.getIndexingMapsAttr(), generic_op.getIteratorTypesAttr(),
+      /*doc=*/StringAttr{},
+      /*library_call=*/StringAttr{});
+  IRMapping mapping;
+  generic_op.getRegion().cloneInto(&buf_generic.getRegion(), mapping);
+  Block& placeholder = buf_generic.getRegion().front();
+  if (&placeholder != &buf_generic.getRegion().back()) placeholder.erase();
+
+  // Patch write_to_fifo to send the full alloc_in buffer (not the subview),
+  // and capture the old fifo slot so we can widen its type below.
+  Value old_fifo_slot;
+  Value generic_result = generic_op.getResult(0);
+  for (Operation* user :
+       llvm::make_early_inc_range(generic_result.getUsers())) {
+    if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user)) {
+      old_fifo_slot = write_op.getFifoSlot();
+      write_op.getDataMutable().assign(alloc_in);
+    }
+  }
+  generic_result.replaceAllUsesWith(subview.getResult());
+
+  // Widen the FIFO slot type and all downstream allocs/transfers that use it.
+  // The new element count is the product of all input dimensions.
+  if (old_fifo_slot) {
+    auto old_slot_type = cast<ktdf::FifoSlotType>(old_fifo_slot.getType());
+    Type elem_type = old_slot_type.getElementType();
+
+    int64_t new_num_elems = 1;
+    for (int64_t sz : in_shape) new_num_elems *= sz;
+
+    auto new_slot_type = ktdf::FifoSlotType::get(
+        generic_op.getContext(), old_slot_type.getSrc(),
+        old_slot_type.getDest(), new_num_elems, elem_type);
+    // Widen the PrivateOp result for the fifo slot (and its inner allocate).
+    widenPrivateResult(old_fifo_slot, new_slot_type);
+
+    // Update the FIFO-side size on all data_transfer uses of the fifo slot.
+    // The paired alloc in ktdf.private is intentionally left unchanged.
+    widenFifoUses(old_fifo_slot, in_shape, generic_op.getContext());
+  }
+
+  // Erase the original tensor.empty output initializer and the tensor generic.
+  Value orig_out_init = generic_op.getDpsInitOperand(0)->get();
+  generic_op.erase();
+  if (orig_out_init.use_empty())
+    if (auto* def = orig_out_init.getDefiningOp()) def->erase();
+
+  return success();
+}
+
 struct MapReductionPartialsPass
     : public ktdf::impl::MapReductionPartialsPassBase<
           MapReductionPartialsPass> {
@@ -427,16 +738,46 @@ struct MapReductionPartialsPass
         device_manager.getOrCreateView<scheduler::arch_view::GroupLocalMemory>(
             *device);
 
-    SmallVector<linalg::GenericOp> candidates;
+    // Collect generics in two buckets.  Loop-exposed (outer-dim) generics
+    // must be processed first so their loop results are RAUW'd to alloc
+    // memrefs before the inner-dim generics are processed (which expect ins[0]
+    // to already be a memref).
+    SmallVector<linalg::GenericOp> loop_exposed, inner_dim;
     module.walk([&](linalg::GenericOp generic_op) {
-      if (hasReductionIterator(generic_op)) candidates.push_back(generic_op);
+      if (!hasReductionIterator(generic_op)) return;
+      if (generic_op.getOutputs().empty()) return;
+      auto iter_arg = dyn_cast<BlockArgument>(generic_op.getOutputs()[0]);
+      if (iter_arg && isa<scf::ForOp>(iter_arg.getOwner()->getParentOp()))
+        loop_exposed.push_back(generic_op);
+      else
+        inner_dim.push_back(generic_op);
     });
 
-    for (auto generic_op : candidates) {
+    for (auto generic_op : loop_exposed) {
       if (failed(rewriteGeneric(generic_op, group_local_mem))) {
         signalPassFailure();
         return;
       }
+    }
+    for (auto generic_op : inner_dim) {
+      // ins[0] is a tensor-typed ktdf.read_from_fifo when there was no
+      // outer-dim loop feeding this generic (i.e. rewriteGeneric did not run
+      // on its pipeline).  Emit a memref-typed read in its place so that
+      // rewriteInnerDimGeneric can assume ins[0] is already a memref.
+      Operation* stale_tensor_read = nullptr;
+      if (generic_op.getInputs()[0].getDefiningOp<ktdf::ReadFromFifoOp>()) {
+        OpBuilder builder(generic_op);
+        stale_tensor_read = generic_op.getInputs()[0].getDefiningOp();
+        Value new_read = convertInputToMemref(builder, generic_op);
+        generic_op.getInputsMutable().assign(new_read);
+      }
+      // Transform inner-dim generic into memref-typed generic.
+      if (failed(rewriteInnerDimGeneric(generic_op))) {
+        signalPassFailure();
+        return;
+      }
+      if (stale_tensor_read && stale_tensor_read->use_empty())
+        stale_tensor_read->erase();
     }
   }
 };

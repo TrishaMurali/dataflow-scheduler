@@ -42,8 +42,10 @@
 // CHECK-NEXT:   loop-invariant-code-motion
 // CHECK-NEXT:   stage-coarsening
 // CHECK-NEXT:   reduction-dim-chunking
+// CHECK-NEXT:   split-reduction-inner-outer-dim
 // CHECK-NEXT:   reduction-loop-exposure
 // CHECK-NEXT:   map-reduction-partials
+// CHECK-NEXT:   reduction-opacification
 // CHECK-NEXT:   broadcast-promotion
 // CHECK-NEXT:   double-buffering
 // CHECK-NEXT:   parallelize-loops-across-instances

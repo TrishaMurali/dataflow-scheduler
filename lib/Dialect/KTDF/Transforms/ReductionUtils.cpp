@@ -22,15 +22,39 @@
 
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/ReductionUtils.h"
 
+#include <optional>
+
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 
 namespace mlir::ktdf {
+
+// ---------------------------------------------------------------------------
+// findInnerDimLoopDim
+// ---------------------------------------------------------------------------
+std::optional<unsigned> findInnerDimLoopDim(linalg::GenericOp generic_op) {
+  auto input_type =
+      dyn_cast<RankedTensorType>(generic_op.getInputs().front().getType());
+  if (!input_type) return std::nullopt;
+
+  int64_t last = input_type.getRank() - 1;
+
+  AffineMap input_map = generic_op.getIndexingMapsArray().front();
+  auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(last));
+  if (!dim_expr) return std::nullopt;
+
+  unsigned loop_dim = dim_expr.getPosition();
+  auto iter_types = generic_op.getIteratorTypesArray();
+  if (iter_types[loop_dim] == utils::IteratorType::reduction) return loop_dim;
+  return std::nullopt;
+}
 
 // ---------------------------------------------------------------------------
 // StageFactory method definitions
