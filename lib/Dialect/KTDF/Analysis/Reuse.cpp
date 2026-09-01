@@ -62,6 +62,21 @@ int findOutermostLegalTargetDepth(::DataTransferOp transfer,
   return best;
 }
 
+/// True iff a loop between `transfer` and `stage` carries a value out.
+///
+/// Hoisting makes a clone pruned to the transfer, and what such a loop yields
+/// is computed by ops the pruning drops. There is nothing to hand back, so the
+/// transfer is not offered.
+bool carriesAValueOut(::DataTransferOp transfer, ::StageOp stage) {
+  for (Operation* parent = transfer->getParentOp();
+       parent && parent != stage.getOperation();
+       parent = parent->getParentOp()) {
+    auto loop = dyn_cast<scf::ForOp>(parent);
+    if (loop && loop->getNumResults() != 0) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 auto mlir::ktdf::reuse::findFirstCandidate(::PipelineOp pipeline)
@@ -85,6 +100,9 @@ auto mlir::ktdf::reuse::findFirstCandidate(::PipelineOp pipeline)
     }
     stage.walk([&](::DataTransferOp transfer) {
       if (transfer.isDestFifo()) {
+        return WalkResult::advance();
+      }
+      if (carriesAValueOut(transfer, stage)) {
         return WalkResult::advance();
       }
       int depth = findOutermostLegalTargetDepth(transfer, scope);

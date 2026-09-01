@@ -23,6 +23,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #define PRUNE_ANCHOR_MARKER "prune_anchor"
 
@@ -30,18 +31,18 @@ using namespace scheduler;
 
 namespace {
 
-/// True iff `iv` is transitively used by any op in `kept`.
+/// True iff some op in `kept` reads `iv` itself.
+///
+/// Itself, rather than "has an ancestor in `kept`": a kept enclosing loop is an
+/// ancestor of everything within it, so that question answers yes for the
+/// variable of every loop inside one and no loop is ever dropped. Reaching the
+/// variable through a chain of ops is the caller's part -- it looks at a loop
+/// again each time an op inside it joins `kept`.
 bool ivUsedByKept(mlir::Value iv,
                   const llvm::DenseSet<mlir::Operation*>& kept) {
-  for (mlir::Operation* user : iv.getUsers()) {
-    // Walk up from user: if any ancestor is in kept, the IV matters.
-    mlir::Operation* cur = user;
-    while (cur) {
-      if (kept.contains(cur)) return true;
-      cur = cur->getParentOp();
-    }
-  }
-  return false;
+  return llvm::any_of(iv.getUsers(), [&](mlir::Operation* user) {
+    return kept.contains(user);
+  });
 }
 
 /// Compute the set of cloned ops to keep, starting from `anchor` and
@@ -52,7 +53,9 @@ bool ivUsedByKept(mlir::Value iv,
 /// When walking up to a parent scf.for, the loop is only added to the kept
 /// set if its induction variable is actually used by something already kept.
 /// If the IV is unused, the loop is skipped and the walk continues to the
-/// loop's parent — so irrelevant loop skeletons are not cloned.
+/// loop's parent — so irrelevant loop skeletons are not cloned. Whether a
+/// skipped loop may then go is bodyCanRunOnce()'s question, asked once the set
+/// is complete.
 void computeKeptSet(mlir::Operation* anchor, mlir::Operation* prune_root,
                     llvm::DenseSet<mlir::Operation*>& kept) {
   llvm::SmallVector<mlir::Operation*> worklist;
@@ -82,6 +85,30 @@ void computeKeptSet(mlir::Operation* anchor, mlir::Operation* prune_root,
       worklist.push_back(parent);
     }
   }
+}
+
+/// Whether the body of \p loop can run once in place of every iteration.
+///
+/// The pruning leaves \p anchor and the ops it reads, and this is only asked of
+/// a loop whose variable none of those reads -- so every iteration computes the
+/// same values and performs the same transfer. Once stands for all of them
+/// where nothing else depends on there having been several: the loop carries no
+/// value out, and nothing surviving in it besides the anchor touches memory.
+///
+/// The anchor is the exception on purpose. Collapsing repeats of one transfer
+/// is what hoisting an invariant transfer does in the first place.
+bool bodyCanRunOnce(mlir::scf::ForOp loop, mlir::Operation* anchor,
+                    const llvm::DenseSet<mlir::Operation*>& kept) {
+  if (loop->getNumResults() != 0) {
+    return false;
+  }
+
+  bool once = true;
+  loop.getBody()->walk([&](mlir::Operation* op) {
+    if (op == anchor || !kept.contains(op)) return;
+    if (!mlir::isMemoryEffectFree(op)) once = false;
+  });
+  return once;
 }
 
 }  // namespace
@@ -137,8 +164,12 @@ mlir::Operation* scheduler::cloneRegionAndPruneToAnchor(
       if (op->hasTrait<mlir::OpTrait::IsTerminator>()) return;
 
       // For a skipped scf.for: splice its body ops (except the terminator)
-      // immediately before the loop op in its parent block, then erase.
-      if (mlir::isa<mlir::scf::ForOp>(op)) {
+      // immediately before the loop op in its parent block, then erase. A loop
+      // whose iterations are not all the same one stays where it is, holding
+      // whatever the pruning left in it.
+      if (auto loop = mlir::dyn_cast<mlir::scf::ForOp>(op)) {
+        if (!bodyCanRunOnce(loop, cloned_anchor, kept)) return;
+
         mlir::Block* loop_body = &op->getRegion(0).front();
         // Splice everything up to (but not including) the terminator.
         op->getBlock()->getOperations().splice(
