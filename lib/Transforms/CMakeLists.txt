@@ -6,6 +6,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     PathExpansion/PlannerFactories.cpp
     AddressAssignment.cpp
     AffineMinCanonicalization.cpp
+    DataTransferAlignment.cpp
     ApplyDevicePatterns.cpp
     DoubleBuffering.cpp
     EnsureDeviceDeclaration.cpp

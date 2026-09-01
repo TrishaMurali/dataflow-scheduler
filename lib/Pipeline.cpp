@@ -105,6 +105,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
   pm.addPass(createParallelizeLoopsAcrossInstancesPass(scheduler_ctx));
   pm.addPass(mlir::ktdf::createTileSizeSelectionPass());
   pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(createDataTransferAlignmentPass());
   pm.addPass(createAffineMinCanonicalizationPass());
   pm.addPass(mlir::ktdf::createSubsumeLinearizeIndexPass());
 
