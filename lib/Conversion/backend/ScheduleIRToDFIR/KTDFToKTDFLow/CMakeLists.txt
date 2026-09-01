@@ -26,7 +26,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFToKTDFLow
     DataflowSchedulerDialects::KTDFDialect
     DataflowScheduler::KTDFAnalysis
     DataflowScheduler::KTDFUtils
-    DataflowSchedulerDialects::KTDFLoweringDialect
+    DataflowScheduler::KTDFLoweringDialect
     DataflowScheduler::Transforms
     DataflowScheduler::TransformUtils
     DataflowSchedulerDialects::UniformDialect

@@ -1,0 +1,1 @@
+add_dataflow_scheduler_dialect(KTDFLowering ktdf_lowering)
