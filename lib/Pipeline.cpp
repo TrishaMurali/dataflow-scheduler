@@ -88,7 +88,6 @@ void scheduler::buildSchedulerOptimizationPipeline(
   pm.addPass(mlir::ktdf::createSplitReductionInnerOuterDimPass());
   pm.addPass(mlir::ktdf::createReductionLoopExposurePass());
   pm.addPass(mlir::ktdf::createMapReductionPartialsPass());
-  pm.addPass(mlir::ktdf::createReductionOpacificationPass());
   pm.addPass(mlir::ktdf::createBroadcastPromotionPass());
   pm.addPass(createDoubleBufferingPass(scheduler_ctx));
   // Parallelizing before tile selection is beneficial because the tile size
@@ -106,8 +105,8 @@ void scheduler::buildSchedulerOptimizationPipeline(
   //   - The scheduler has decided on the final pipeline structure, tile sizes
   //     and materialized concrete trip counts.
   //  -> Apply patterns that add/remove allocations or coalesce FIFOs.
-  // pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
-  //     createApplyDevicePatternsPass({"post_scheduling"}));
+  pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
+      createApplyDevicePatternsPass({"post_scheduling"}));
 
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
   // TODO: position of cross-instance parallelization is TBD

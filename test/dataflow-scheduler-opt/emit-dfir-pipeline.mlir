@@ -45,7 +45,6 @@
 // CHECK-NEXT:   split-reduction-inner-outer-dim
 // CHECK-NEXT:   reduction-loop-exposure
 // CHECK-NEXT:   map-reduction-partials
-// CHECK-NEXT:   reduction-opacification
 // CHECK-NEXT:   broadcast-promotion
 // CHECK-NEXT:   double-buffering
 // CHECK-NEXT:   parallelize-loops-across-instances
@@ -53,6 +52,11 @@
 // CHECK-NEXT:   canonicalize
 // CHECK-NEXT:   affine-min-canonicalization
 // CHECK-NEXT:   subsume-linearize-index
+// CHECK-NEXT:   builtin.module(
+// CHECK-NEXT:   func.func(
+// CHECK-NEXT:   apply-device-patterns{groups={post_scheduling}}
+// CHECK-NEXT:   )
+// CHECK-NEXT:   )
 // CHECK-NEXT:   address-assignment
 // CHECK-NEXT:   normalize-grid-to-1d
 // CHECK-NEXT:   ktdf-to-ktdflowering

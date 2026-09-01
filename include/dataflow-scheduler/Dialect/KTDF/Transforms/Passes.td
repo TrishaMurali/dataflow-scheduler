@@ -98,7 +98,7 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
 
     The innermost reduction dimension — identified as the reduction loop dim
     that maps to the rightmost input tensor dimension — is excluded from loop
-    exposure and left as-is for later handling by ReductionOpacification.
+    exposure and left as-is for later handling by a device PDL pattern.
 
     The pass may be composed with ReductionDimChunking.  When the input has
     already been chunked, the Load stage body contains a scf.if that feeds
@@ -182,22 +182,6 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
 
 
 
-def ReductionOpacificationPass : Pass<"reduction-opacification", "mlir::ModuleOp"> {
-  let summary = "Wrap innermost-dimension reduction linalg.generic ops in ktdf.opaque";
-  let description = [{
-    Walks the module for linalg.generic ops that carry an innermost reduction
-    — i.e. the reduction iterator whose loop dimension maps to the rightmost
-    input-tensor dimension.
-
-    For each such generic found inside a ktdf.stage the pass will replace it
-    with a ktdf.opaque.
-  }];
-  let constructor = "::mlir::ktdf::createReductionOpacificationPass()";
-  let dependentDialects = [
-    "mlir::ktdf::KTDFDialect",
-    "mlir::linalg::LinalgDialect"
-  ];
-}
 
 def SubsumeLinearizeIndexPass : Pass<"subsume-linearize-index", "mlir::ModuleOp"> {
   let summary = "Fold ktdf.tiling.linearize_index into ktdf.data_transfer affine maps";
