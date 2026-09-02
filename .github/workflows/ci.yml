@@ -75,11 +75,11 @@ jobs:
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
             | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
           sudo add-apt-repository \
-            "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${LLVM_MAJOR} main"
+            "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-${LLVM_MAJOR} main"
 
           # clang-21 from the LLVM apt repository
           sudo add-apt-repository \
-            "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main"
+            "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main"
 
           # gcc-13 from toolchain PPA
           sudo add-apt-repository ppa:ubuntu-toolchain-r/test
