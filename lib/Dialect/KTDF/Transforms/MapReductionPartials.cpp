@@ -553,6 +553,10 @@ static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
 // ---------------------------------------------------------------------------
 // Lower an inner-dim reduction linalg.generic to buffer semantics.
 //
+// Two sub-cases are handled:
+//
+// ── Case A: alloc_in is a local accumulator from rewriteGeneric ──────────
+//
 // At this point (after rewriteGeneric has run on G1) the stage contains:
 //
 //   %result = linalg.generic ins(%alloc_G1: memref<D0x...xDNxf16, ms>)
@@ -583,8 +587,24 @@ static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
 //   // ktdf.private widened (flat count 2 → 128, shape 2xf16 → 2x64xf16):
 //   %fifo = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"A" -> "B", 128xf16>
 //   %acc  = memref.alloc() : memref<2x64xf16, ct_local>
+//
+// ── Case B: alloc_in is a ktdf.read_from_fifo (no outer-dim loop) ────────
+//
+// When there is no outer-dim reduction loop, rewriteGeneric is never called.
+// alloc_in is the memref result of a ktdf.read_from_fifo.
+//
+// We allocate ONE local buffer (local_reg), copy the FIFO data into it, and
+// use it as BOTH ins and the subview source:
+//
+//   %local_reg = memref.alloc() : memref<D0x...xDNxf16, SFP_LRFREG>
+//   memref.copy %fifo_read_memref, %local_reg
+//   %sv = memref.subview %local_reg[0,...][..., 1, ...][...]
+//   linalg.generic ins(%local_reg) outs(%sv)   // both refer to local_reg
+//   ktdf.write_to_fifo %local_reg, %fifo_out
 // ---------------------------------------------------------------------------
-static LogicalResult rewriteInnerDimGeneric(linalg::GenericOp generic_op) {
+static LogicalResult rewriteInnerDimGeneric(
+    linalg::GenericOp generic_op,
+    scheduler::arch_view::GroupLocalMemory& group_local_mem) {
   auto stage = generic_op->getParentOfType<ktdf::StageOp>();
   assert(stage && "expected enclosing ktdf.stage");
 
@@ -648,23 +668,53 @@ static LogicalResult rewriteInnerDimGeneric(linalg::GenericOp generic_op) {
       sv_result_shape.push_back(loop_dim_to_size[loop_dim]);
   }
 
-  // Let SubViewOp infer the correct strided layout from the source memref.
+  // Case B: alloc_in is a FIFO-read buffer (no outer-dim loop).
+  //
+  // ktdf.opaque requires a constant-address operand (read_from_fifo fails
+  // that check).  Allocate one local_reg, copy the
+  // FIFO data into it, and use it as both ins and subview_source.
+  Value effective_alloc_in = alloc_in;  // ins to the buffer linalg.generic
+  Value subview_source = alloc_in;      // source of the rank-reducing subview
+  if (alloc_in.getDefiningOp<ktdf::ReadFromFifoOp>()) {
+    Attribute mem_space = group_local_mem.getLocalMemoryKindForStage(stage);
+    if (!mem_space) return failure();
+
+    auto alloc_type = MemRefType::get(in_shape, in_memref_type.getElementType(),
+                                      MemRefLayoutAttrInterface{}, mem_space);
+
+    // One alloc serves as both ins and subview_source.
+    builder.setInsertionPointToStart(stage.getBody());
+    Value local_reg =
+        memref::AllocOp::create(builder, loc, alloc_type).getResult();
+
+    // Copy FIFO data into local_reg immediately before the generic.
+    builder.setInsertionPoint(generic_op);
+    memref::CopyOp::create(builder, loc, alloc_in, local_reg);
+
+    effective_alloc_in = local_reg;
+    subview_source = local_reg;
+  }
+
+  // Let SubViewOp infer the correct strided layout from the subview source.
   auto sv_result_type =
       cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
-          sv_result_shape, in_memref_type, sv_offsets, sv_sizes_ofr,
-          sv_strides));
+          sv_result_shape, cast<MemRefType>(subview_source.getType()),
+          sv_offsets, sv_sizes_ofr, sv_strides));
 
+  builder.setInsertionPoint(generic_op);
   auto subview =
-      memref::SubViewOp::create(builder, loc, sv_result_type, alloc_in,
+      memref::SubViewOp::create(builder, loc, sv_result_type, subview_source,
                                 sv_offsets, sv_sizes_ofr, sv_strides);
 
-  // Buffer linalg.generic: ins = full alloc_in, outs = rank-reduced subview.
-  // Original maps and iterator_types are preserved — they already express the
-  // correct ins/outs rank relationship.
+  // Buffer linalg.generic: ins = full input buffer, outs = rank-reduced
+  // subview.  In Case A effective_alloc_in == alloc_in (the outer-dim local
+  // alloc).  In Case B it is local_reg (a local SFP_LRFREG buffer pre-loaded
+  // from the FIFO via memref.copy above).  Original maps and iterator_types
+  // are preserved.
   auto buf_generic = linalg::GenericOp::create(
       builder, loc,
       /*resultTensorTypes=*/TypeRange{},
-      /*inputs=*/ValueRange{alloc_in},
+      /*inputs=*/ValueRange{effective_alloc_in},
       /*outputs=*/ValueRange{subview.getResult()},
       generic_op.getIndexingMapsAttr(), generic_op.getIteratorTypesAttr(),
       /*doc=*/StringAttr{},
@@ -674,15 +724,16 @@ static LogicalResult rewriteInnerDimGeneric(linalg::GenericOp generic_op) {
   Block& placeholder = buf_generic.getRegion().front();
   if (&placeholder != &buf_generic.getRegion().back()) placeholder.erase();
 
-  // Patch write_to_fifo to send the full alloc_in buffer (not the subview),
-  // and capture the old fifo slot so we can widen its type below.
+  // Patch write_to_fifo to send the full subview_source buffer (not the
+  // subview), and capture the old fifo slot so we can widen its type below.
+  // In Case B subview_source is local_reg; in Case A it is alloc_in.
   Value old_fifo_slot;
   Value generic_result = generic_op.getResult(0);
   for (Operation* user :
        llvm::make_early_inc_range(generic_result.getUsers())) {
     if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user)) {
       old_fifo_slot = write_op.getFifoSlot();
-      write_op.getDataMutable().assign(alloc_in);
+      write_op.getDataMutable().assign(subview_source);
     }
   }
   generic_result.replaceAllUsesWith(subview.getResult());
@@ -772,7 +823,7 @@ struct MapReductionPartialsPass
         generic_op.getInputsMutable().assign(new_read);
       }
       // Transform inner-dim generic into memref-typed generic.
-      if (failed(rewriteInnerDimGeneric(generic_op))) {
+      if (failed(rewriteInnerDimGeneric(generic_op, group_local_mem))) {
         signalPassFailure();
         return;
       }

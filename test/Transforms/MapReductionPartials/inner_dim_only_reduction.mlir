@@ -65,14 +65,16 @@
 // CHECK-NEXT:                 } {loop_type = #ktdf.loop_type<reduction_loop>}
 // CHECK-NEXT:               } {applicable_units = ["L1LU"]}
 // CHECK-NEXT:               ktdf.stage depends_in(%[[VAL_6:.*]]#2) depends_out(%[[VAL_6]]#3) {
+// CHECK-NEXT:                 %[[ALLOC_2:.*]] = memref.alloc() : memref<1x64xf16, "SFU_REG">
 // CHECK-NEXT:                 %[[READ_FROM_FIFO_0:.*]] = ktdf.read_from_fifo %[[VAL_6]]#0 : <"L1LU" -> "SFU", 64xf16> -> memref<1x64xf16>
-// CHECK-NEXT:                 %[[SUBVIEW_0:.*]] = memref.subview %[[READ_FROM_FIFO_0]][0, 0] [1, 1] [1, 1] : memref<1x64xf16> to memref<1x1xf16, strided<[64, 1]>>
-// CHECK-NEXT:                 linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_1]]], iterator_types = ["parallel", "reduction", "parallel"]} ins(%[[READ_FROM_FIFO_0]] : memref<1x64xf16>) outs(%[[SUBVIEW_0]] : memref<1x1xf16, strided<[64, 1]>>) {
+// CHECK-NEXT:                 memref.copy %[[READ_FROM_FIFO_0]], %[[ALLOC_2]] : memref<1x64xf16> to memref<1x64xf16, "SFU_REG">
+// CHECK-NEXT:                 %[[SUBVIEW_0:.*]] = memref.subview %[[ALLOC_2]][0, 0] [1, 1] [1, 1] : memref<1x64xf16, "SFU_REG"> to memref<1x1xf16, strided<[64, 1]>, "SFU_REG">
+// CHECK-NEXT:                 linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_1]]], iterator_types = ["parallel", "reduction", "parallel"]} ins(%[[ALLOC_2]] : memref<1x64xf16, "SFU_REG">) outs(%[[SUBVIEW_0]] : memref<1x1xf16, strided<[64, 1]>, "SFU_REG">) {
 // CHECK-NEXT:                 ^bb0(%[[VAL_7:.*]]: f16, %[[VAL_8:.*]]: f16):
 // CHECK-NEXT:                   %[[ADDF_0:.*]] = arith.addf %[[VAL_7]], %[[VAL_8]] : f16
 // CHECK-NEXT:                   linalg.yield %[[ADDF_0]] : f16
 // CHECK-NEXT:                 }
-// CHECK-NEXT:                 ktdf.write_to_fifo %[[READ_FROM_FIFO_0]], %[[VAL_6]]#1 : memref<1x64xf16>, <"SFU" -> "L1SU", 64xf16>
+// CHECK-NEXT:                 ktdf.write_to_fifo %[[ALLOC_2]], %[[VAL_6]]#1 : memref<1x64xf16, "SFU_REG">, <"SFU" -> "L1SU", 64xf16>
 // CHECK-NEXT:               } {applicable_units = ["SFU"]}
 // CHECK-NEXT:               ktdf.stage depends_in(%[[VAL_9:.*]]#3) depends_out(none) {
 // CHECK-NEXT:                 %[[CONSTANT_8:.*]] = arith.constant 2 : index
