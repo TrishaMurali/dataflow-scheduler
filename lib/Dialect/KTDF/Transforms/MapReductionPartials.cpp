@@ -313,34 +313,43 @@ static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val,
 // the operand but leaves the region block argument and loop result intact,
 // producing an inconsistent op that fails the verifier.  We clone instead.
 // ---------------------------------------------------------------------------
-static void removeUnusedIterArgChain(BlockArgument acc_iter_arg,
-                                     Value alloc_val) {
-  // `current` starts as the innermost iter_arg and advances to the init of
-  // that iter_arg at each level.
-  Value current = acc_iter_arg;
-  while (auto iter_arg = dyn_cast<BlockArgument>(current)) {
-    auto for_op = dyn_cast<scf::ForOp>(iter_arg.getOwner()->getParentOp());
-    assert(for_op);
+static void removeUnusedIterArgChain(ArrayRef<BlockArgument> acc_iter_args,
+                                     ArrayRef<Value> alloc_vals) {
+  // `current` starts as the innermost iter_args, one per accumulator, and
+  // advances to their inits at each level. All of them belong to the same loop
+  // at every level, so a level is rebuilt once without all of their slots --
+  // rebuilding it once per accumulator would leave the others' block arguments
+  // pointing at a loop that is gone.
+  SmallVector<Value> current(acc_iter_args.begin(), acc_iter_args.end());
+  while (!current.empty() && isa<BlockArgument>(current.front())) {
+    auto for_op = cast<scf::ForOp>(
+        cast<BlockArgument>(current.front()).getOwner()->getParentOp());
 
-    // Block arg 0 of an scf.for is the induction variable; iter_args start
-    // at index 1, so subtract 1 to get the iter_arg slot index.
-    unsigned iter_idx = iter_arg.getArgNumber() - 1;
+    llvm::SmallDenseSet<unsigned> dropped;
+    SmallVector<Value> next;
+    for (auto [k, value] : llvm::enumerate(current)) {
+      auto iter_arg = cast<BlockArgument>(value);
 
-    // Capture the init before rebuilding — this is what we advance to next.
-    Value iter_init = for_op.getInits()[iter_idx];
+      // Block arg 0 of an scf.for is the induction variable; iter_args start
+      // at index 1, so subtract 1 to get the iter_arg slot index.
+      const unsigned iter_idx = iter_arg.getArgNumber() - 1;
+      dropped.insert(iter_idx);
 
-    // Replace all uses of the dropped iter_arg and its loop result.
-    Value loop_result = for_op.getResult(iter_idx);
-    loop_result.replaceAllUsesWith(alloc_val);
-    iter_arg.replaceAllUsesWith(alloc_val);
+      // The init is what this accumulator advances to next.
+      next.push_back(for_op.getInits()[iter_idx]);
 
-    // Rebuild the loop without the iter_arg at `iter_idx`.
+      // Replace all uses of the dropped iter_arg and its loop result.
+      for_op.getResult(iter_idx).replaceAllUsesWith(alloc_vals[k]);
+      iter_arg.replaceAllUsesWith(alloc_vals[k]);
+    }
+
+    // Rebuild the loop without the dropped iter_args.
     OpBuilder builder(for_op);
     Location loc = for_op.getLoc();
 
     SmallVector<Value> new_inits;
     for (auto [i, init] : llvm::enumerate(for_op.getInits()))
-      if (i != iter_idx) new_inits.push_back(init);
+      if (!dropped.contains(i)) new_inits.push_back(init);
 
     auto new_for =
         scf::ForOp::create(builder, loc, for_op.getLowerBound(),
@@ -350,15 +359,15 @@ static void removeUnusedIterArgChain(BlockArgument acc_iter_arg,
       if (attr.getName() != "operandSegmentSizes")
         new_for->setAttr(attr.getName(), attr.getValue());
 
-    // Map old to new iter args, skipping over iter_idx.
+    // Map old to new iter args, skipping the dropped ones.
     IRMapping body_map;
     body_map.map(for_op.getInductionVar(), new_for.getInductionVar());
     unsigned new_arg_idx = 0;
     for (auto [i, arg] : llvm::enumerate(for_op.getRegionIterArgs()))
-      if (i != iter_idx)
+      if (!dropped.contains(i))
         body_map.map(arg, new_for.getRegionIterArgs()[new_arg_idx++]);
 
-    // Copy old scf.for yield operands skipping over iter_idx.
+    // Copy old scf.for yield operands, skipping the dropped ones.
     auto* old_yield = for_op.getBody()->getTerminator();
     Operation* new_yield = new_for.getBody()->getTerminator();
     OpBuilder body_builder(new_yield);
@@ -367,17 +376,17 @@ static void removeUnusedIterArgChain(BlockArgument acc_iter_arg,
 
     SmallVector<Value> new_yield_operands;
     for (auto [i, operand] : llvm::enumerate(old_yield->getOperands()))
-      if (i != iter_idx)
+      if (!dropped.contains(i))
         new_yield_operands.push_back(body_map.lookupOrDefault(operand));
     new_yield->setOperands(new_yield_operands);
 
     unsigned new_res_idx = 0;
     for (auto [i, res] : llvm::enumerate(for_op.getResults()))
-      if (i != iter_idx)
+      if (!dropped.contains(i))
         res.replaceAllUsesWith(new_for.getResult(new_res_idx++));
 
-    // Advance to next parent loop in iter arg chain.
-    current = iter_init;
+    // Advance to the next parent loop in the iter arg chain.
+    current = next;
     for_op.erase();
   }
 }
@@ -424,27 +433,40 @@ static LogicalResult rewriteGeneric(
   OpBuilder builder(generic_op);
   Location loc = generic_op.getLoc();
 
-  auto out_tensor_type =
-      cast<RankedTensorType>(generic_op.getDpsInitOperand(0)->get().getType());
-  auto alloc_type = MemRefType::get(out_tensor_type.getShape(),
-                                    out_tensor_type.getElementType(),
-                                    MemRefLayoutAttrInterface{}, mem_space);
+  // One accumulator per result: a compute that accumulates more than one thing
+  // has one of each, and each is buffered on its own.
+  const unsigned accumulators =
+      static_cast<unsigned>(generic_op.getOutputs().size());
 
-  // Step 2: allocate the accumulator memref at the top of the stage.
+  // Step 2: allocate an accumulator memref per result at the top of the stage.
   builder.setInsertionPointToStart(stage.getBody());
-  auto alloc = memref::AllocOp::create(builder, loc, alloc_type);
+  SmallVector<Value> allocs;
+  for (unsigned r = 0; r < accumulators; ++r) {
+    auto out_tensor_type = cast<RankedTensorType>(
+        generic_op.getDpsInitOperand(r)->get().getType());
+    auto alloc_type = MemRefType::get(out_tensor_type.getShape(),
+                                      out_tensor_type.getElementType(),
+                                      MemRefLayoutAttrInterface{}, mem_space);
+    allocs.push_back(
+        memref::AllocOp::create(builder, loc, alloc_type).getResult());
+  }
 
-  // Step 3: capture the iter_arg and walk up to find the outermost initializer
-  // before anything is erased.
-  assert(generic_op.getOutputs().size() == 1 &&
-         "rewriteGeneric: expected exactly one output on linalg.generic");
-  auto acc_iter_arg = dyn_cast<BlockArgument>(generic_op.getOutputs()[0]);
-  assert(acc_iter_arg &&
-         isa<scf::ForOp>(acc_iter_arg.getOwner()->getParentOp()) &&
-         "rewriteGeneric: outs[0] must be an iter_arg of an scf.for");
+  // Step 3: capture the iter_args and walk up to find the outermost initializer
+  // of each, before anything is erased.
+  SmallVector<BlockArgument> acc_iter_args;
+  SmallVector<Value> outermost_inits;
+  for (unsigned r = 0; r < accumulators; ++r) {
+    auto acc_iter_arg = dyn_cast<BlockArgument>(generic_op.getOutputs()[r]);
+    if (!acc_iter_arg ||
+        !isa<scf::ForOp>(acc_iter_arg.getOwner()->getParentOp())) {
+      return generic_op.emitError(
+                 "rewriteGeneric: every output must be an iter_arg of an "
+                 "scf.for, and output ")
+             << r << " is not";
+    }
+    acc_iter_args.push_back(acc_iter_arg);
 
-  Value outermost_init;
-  {
+    Value outermost_init;
     Value cursor = acc_iter_arg;
     while (auto ba = dyn_cast<BlockArgument>(cursor)) {
       auto for_op = cast<scf::ForOp>(ba.getOwner()->getParentOp());
@@ -452,19 +474,24 @@ static LogicalResult rewriteGeneric(
       outermost_init = for_op.getInits()[ba.getArgNumber() - 1];
       cursor = outermost_init;
     }
+    assert(outermost_init && "could not find iter_arg initializer");
+    outermost_inits.push_back(outermost_init);
   }
-  assert(outermost_init && "could not find iter_arg initializer");
 
-  // Step 4: replace all uses of the outermost initializer (e.g. the scf.for
-  // init operand) with alloc_val *before* lowering it, so that when
+  // Step 4: replace all uses of each outermost initializer (e.g. the scf.for
+  // init operand) with its alloc *before* lowering it, so that when
   // lowerIterArgInitializer erases the defining op no uses remain.
-  outermost_init.replaceAllUsesWith(alloc.getResult());
+  for (unsigned r = 0; r < accumulators; ++r) {
+    outermost_inits[r].replaceAllUsesWith(allocs[r]);
+  }
 
-  // Step 4b: lower the initializer — emit linalg.fill (and/or memref.copy) in
+  // Step 4b: lower each initializer — emit linalg.fill (and/or memref.copy) in
   // the right place and clean up tensor ops.
-  if (failed(lowerIterArgInitializer(outermost_init, alloc.getResult(),
-                                     generic_op)))
-    return failure();
+  for (unsigned r = 0; r < accumulators; ++r) {
+    if (failed(
+            lowerIterArgInitializer(outermost_inits[r], allocs[r], generic_op)))
+      return failure();
+  }
 
   // Step 5: emit a new ktdf.read_from_fifo with a memref result type so the
   // buffer-semantics linalg.generic below has a pure-buffer input.
@@ -476,8 +503,8 @@ static LogicalResult rewriteGeneric(
       builder, loc,
       /*resultTensorTypes=*/TypeRange{},
       /*inputs=*/ValueRange{new_read},
-      /*outputs=*/ValueRange{alloc.getResult()},
-      generic_op.getIndexingMapsAttr(), generic_op.getIteratorTypesAttr(),
+      /*outputs=*/allocs, generic_op.getIndexingMapsAttr(),
+      generic_op.getIteratorTypesAttr(),
       /*doc=*/StringAttr{},
       /*library_call=*/StringAttr{});
   IRMapping mapping;
@@ -488,11 +515,13 @@ static LogicalResult rewriteGeneric(
 
   // Step 7: replace generic result with alloc, patch write_to_fifo users,
   // then erase the generic and its now-dead tensor read_from_fifo input.
-  Value generic_result = generic_op.getResult(0);
-  for (Operation* user : generic_result.getUsers())
-    if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user))
-      write_op.getDataMutable().assign(alloc.getResult());
-  generic_result.replaceAllUsesWith(alloc.getResult());
+  for (unsigned r = 0; r < accumulators; ++r) {
+    Value generic_result = generic_op.getResult(r);
+    for (Operation* user : generic_result.getUsers())
+      if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user))
+        write_op.getDataMutable().assign(allocs[r]);
+    generic_result.replaceAllUsesWith(allocs[r]);
+  }
 
   Value orig_input = generic_op.getInputs()[0];
   generic_op.erase();
@@ -502,7 +531,7 @@ static LogicalResult rewriteGeneric(
 
   // Step 8: walk up the iter_arg chain and rebuild each scf.for without it.
   // The initializer has already been transformed; no erasure is needed here.
-  removeUnusedIterArgChain(acc_iter_arg, alloc.getResult());
+  removeUnusedIterArgChain(acc_iter_args, allocs);
   return success();
 }
 
@@ -542,7 +571,8 @@ static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
     // Only update the FIFO-side size on this transfer.  The alloc side (its
     // size, map, and type) is left entirely unchanged — the alloc's shape is
     // determined by its own allocation context and is shared with other
-    // transfers (e.g. the L3SU store-out) that must not be disturbed.
+    // transfers (e.g. the store-out to global memory) that must not be
+    // disturbed.
     if (xfer.isSourceFifo())
       xfer.setStaticSourceSizesAttr(new_sizes_attr);
     else if (xfer.isDestFifo())
@@ -596,7 +626,7 @@ static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
 // We allocate ONE local buffer (local_reg), copy the FIFO data into it, and
 // use it as BOTH ins and the subview source:
 //
-//   %local_reg = memref.alloc() : memref<D0x...xDNxf16, SFP_LRFREG>
+//   %local_reg = memref.alloc() : memref<D0x...xDNxf16, "REG">
 //   memref.copy %fifo_read_memref, %local_reg
 //   %sv = memref.subview %local_reg[0,...][..., 1, ...][...]
 //   linalg.generic ins(%local_reg) outs(%sv)   // both refer to local_reg
@@ -611,12 +641,25 @@ static LogicalResult rewriteInnerDimGeneric(
   OpBuilder builder(generic_op);
   Location loc = generic_op.getLoc();
 
-  // ins[0] is a memref — either the outer-dim alloc from rewriteGeneric, or
-  // a memref-typed read_from_fifo emitted by the caller when no outer-dim
-  // loop exists.
-  Value alloc_in = generic_op.getInputs()[0];
+  // ins[0] is a memref — either the outer-dim alloc from rewriteGeneric, or a
+  // memref-typed read_from_fifo emitted by the caller when no outer-dim loop
+  // exists. One input per accumulator: a compute reducing more than one thing
+  // has an intermediate of each, and each half reduces into its own buffer.
+  // They are the same type, so one set of offsets and sizes describes every
+  // subview.
+  SmallVector<Value> allocs_in(generic_op.getInputs());
+  Value alloc_in = allocs_in.front();
   auto in_memref_type = cast<MemRefType>(alloc_in.getType());
   unsigned in_rank = in_memref_type.getRank();
+  if (llvm::any_of(allocs_in,
+                   [&](Value in) { return in.getType() != in_memref_type; })) {
+    return generic_op.emitError(
+        "rewriteInnerDimGeneric: the inputs are not all the same memref type");
+  }
+  if (generic_op.getOutputs().size() != allocs_in.size()) {
+    return generic_op.emitError(
+        "rewriteInnerDimGeneric: expected an output per input");
+  }
 
   // Inspect indexing maps and iterator types to classify each dim.
   auto iter_types = generic_op.getIteratorTypesArray();
@@ -671,52 +714,58 @@ static LogicalResult rewriteInnerDimGeneric(
   // Case B: alloc_in is a FIFO-read buffer (no outer-dim loop).
   //
   // ktdf.opaque requires a constant-address operand (read_from_fifo fails
-  // that check).  Allocate one local_reg, copy the
-  // FIFO data into it, and use it as both ins and subview_source.
-  Value effective_alloc_in = alloc_in;  // ins to the buffer linalg.generic
-  Value subview_source = alloc_in;      // source of the rank-reducing subview
-  if (alloc_in.getDefiningOp<ktdf::ReadFromFifoOp>()) {
+  // that check).  Allocate a local register per accumulator, copy the FIFO data
+  // into each, and use them as both ins and subview sources.
+  //
+  // One each rather than one shared: two accumulations cannot be reduced
+  // straight out of the fifo, since each element's own contribution still has
+  // to be worked out, so the second would overwrite the first.
+  SmallVector<Value> effective(allocs_in);
+  if (allocs_in.front().getDefiningOp<ktdf::ReadFromFifoOp>()) {
     Attribute mem_space = group_local_mem.getLocalMemoryKindForStage(stage);
     if (!mem_space) return failure();
 
     auto alloc_type = MemRefType::get(in_shape, in_memref_type.getElementType(),
                                       MemRefLayoutAttrInterface{}, mem_space);
 
-    // One alloc serves as both ins and subview_source.
-    builder.setInsertionPointToStart(stage.getBody());
-    Value local_reg =
-        memref::AllocOp::create(builder, loc, alloc_type).getResult();
+    for (auto [r, in] : llvm::enumerate(allocs_in)) {
+      // Each alloc serves as both ins and subview source for its accumulator.
+      builder.setInsertionPointToStart(stage.getBody());
+      Value local_reg =
+          memref::AllocOp::create(builder, loc, alloc_type).getResult();
 
-    // Copy FIFO data into local_reg immediately before the generic.
-    builder.setInsertionPoint(generic_op);
-    memref::CopyOp::create(builder, loc, alloc_in, local_reg);
-
-    effective_alloc_in = local_reg;
-    subview_source = local_reg;
+      // Copy its FIFO data into it immediately before the generic.
+      builder.setInsertionPoint(generic_op);
+      memref::CopyOp::create(builder, loc, in, local_reg);
+      effective[r] = local_reg;
+    }
   }
 
   // Let SubViewOp infer the correct strided layout from the subview source.
   auto sv_result_type =
       cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
-          sv_result_shape, cast<MemRefType>(subview_source.getType()),
+          sv_result_shape, cast<MemRefType>(effective.front().getType()),
           sv_offsets, sv_sizes_ofr, sv_strides));
 
   builder.setInsertionPoint(generic_op);
-  auto subview =
-      memref::SubViewOp::create(builder, loc, sv_result_type, subview_source,
-                                sv_offsets, sv_sizes_ofr, sv_strides);
+  SmallVector<Value> subviews;
+  for (Value in : effective) {
+    subviews.push_back(memref::SubViewOp::create(builder, loc, sv_result_type,
+                                                 in, sv_offsets, sv_sizes_ofr,
+                                                 sv_strides)
+                           .getResult());
+  }
 
-  // Buffer linalg.generic: ins = full input buffer, outs = rank-reduced
-  // subview.  In Case A effective_alloc_in == alloc_in (the outer-dim local
-  // alloc).  In Case B it is local_reg (a local SFP_LRFREG buffer pre-loaded
-  // from the FIFO via memref.copy above).  Original maps and iterator_types
-  // are preserved.
+  // Buffer linalg.generic: ins = the full buffers, outs = a rank-reduced
+  // subview of each. In Case A those are the outer-dim accumulators; in Case B
+  // they are the local registers copied from the fifo. Original maps and
+  // iterator_types are preserved.
   auto buf_generic = linalg::GenericOp::create(
       builder, loc,
       /*resultTensorTypes=*/TypeRange{},
-      /*inputs=*/ValueRange{effective_alloc_in},
-      /*outputs=*/ValueRange{subview.getResult()},
-      generic_op.getIndexingMapsAttr(), generic_op.getIteratorTypesAttr(),
+      /*inputs=*/effective,
+      /*outputs=*/subviews, generic_op.getIndexingMapsAttr(),
+      generic_op.getIteratorTypesAttr(),
       /*doc=*/StringAttr{},
       /*library_call=*/StringAttr{});
   IRMapping mapping;
@@ -724,23 +773,25 @@ static LogicalResult rewriteInnerDimGeneric(
   Block& placeholder = buf_generic.getRegion().front();
   if (&placeholder != &buf_generic.getRegion().back()) placeholder.erase();
 
-  // Patch write_to_fifo to send the full subview_source buffer (not the
-  // subview), and capture the old fifo slot so we can widen its type below.
-  // In Case B subview_source is local_reg; in Case A it is alloc_in.
-  Value old_fifo_slot;
-  Value generic_result = generic_op.getResult(0);
-  for (Operation* user :
-       llvm::make_early_inc_range(generic_result.getUsers())) {
-    if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user)) {
-      old_fifo_slot = write_op.getFifoSlot();
-      write_op.getDataMutable().assign(subview_source);
+  // Patch each write_to_fifo to send the whole buffer its result reduced into
+  // rather than the subview, and capture the slot it wrote to, whose type is
+  // widened below.
+  SmallVector<Value> old_fifo_slots;
+  for (auto [r, in] : llvm::enumerate(effective)) {
+    Value generic_result = generic_op.getResult(r);
+    for (Operation* user :
+         llvm::make_early_inc_range(generic_result.getUsers())) {
+      if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user)) {
+        old_fifo_slots.push_back(write_op.getFifoSlot());
+        write_op.getDataMutable().assign(in);
+      }
     }
+    generic_result.replaceAllUsesWith(subviews[r]);
   }
-  generic_result.replaceAllUsesWith(subview.getResult());
 
-  // Widen the FIFO slot type and all downstream allocs/transfers that use it.
-  // The new element count is the product of all input dimensions.
-  if (old_fifo_slot) {
+  // Widen each FIFO slot type and all downstream allocs/transfers that use
+  // it. The new element count is the product of all input dimensions.
+  for (Value old_fifo_slot : old_fifo_slots) {
     auto old_slot_type = cast<ktdf::FifoSlotType>(old_fifo_slot.getType());
     Type elem_type = old_slot_type.getElementType();
 
@@ -758,11 +809,14 @@ static LogicalResult rewriteInnerDimGeneric(
     widenFifoUses(old_fifo_slot, in_shape, generic_op.getContext());
   }
 
-  // Erase the original tensor.empty output initializer and the tensor generic.
-  Value orig_out_init = generic_op.getDpsInitOperand(0)->get();
+  // Erase the original tensor.empty output initializers and the tensor
+  // generic.
+  SmallVector<Value> orig_out_inits(generic_op.getOutputs());
   generic_op.erase();
-  if (orig_out_init.use_empty())
-    if (auto* def = orig_out_init.getDefiningOp()) def->erase();
+  for (Value init : orig_out_inits) {
+    if (!init.use_empty()) continue;
+    if (auto* def = init.getDefiningOp()) def->erase();
+  }
 
   return success();
 }
@@ -791,8 +845,8 @@ struct MapReductionPartialsPass
 
     // Collect generics in two buckets.  Loop-exposed (outer-dim) generics
     // must be processed first so their loop results are RAUW'd to alloc
-    // memrefs before the inner-dim generics are processed (which expect ins[0]
-    // to already be a memref).
+    // memrefs before the inner-dim generics are processed (which expect
+    // ins[0] to already be a memref).
     SmallVector<linalg::GenericOp> loop_exposed, inner_dim;
     module.walk([&](linalg::GenericOp generic_op) {
       if (!hasReductionIterator(generic_op)) return;

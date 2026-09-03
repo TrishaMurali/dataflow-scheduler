@@ -277,18 +277,21 @@ NestedForResult buildNestedForLoops(OpBuilder& builder, Location loc,
   scf::ForOp innermost;
   SmallVector<Value> collected_ivs;
 
-  // Recursive lambda (std::function for self-reference).
-  std::function<Value(OpBuilder&, Location, size_t, Value)> build_level =
-      [&](OpBuilder& loop_builder, Location loop_loc, size_t depth,
-          Value carry) -> Value {
+  // Recursive lambda (std::function for self-reference). As many carries as
+  // there are accumulators: a compute reducing a pair -- more than one thing
+  // over one input -- carries one of each.
+  std::function<SmallVector<Value>(OpBuilder&, Location, size_t,
+                                   SmallVector<Value>)>
+      build_level = [&](OpBuilder& loop_builder, Location loop_loc,
+                        size_t depth,
+                        SmallVector<Value> carries) -> SmallVector<Value> {
     bool is_outermost = (depth == 0);
     bool is_innermost = (depth == dim_sizes.size() - 1);
 
-    // Use a SmallVector to avoid a dangling ValueRange pointing at a temporary.
+    // Held in a SmallVector so the ValueRange does not point at a temporary.
     SmallVector<Value> level_args_vec =
-        is_outermost
-            ? SmallVector<Value>(iter_args.begin(), iter_args.end())
-            : (carry ? SmallVector<Value>{carry} : SmallVector<Value>{});
+        is_outermost ? SmallVector<Value>(iter_args.begin(), iter_args.end())
+                     : carries;
     ValueRange level_args(level_args_vec);
 
     auto loop = scf::ForOp::create(
@@ -298,24 +301,15 @@ NestedForResult buildNestedForLoops(OpBuilder& builder, Location loc,
           collected_ivs.push_back(iv);
           (void)is_outermost;  // captured for level_args logic above
 
-          Value inner_carry =
-              loop_iter_args.empty() ? Value{} : loop_iter_args.front();
+          SmallVector<Value> inner_carries(loop_iter_args);
 
           if (is_innermost) {
-            // Yield the carry unchanged; the caller will replace the yield.
-            if (inner_carry)
-              scf::YieldOp::create(body_builder, body_loc,
-                                   ValueRange{inner_carry});
-            else
-              scf::YieldOp::create(body_builder, body_loc, ValueRange{});
+            // The carries unchanged; the caller replaces this yield.
+            scf::YieldOp::create(body_builder, body_loc, inner_carries);
           } else {
-            Value returned =
-                build_level(body_builder, body_loc, depth + 1, inner_carry);
-            if (returned)
-              scf::YieldOp::create(body_builder, body_loc,
-                                   ValueRange{returned});
-            else
-              scf::YieldOp::create(body_builder, body_loc, ValueRange{});
+            scf::YieldOp::create(
+                body_builder, body_loc,
+                build_level(body_builder, body_loc, depth + 1, inner_carries));
           }
         });
 
@@ -323,16 +317,12 @@ NestedForResult buildNestedForLoops(OpBuilder& builder, Location loc,
                                    context, ktdf::LoopType::ReductionLoop));
     if (depth == 0) outermost = loop;
     if (is_innermost) innermost = loop;
-    return loop.getResults().empty() ? Value{} : loop.getResult(0);
+    return SmallVector<Value>(loop.getResults());
   };
 
-  // Build a temporary placeholder carry if iter_args has an element so the
-  // lambda signature works.  The returned Value from the outermost level is
-  // the final result of the loop chain (unused outside — the caller sets up
-  // yield ops separately via the innermost loop body).
-  Value placeholder_carry = iter_args.empty() ? Value{} : iter_args.front();
-  OpBuilder root_builder = builder;
-  build_level(root_builder, loc, 0, placeholder_carry);
+  // The outermost level takes the carries from `iter_args`; what it returns is
+  // the loop chain's own results, which the caller reads off the loops instead.
+  build_level(builder, loc, 0, SmallVector<Value>(iter_args));
 
   result.outermost_loop = outermost;
   result.innermost_loop = innermost;
@@ -604,15 +594,28 @@ struct ReductionLoopExposurePass
     // first operand of the write_to_fifo).  When the generic feeds another op
     // first (e.g. a second-stage inner-dim reduction after SplitReduction),
     // this will be null and we take the non-FIFO path in rewriteComputeStage.
-    Value fifo_out;
-    for (Operation* user : generic_op.getResult(0).getUsers()) {
-      if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user)) {
-        fifo_out = write_op.getFifoSlot();
-        break;
+    // One per result: a compute reducing a pair writes each half to a slot of
+    // its own. All null or all found -- a mix is a shape this does not know.
+    SmallVector<Value> fifo_outs(generic_op.getNumResults());
+    for (unsigned r = 0; r < generic_op.getNumResults(); ++r) {
+      for (Operation* user : generic_op.getResult(r).getUsers()) {
+        if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user)) {
+          fifo_outs[r] = write_op.getFifoSlot();
+          break;
+        }
       }
     }
+    const bool writes_fifo = fifo_outs.front() != Value{};
+    if (llvm::any_of(fifo_outs, [&](Value slot) {
+          return (slot != Value{}) != writes_fifo;
+        })) {
+      return generic_op.emitError(PASS_NAME
+                                  ": some results are written to a fifo and "
+                                  "some are not");
+    }
 
-    // Output accumulator tensor type (from the generic's output).
+    // Output accumulator tensor type (from the generic's output). One per
+    // result, and the same for each.
     auto output_tensor_type =
         cast<RankedTensorType>(generic_op.getOutputs().front().getType());
 
@@ -661,10 +664,12 @@ struct ReductionLoopExposurePass
     // -----------------------------------------------------------------------
     for (auto stage : inner_pipeline.getStages()) {
       if (stage == compute_stage) {
-        rewriteComputeStage(rewriter, loc, ctx, stage, generic_op,
-                            one_row_tensor_type, output_tensor_type, fifo_in,
-                            fifo_out, fifo_in_partial, is_first_chunk,
-                            dim_sizes, start, step, last_vals);
+        if (failed(rewriteComputeStage(
+                rewriter, loc, ctx, stage, generic_op, one_row_tensor_type,
+                output_tensor_type, fifo_in, fifo_outs, fifo_in_partial,
+                is_first_chunk, dim_sizes, start, step, last_vals))) {
+          return failure();
+        }
       } else if (stage == conditional_store_stage) {
         rewriteConditionalStoreStage(rewriter, loc, ctx, stage, dim_sizes,
                                      start, step, last_vals);
@@ -892,27 +897,40 @@ struct ReductionLoopExposurePass
   //     ...
   //   scf.yield %r0_result
   // -------------------------------------------------------------------------
-  void rewriteComputeStage(IRRewriter& rewriter, Location loc, MLIRContext* ctx,
-                           ktdf::StageOp stage, linalg::GenericOp generic_op,
-                           RankedTensorType one_row_tensor_type,
-                           RankedTensorType output_tensor_type, Value fifo_in,
-                           Value fifo_out, Value fifo_in_partial,
-                           Value is_first_chunk, ArrayRef<int64_t> dim_sizes,
-                           Value start, Value step, ArrayRef<Value> last_vals) {
+  LogicalResult rewriteComputeStage(IRRewriter& rewriter, Location loc,
+                                    MLIRContext* ctx, ktdf::StageOp stage,
+                                    linalg::GenericOp generic_op,
+                                    RankedTensorType one_row_tensor_type,
+                                    RankedTensorType output_tensor_type,
+                                    Value fifo_in, ArrayRef<Value> fifo_outs,
+                                    Value fifo_in_partial, Value is_first_chunk,
+                                    ArrayRef<int64_t> dim_sizes, Value start,
+                                    Value step, ArrayRef<Value> last_vals) {
     Block* body = stage.getBody();
 
     // Collect existing ops to erase after the rewrite.
     SmallVector<Operation*> to_erase;
     for (auto& op : *body) to_erase.push_back(&op);
 
-    rewriter.setInsertionPointToStart(body);
+    // Build where the compute stands, so what its body reads from around it --
+    // a register materialize-registers hoisted in front of it, say -- is
+    // already in front of the loops, and what reads its result is behind them.
+    rewriter.setInsertionPoint(generic_op);
 
     // Accumulator seed: when a partial FIFO path exists, on the first chunk
     // zero-init via tensor.empty; on subsequent chunks read the previous
     // partial result from fifo_in_partial.  When there is no partial path
     // (pipeline has no accumulator feedback), always use tensor.empty.
-    Value seed;
+    const unsigned results = static_cast<unsigned>(generic_op.getNumResults());
+
+    SmallVector<Value> seeds;
     if (fifo_in_partial && is_first_chunk) {
+      if (results != 1) {
+        return generic_op.emitError(
+            PASS_NAME
+            ": a compute with more than one accumulator has no partial fifo "
+            "per accumulator to read the previous chunk from");
+      }
       // Build the seed scf.if with an else region.  The regions start empty,
       // so we use OpBuilder::atBlockBegin (not getTerminator()) to populate
       // them before inserting the scf.yield terminator.
@@ -934,17 +952,19 @@ struct ReductionLoopExposurePass
             else_b, loc, output_tensor_type, fifo_in_partial);
         scf::YieldOp::create(else_b, loc, ValueRange{partial_read.getResult()});
       }
-      seed = seed_if.getResult(0);
+      seeds.push_back(seed_if.getResult(0));
     } else {
-      auto empty =
-          tensor::EmptyOp::create(rewriter, loc, output_tensor_type.getShape(),
-                                  output_tensor_type.getElementType());
-      seed = empty.getResult();
+      for (unsigned r = 0; r < results; ++r) {
+        seeds.push_back(tensor::EmptyOp::create(
+                            rewriter, loc, output_tensor_type.getShape(),
+                            output_tensor_type.getElementType())
+                            .getResult());
+      }
     }
 
-    // Build the nested loops, threading the accumulator through each level.
-    auto nested = buildNestedForLoops(rewriter, loc, ctx, dim_sizes, start,
-                                      step, ValueRange{seed});
+    // Build the nested loops, threading each accumulator through every level.
+    auto nested =
+        buildNestedForLoops(rewriter, loc, ctx, dim_sizes, start, step, seeds);
 
     // Now populate the innermost loop body (before its yield).
     scf::ForOp innermost = nested.innermost_loop;
@@ -952,8 +972,8 @@ struct ReductionLoopExposurePass
 
     OpBuilder body_builder(inner_yield);
 
-    // The iter_arg of the innermost loop is the accumulator carried in.
-    Value carry = innermost.getRegionIterArgs().front();
+    // The iter_args of the innermost loop are the accumulators carried in.
+    ValueRange carries = innermost.getRegionIterArgs();
 
     // read_from_fifo: one slice per innermost iteration.
     auto slice = ktdf::ReadFromFifoOp::create(body_builder, loc,
@@ -962,26 +982,33 @@ struct ReductionLoopExposurePass
     // Clone the original linalg.generic, remapping its operands.
     IRMapping mapping;
     mapping.map(generic_op.getInputs().front(), slice.getResult());
-    mapping.map(generic_op.getOutputs().front(), carry);
+    for (unsigned r = 0; r < results; ++r) {
+      mapping.map(generic_op.getOutputs()[r], carries[r]);
+    }
     auto new_generic = cast<linalg::GenericOp>(
         body_builder.clone(*generic_op.getOperation(), mapping));
-    Value updated_carry = new_generic.getResult(0);
+    ValueRange updated = new_generic.getResults();
 
-    if (fifo_out) {
-      // The generic's result feeds a write_to_fifo directly.  Emit the
-      // guarded write on the last iteration and drop the original write op.
+    if (fifo_outs.front()) {
+      // Each result feeds a write_to_fifo directly.  Emit the guarded writes on
+      // the last iteration and drop the original write ops.
       Value is_last = buildAllLast(body_builder, loc, nested.ivs, last_vals);
       auto if_op = scf::IfOp::create(body_builder, loc, TypeRange{}, is_last,
                                      /*withElseRegion=*/false);
       OpBuilder then_builder(if_op.getThenRegion().front().getTerminator());
-      ktdf::WriteToFifoOp::create(then_builder, loc, updated_carry, fifo_out);
+      for (unsigned r = 0; r < results; ++r) {
+        ktdf::WriteToFifoOp::create(then_builder, loc, updated[r],
+                                    fifo_outs[r]);
+      }
     } else {
       // The generic's result feeds other ops (e.g. a downstream inner-dim
       // reduction).  Replace all uses of the original generic with the
       // outermost loop result so those ops pick up the fully-accumulated
       // tensor after the loop completes.
-      generic_op.getResult(0).replaceAllUsesWith(
-          nested.outermost_loop.getResult(0));
+      for (unsigned r = 0; r < results; ++r) {
+        generic_op.getResult(r).replaceAllUsesWith(
+            nested.outermost_loop.getResult(r));
+      }
       // write_to_fifo has no results so use_empty() is always true; exclude
       // it from the erase list so it is preserved together with the ops that
       // feed it (G2 etc).
@@ -990,21 +1017,24 @@ struct ReductionLoopExposurePass
     }
 
     // Replace the placeholder yield in the innermost loop with the real one.
-    inner_yield->setOperand(0, updated_carry);
+    for (unsigned r = 0; r < results; ++r) {
+      inner_yield->setOperand(r, updated[r]);
+    }
 
     // Erase original body ops (reverse order, only if unused).
     for (auto* op : llvm::reverse(to_erase))
       if (op->use_empty()) rewriter.eraseOp(op);
-  }
 
+    return success();
+  }
   // -------------------------------------------------------------------------
   // Rewrite the conditional-store stage with N nested scf.for loops:
   //   scf.for %r0 = 0 to D0
   //     scf.for %r1 = 0 to D1
   //       ...
-  //         <all original body ops except the data_transfer>
+  //         <all original body ops except the data_transfers>
   //         if (all ivs == last):
-  //           <the data_transfer>
+  //           <the data_transfers>
   // -------------------------------------------------------------------------
   void rewriteConditionalStoreStage(IRRewriter& rewriter, Location loc,
                                     MLIRContext* ctx, ktdf::StageOp stage,
@@ -1012,12 +1042,12 @@ struct ReductionLoopExposurePass
                                     Value step, ArrayRef<Value> last_vals) {
     Block* body = stage.getBody();
 
-    // Find the data_transfer that must be conditioned.
-    ktdf::DataTransferOp transfer;
-    body->walk([&](ktdf::DataTransferOp xfer) {
-      transfer = xfer;
-      return WalkResult::interrupt();
-    });
+    // Find the data_transfers that must be conditioned.  A compute stores one
+    // result per accumulator, and each store is a transfer of its own.
+    SmallVector<ktdf::DataTransferOp> transfers;
+    for (Operation& op : *body)
+      if (auto xfer = dyn_cast<ktdf::DataTransferOp>(&op))
+        transfers.push_back(xfer);
 
     // Capture an iterator to the first original op *before* the loop shell is
     // prepended.  iplist iterators survive insertions elsewhere in the list, so
@@ -1036,15 +1066,22 @@ struct ReductionLoopExposurePass
                                        body->getOperations(), first_original,
                                        body->end());
 
-    if (!transfer) return;  // no transfer found — nothing to guard
+    if (transfers.empty()) return;  // no transfer found — nothing to guard
 
-    // Wrap just the data_transfer in scf.if (all ivs == last).
-    rewriter.setInsertionPoint(transfer);
+    // Wrap the data_transfers in one scf.if (all ivs == last).  Every one of
+    // them carries a partial until the last iteration, so guarding a subset
+    // would store a partial result.
+    //
+    // The if goes at the last of them: a transfer's address may be computed
+    // between two transfers, and that has to stay in front of the if to still
+    // dominate the transfer that reads it.
+    rewriter.setInsertionPoint(transfers.back());
     Value is_last = buildAllLast(rewriter, loc, nested.ivs, last_vals);
     auto if_op = scf::IfOp::create(rewriter, loc, TypeRange{}, is_last,
                                    /*withElseRegion=*/false);
-    // Move the transfer inside the then-block.
-    transfer->moveBefore(if_op.getThenRegion().front().getTerminator());
+    // Move the transfers inside the then-block, keeping their order.
+    Operation* then_term = if_op.getThenRegion().front().getTerminator();
+    for (auto xfer : transfers) xfer->moveBefore(then_term);
   }
 };
 

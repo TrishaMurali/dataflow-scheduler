@@ -139,9 +139,18 @@ auto getBodyAllocations(linalg::GenericOp generic) -> SmallVector<Operation*> {
 
 /// Gets how many elements of its tile \p generic covers, zero if it is not
 /// static.
+///
+/// The parallel dimensions only. A register holds one element per lane of what
+/// the compute works on at once, and a reduction dimension is iterated rather
+/// than held -- counting it would size the register to every step of the
+/// reduction instead of the accumulator it carries.
 auto getTileSize(linalg::GenericOp generic) -> int64_t {
+  const auto iterators = generic.getIteratorTypesArray();
+
   int64_t result = 1;
-  for (const auto range : generic.getStaticLoopRanges()) {
+  for (const auto [dim, range] :
+       llvm::enumerate(generic.getStaticLoopRanges())) {
+    if (iterators[dim] == utils::IteratorType::reduction) continue;
     if (ShapedType::isDynamic(range)) return 0;
     if (llvm::MulOverflow<int64_t>(result, range, result)) return 0;
   }

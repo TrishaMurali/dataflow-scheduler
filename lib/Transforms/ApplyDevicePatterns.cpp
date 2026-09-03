@@ -104,6 +104,30 @@ auto ktdfSubviewSource(mlir::PatternRewriter& /*rewriter*/,
   return mlir::success();
 }
 
+// What accumulates `yielded`, as one of the kinds a reduction can be:
+//   "sum"    — arith.addf
+//   "max"    — arith.maximumf
+//   "min"    — arith.minimumf
+//   "absmax" — arith.maxnumf over math.absf of each side
+// Empty where it is none of them.
+auto reductionKindOf(mlir::Value yielded) -> llvm::StringRef {
+  mlir::Operation* accumulates = yielded.getDefiningOp();
+  if (!accumulates) return {};
+
+  if (mlir::isa<mlir::arith::AddFOp>(accumulates)) return "sum";
+  if (mlir::isa<mlir::arith::MaximumFOp>(accumulates)) return "max";
+  if (mlir::isa<mlir::arith::MinimumFOp>(accumulates)) return "min";
+
+  auto maxf = mlir::dyn_cast<mlir::arith::MaxNumFOp>(accumulates);
+  if (!maxf) return {};
+  auto lhs = mlir::dyn_cast_if_present<mlir::math::AbsFOp>(
+      maxf.getLhs().getDefiningOp());
+  auto rhs = mlir::dyn_cast_if_present<mlir::math::AbsFOp>(
+      maxf.getRhs().getDefiningOp());
+  if (!lhs || !rhs) return {};
+  return "absmax";
+}
+
 // Constraint: ktdf.is_reduction_kind(op, expected_kind)
 //
 // Expected `values` entries (in order):
@@ -128,40 +152,13 @@ auto ktdfIsReductionKind(mlir::PatternRewriter& /*rewriter*/,
       values[1].cast<mlir::Attribute>());
   if (!expected) return mlir::failure();
 
-  mlir::Block& body = generic.getRegion().front();
+  mlir::Operation* yield = generic.getRegion().front().getTerminator();
+  if (yield->getNumOperands() == 0) return mlir::failure();
 
-  llvm::SmallVector<mlir::Operation*, 3> body_ops;
-  for (mlir::Operation& op : body.without_terminator()) body_ops.push_back(&op);
-
-  llvm::StringRef kind;
-
-  if (body_ops.size() == 1) {
-    if (mlir::isa<mlir::arith::AddFOp>(body_ops[0]))
-      kind = "sum";
-    else if (mlir::isa<mlir::arith::MaximumFOp>(body_ops[0]))
-      kind = "max";
-    else if (mlir::isa<mlir::arith::MinimumFOp>(body_ops[0]))
-      kind = "min";
-    else
-      return mlir::failure();
-  } else if (body_ops.size() == 3) {
-    // ABSMAX: abs(%in), abs(%acc), maxnumf(abs1, abs2)
-    auto abs0 = mlir::dyn_cast<mlir::math::AbsFOp>(body_ops[0]);
-    auto abs1 = mlir::dyn_cast<mlir::math::AbsFOp>(body_ops[1]);
-    auto maxf = mlir::dyn_cast<mlir::arith::MaxNumFOp>(body_ops[2]);
-    if (!abs0 || !abs1 || !maxf) return mlir::failure();
-    // maxnumf must consume both absf results.
-    auto lhs = maxf.getLhs();
-    auto rhs = maxf.getRhs();
-    if (!((lhs == abs0.getResult() && rhs == abs1.getResult()) ||
-          (lhs == abs1.getResult() && rhs == abs0.getResult())))
-      return mlir::failure();
-    kind = "absmax";
-  } else {
-    return mlir::failure();
+  for (mlir::Value yielded : yield->getOperands()) {
+    if (reductionKindOf(yielded) != expected.getValue()) return mlir::failure();
   }
-
-  return mlir::success(kind == expected.getValue());
+  return mlir::success();
 }
 
 class PatternCache : public mlir::ktdf_arch::PatternCache {

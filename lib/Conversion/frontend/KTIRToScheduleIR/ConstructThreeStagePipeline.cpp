@@ -386,8 +386,12 @@ static llvm::SmallVector<int64_t> computeTileSizesFromShape(
 
 llvm::SmallVector<int64_t> ConstructThreeStagePipelinePass::determineTileSizes(
     mlir::linalg::LinalgOp linalg_op) {
-  assert(linalg_op->getNumResults() == 1 &&
-         "linalg op expected to have exactly one tensor result");
+  // Two where the compute accumulates a pair -- more than one thing, say. They
+  // are the same shape, so either says what the tile is.
+  assert(linalg_op->getNumResults() >= 1 && linalg_op->getNumResults() <= 2 &&
+         "linalg op expected to have one or two tensor results");
+  assert(llvm::all_equal(linalg_op->getResultTypes()) &&
+         "the results of a linalg op are expected to be the same shape");
 
   mlir::ShapedType shaped_type =
       mlir::dyn_cast<mlir::ShapedType>(linalg_op->getResult(0).getType());
@@ -1161,18 +1165,18 @@ void ConstructThreeStagePipelinePass::createComputeOps(
   mlir::linalg::LinalgOp compute_op = compute_ops_[0];
   LDBG(1) << "  Cloning compute op: " << compute_op->getName() << "";
 
-  // Create a dummy tensor.empty for the output operand with the tiled tensor
-  // type
-  auto empty_tensor =
-      mlir::tensor::EmptyOp::create(builder, loc, tiled_tensor_type.getShape(),
-                                    tiled_tensor_type.getElementType());
-
-  // Map the output extract_slice to the empty tensor
+  // A dummy tensor.empty per output operand, with the tiled tensor type. One
+  // each: a compute accumulating a pair has an init per half, and mapping only
+  // the first would leave the clone reading the other from outside the stage.
   auto linalg_op =
       mlir::dyn_cast<mlir::linalg::LinalgOp>(compute_op.getOperation());
-  if (linalg_op && linalg_op.getNumDpsInits() > 0) {
-    mlir::Value output_operand = linalg_op.getDpsInitOperand(0)->get();
-    mapper.map(output_operand, empty_tensor.getResult());
+  if (linalg_op) {
+    for (mlir::OpOperand& init : linalg_op.getDpsInitsMutable()) {
+      auto empty_tensor = mlir::tensor::EmptyOp::create(
+          builder, loc, tiled_tensor_type.getShape(),
+          tiled_tensor_type.getElementType());
+      mapper.map(init.get(), empty_tensor.getResult());
+    }
   }
 
   // Any linalg op input not already remapped
@@ -1196,10 +1200,14 @@ void ConstructThreeStagePipelinePass::createComputeOps(
 
   auto* cloned = builder.clone(*compute_op, mapper);
 
-  // Create ktdf.write_to_fifo for each store operation
+  // Create ktdf.write_to_fifo for each store operation, each writing the result
+  // that store was written from -- a compute accumulating a pair has one per
+  // half.
   for (size_t i = 0; i < store_ops_.size(); ++i) {
     mlir::Value fifo_slot = private_op.getResult(load_ops_.size() + i);
-    mlir::ktdf::WriteToFifoOp::create(builder, loc, cloned->getResult(0),
+    auto stored = mlir::dyn_cast<mlir::OpResult>(store_ops_[i].getDataTile());
+    const unsigned which = stored ? stored.getResultNumber() : 0;
+    mlir::ktdf::WriteToFifoOp::create(builder, loc, cloned->getResult(which),
                                       fifo_slot);
   }
 }

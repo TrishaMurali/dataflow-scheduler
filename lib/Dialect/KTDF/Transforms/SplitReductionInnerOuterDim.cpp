@@ -182,6 +182,90 @@ static void cloneGenericBody(linalg::GenericOp src, linalg::GenericOp dst) {
 }
 
 // ---------------------------------------------------------------------------
+// Give `g2` the body that accumulates what `src` partially reduced.
+//
+// Not a copy of `src`'s body. That body works out each element's contribution
+// as well as accumulating it -- the square, where the reduction is of squares
+// -- and G1 has done that part already. What is left per result is the op that
+// accumulated it, over the partial result and the running one.
+//
+// Fails where a result is not accumulated by one op over the value running
+// through it, which is the only shape there is anything to say about.
+// ---------------------------------------------------------------------------
+static LogicalResult buildCombinerBody(linalg::GenericOp src,
+                                       linalg::GenericOp g2) {
+  Block& src_body = src.getRegion().front();
+  auto src_yield = cast<linalg::YieldOp>(src_body.getTerminator());
+  const unsigned results = static_cast<unsigned>(src.getNumDpsInits());
+  const unsigned src_inputs = static_cast<unsigned>(src.getNumDpsInputs());
+
+  OpBuilder builder(g2.getContext());
+  Block* body = builder.createBlock(&g2.getRegion());
+
+  // A partial result in, the running one out, per result.
+  for (unsigned r = 0; r < results; ++r) {
+    body->addArgument(src_body.getArgument(src_inputs + r).getType(),
+                      g2.getLoc());
+  }
+  for (unsigned r = 0; r < results; ++r) {
+    body->addArgument(src_body.getArgument(src_inputs + r).getType(),
+                      g2.getLoc());
+  }
+
+  builder.setInsertionPointToEnd(body);
+  SmallVector<Value> accumulated;
+  for (unsigned r = 0; r < results; ++r) {
+    Operation* accumulates = src_yield.getOperand(r).getDefiningOp();
+    BlockArgument running = src_body.getArgument(src_inputs + r);
+    if (!accumulates || accumulates->getNumOperands() != 2) {
+      return src.emitError("result ")
+             << r << " is not accumulated by an op over two values";
+    }
+
+    // The running value can reach the accumulation through one op rather than
+    // being an operand of it -- the abs of an absmax is over each side. So what
+    // stands in for a side is that op rebuilt over the argument where there is
+    // one, and the argument itself where there is not.
+    auto reaches = [&](Value side) {
+      if (side == running) return true;
+      Operation* through = side.getDefiningOp();
+      return through && through->getNumOperands() == 1 &&
+             through->getOperand(0) == running;
+    };
+    auto standIn = [&](Value side, Value argument) -> Value {
+      Operation* through = side.getDefiningOp();
+      if (!through || through->getNumOperands() != 1) return argument;
+      Operation* rebuilt = through->clone();
+      rebuilt->setOperand(0, argument);
+      builder.insert(rebuilt);
+      return rebuilt->getResult(0);
+    };
+
+    Value first = accumulates->getOperand(0);
+    Value second = accumulates->getOperand(1);
+    const bool running_first = reaches(first);
+    if (!running_first && !reaches(second)) {
+      return src.emitError("result ")
+             << r << " is not accumulated over the value running through it";
+    }
+
+    Value partial = body->getArgument(r);
+    Value carried = body->getArgument(results + r);
+
+    Operation* combines = accumulates->clone();
+    combines->setOperand(
+        0, running_first ? standIn(first, carried) : standIn(first, partial));
+    combines->setOperand(
+        1, running_first ? standIn(second, partial) : standIn(second, carried));
+    builder.insert(combines);
+    accumulated.push_back(combines->getResult(0));
+  }
+
+  linalg::YieldOp::create(builder, g2.getLoc(), accumulated);
+  return success();
+}
+
+// ---------------------------------------------------------------------------
 // Split a reduction linalg.generic into two:
 //
 //   Generic 1 (outer reduction): reduces the outer dims.
@@ -198,7 +282,7 @@ static void cloneGenericBody(linalg::GenericOp src, linalg::GenericOp dst) {
 //
 // The original generic is replaced by the result of Generic 2 and erased.
 // ---------------------------------------------------------------------------
-static void splitDim(CandidateInfo& info) {
+static LogicalResult splitDim(CandidateInfo& info) {
   linalg::GenericOp generic_op = info.generic_op;
   LDBG(1) << PASS_NAME ": splitDim on generic at " << generic_op.getLoc();
 
@@ -317,39 +401,59 @@ static void splitDim(CandidateInfo& info) {
                                            : utils::IteratorType::parallel;
   }
 
-  // ── Emit intermediate tensor initialiser ─────────────────────────────────
+  // ── Emit the initialisers and the two generics ───────────────────────────
+  // Still two generics; it is the intermediates, the output initialisers and
+  // the results of each that there is one of per result. A compute may
+  // accumulate a pair -- more than one thing over the same input -- and
+  // then both generics carry both halves.
+  const unsigned results = static_cast<unsigned>(generic_op.getNumResults());
   auto inter_tensor_type = RankedTensorType::get(inter_shape, elem_type);
-  auto inter_empty =
-      tensor::EmptyOp::create(builder, loc, inter_shape, elem_type);
 
-  // ── Emit Generic 1 ───────────────────────────────────────────────────────
-  auto g1 = linalg::GenericOp::create(
-      builder, loc,
-      /*resultTensorTypes=*/TypeRange{inter_tensor_type},
-      /*inputs=*/generic_op.getInputs(),
-      /*outputs=*/ValueRange{inter_empty.getResult()},
-      ArrayRef<AffineMap>{g1_in_map, g1_out_map}, g1_iter_types);
+  SmallVector<Type> inter_types(results, inter_tensor_type);
+  SmallVector<Value> inter_inits;
+  for (unsigned r = 0; r < results; ++r) {
+    inter_inits.push_back(
+        tensor::EmptyOp::create(builder, loc, inter_shape, elem_type)
+            .getResult());
+  }
+
+  SmallVector<AffineMap> g1_maps(generic_op.getNumDpsInputs(), g1_in_map);
+  g1_maps.append(results, g1_out_map);
+  auto g1 = linalg::GenericOp::create(builder, loc,
+                                      /*resultTensorTypes=*/inter_types,
+                                      /*inputs=*/generic_op.getInputs(),
+                                      /*outputs=*/inter_inits, g1_maps,
+                                      g1_iter_types);
   cloneGenericBody(generic_op, g1);
 
-  // ── Emit output tensor initialiser for Generic 2 ─────────────────────────
-  auto out_empty =
-      tensor::EmptyOp::create(builder, loc, output_type.getShape(), elem_type);
+  SmallVector<Type> out_types(results, output_type);
+  SmallVector<Value> out_inits;
+  for (unsigned r = 0; r < results; ++r) {
+    out_inits.push_back(
+        tensor::EmptyOp::create(builder, loc, output_type.getShape(), elem_type)
+            .getResult());
+  }
 
-  // ── Emit Generic 2 ───────────────────────────────────────────────────────
-  auto g2 = linalg::GenericOp::create(
-      builder, loc,
-      /*resultTensorTypes=*/TypeRange{output_type},
-      /*inputs=*/ValueRange{g1.getResult(0)},
-      /*outputs=*/ValueRange{out_empty.getResult()},
-      ArrayRef<AffineMap>{g2_in_map, g2_out_map}, g2_iter_types);
-  cloneGenericBody(generic_op, g2);
+  SmallVector<AffineMap> g2_maps(results, g2_in_map);
+  g2_maps.append(results, g2_out_map);
+  auto g2 =
+      linalg::GenericOp::create(builder, loc,
+                                /*resultTensorTypes=*/out_types,
+                                /*inputs=*/g1.getResults(),
+                                /*outputs=*/out_inits, g2_maps, g2_iter_types);
+  if (failed(buildCombinerBody(generic_op, g2))) return failure();
 
-  // ── Replace and erase original generic and its now-dead output init ──────
-  generic_op.getResult(0).replaceAllUsesWith(g2.getResult(0));
-  Value orig_out_init = generic_op.getOutputs().front();
+  // ── Replace and erase original generic and its now-dead output inits ─────
+  for (unsigned r = 0; r < results; ++r) {
+    generic_op.getResult(r).replaceAllUsesWith(g2.getResult(r));
+  }
+  SmallVector<Value> orig_inits(generic_op.getOutputs());
   generic_op.erase();
-  if (orig_out_init.use_empty())
-    if (auto* def = orig_out_init.getDefiningOp()) def->erase();
+  for (Value init : orig_inits) {
+    if (!init.use_empty()) continue;
+    if (auto* def = init.getDefiningOp()) def->erase();
+  }
+  return success();
 }
 
 struct SplitReductionInnerOuterDimPass
@@ -407,7 +511,7 @@ struct SplitReductionInnerOuterDimPass
       FailureOr<CandidateInfo> info =
           partitionReductionDims(generic_op, vector_length);
       if (failed(info)) continue;
-      splitDim(*info);
+      if (failed(splitDim(*info))) return signalPassFailure();
     }
   }
 };

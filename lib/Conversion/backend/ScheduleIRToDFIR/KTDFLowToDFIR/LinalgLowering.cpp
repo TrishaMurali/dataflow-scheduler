@@ -92,7 +92,7 @@ struct LowerLinalgGenericPattern
                    generic_op.getDpsInputs())) {
       mlir::Value converted =
           convertConstTensorInputToVector(input, generic_op, rewriter);
-      block_arg.replaceAllUsesWith(converted);
+      rewriter.replaceAllUsesWith(block_arg, converted);
     }
 
     // Identity affine map used as op_specific_map for binary ops.
@@ -179,7 +179,10 @@ struct LowerLinalgGenericPattern
 
     mlir::Block& body = generic_op.getRegion().front();
     auto yield_op = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
-    if (!yield_op || yield_op.getNumOperands() != 1) return mlir::failure();
+    const unsigned accumulators = generic_op.getNumDpsInits();
+    if (!yield_op || yield_op.getNumOperands() != accumulators) {
+      return mlir::failure();
+    }
 
     // Replace input block arguments with their corresponding linalg ins
     // operands.
@@ -187,19 +190,27 @@ struct LowerLinalgGenericPattern
     for (auto [block_arg, input] :
          llvm::zip(body.getArguments().take_front(num_inputs),
                    generic_op.getDpsInputs()))
-      block_arg.replaceAllUsesWith(input);
+      rewriter.replaceAllUsesWith(block_arg, input);
 
-    // The output block argument represents the current accumulator value held
-    // in the output memref.  Emit an agen.vector_load to read it into a vector,
-    // then replace all uses of the output block arg with that loaded vector.
-    mlir::Value out_memref = generic_op.getDpsInitOperand(0)->get();
-    auto out_memref_type = mlir::cast<mlir::MemRefType>(out_memref.getType());
-    auto acc_vec_type =
-        getFlattenedVectorType(out_memref_type, resource_kinds_);
-    if (!acc_vec_type) return mlir::failure();
+    // Each output block argument is the accumulator value the matching memref
+    // holds. Read each into a vector and let the body read that instead. There
+    // is one per result: a compute that accumulates more than one thing
+    // accumulates into two.
+    llvm::SmallVector<mlir::Value> out_memrefs;
     rewriter.setInsertionPoint(generic_op);
-    body.getArguments().back().replaceAllUsesWith(
-        scheduler::emitVectorLoad(rewriter, loc, acc_vec_type, out_memref));
+    for (unsigned r = 0; r < accumulators; ++r) {
+      mlir::Value out_memref = generic_op.getDpsInitOperand(r)->get();
+      out_memrefs.push_back(out_memref);
+
+      auto out_memref_type = mlir::cast<mlir::MemRefType>(out_memref.getType());
+      auto acc_vec_type =
+          getFlattenedVectorType(out_memref_type, resource_kinds_);
+      if (!acc_vec_type) return mlir::failure();
+
+      rewriter.replaceAllUsesWith(
+          body.getArgument(num_inputs + r),
+          scheduler::emitVectorLoad(rewriter, loc, acc_vec_type, out_memref));
+    }
 
     mlir::AffineMap identity_map =
         mlir::AffineMap::getMultiDimIdentityMap(1, rewriter.getContext());
@@ -237,6 +248,12 @@ struct LowerLinalgGenericPattern
                     op, op.getLhs(), op.getRhs(), rewriter, identity_map,
                     mlir::vectorchain::VectorChainBinaryOperator::min);
               })
+              .Case<mlir::memref::StoreOp>([&](mlir::memref::StoreOp op) {
+                return lowerMemRefStore(op, rewriter);
+              })
+              .Case<mlir::memref::LoadOp>([&](mlir::memref::LoadOp op) {
+                return lowerMemRefLoad(op, rewriter);
+              })
               .Case<mlir::arith::MaxNumFOp>([&](mlir::arith::MaxNumFOp op) {
                 return lowerBinaryFOp(
                     op, op.getLhs(), op.getRhs(), rewriter, identity_map,
@@ -249,9 +266,11 @@ struct LowerLinalgGenericPattern
       if (mlir::failed(result)) return mlir::failure();
     }
 
-    // Write the vectorchain.binary result back to the output buffer.
-    scheduler::emitVectorStore(rewriter, loc, yield_op.getOperand(0),
-                               out_memref);
+    // Write each accumulated vector back to the buffer it came from.
+    for (unsigned r = 0; r < accumulators; ++r) {
+      scheduler::emitVectorStore(rewriter, loc, yield_op.getOperand(r),
+                                 out_memrefs[r]);
+    }
 
     rewriter.eraseOp(generic_op);
     return mlir::success();
