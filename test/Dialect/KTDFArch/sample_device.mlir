@@ -215,4 +215,40 @@ ktdf_arch.device @sample_device {
       }
     }
   }
+
+  patterns ["post_scheduling"] {
+    // SUM  →  simdreduction_sum
+    pdl.pattern : benefit(1) {
+      %in  = operand
+      %acc = operand
+      %generic = operation "linalg.generic" (%in, %acc : !pdl.value, !pdl.value)
+      apply_native_constraint "ktdf.is_inner_dim_reduction"(%generic : !pdl.operation)
+      %expected_kind = attribute = "sum"
+      apply_native_constraint "ktdf.is_reduction_kind"(%generic, %expected_kind : !pdl.operation, !pdl.attribute)
+
+      rewrite {
+        %acc_src = apply_native_rewrite "ktdf.subview_source"(%acc : !pdl.value) : !pdl.value
+        %new_op = operation "test.simd_reduction_sum"
+          (%in, %acc_src : !pdl.value, !pdl.value)
+        replace %generic with %new_op
+      }
+    }
+
+    // ABSMAX  →  test.simd_absmax
+    pdl.pattern : benefit(1) {
+      %in  = operand
+      %acc = operand
+      %generic = operation "linalg.generic" (%in, %acc : !pdl.value, !pdl.value)
+      apply_native_constraint "ktdf.is_inner_dim_reduction"(%generic : !pdl.operation)
+      %expected_kind = attribute = "absmax"
+      apply_native_constraint "ktdf.is_reduction_kind"(%generic, %expected_kind : !pdl.operation, !pdl.attribute)
+
+      rewrite {
+        %acc_src = apply_native_rewrite "ktdf.subview_source"(%acc : !pdl.value) : !pdl.value
+        %new_op = operation "test.simd_reduction_absmax"
+          (%in, %acc_src : !pdl.value, !pdl.value)
+        replace %generic with %new_op
+      }
+    }
+  }
 }

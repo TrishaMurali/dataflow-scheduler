@@ -60,12 +60,8 @@ namespace {
 // inner-dim reduction generic produced by MapReductionPartials — and whose
 // single output operand is defined by a memref.subview.
 auto ktdfIsInnerDimReduction(mlir::PatternRewriter& /*rewriter*/,
-                             mlir::PDLResultList& /*results*/,
-                             llvm::ArrayRef<mlir::PDLValue> values)
-    -> mlir::LogicalResult {
-  assert(values.size() == 1);
-  auto generic = llvm::dyn_cast_if_present<mlir::linalg::GenericOp>(
-      values[0].cast<mlir::Operation*>());
+                             mlir::Operation* op) -> mlir::LogicalResult {
+  auto generic = llvm::dyn_cast_if_present<mlir::linalg::GenericOp>(op);
   if (!generic || generic.getInputs().empty()) return mlir::failure();
 
   auto input_type =
@@ -109,6 +105,10 @@ auto ktdfSubviewSource(mlir::PatternRewriter& /*rewriter*/,
 }
 
 // Constraint: ktdf.is_reduction_kind(op, expected_kind)
+//
+// Expected `values` entries (in order):
+//   [0] mlir::Operation*   — the linalg.generic op to inspect
+//   [1] mlir::Attribute    — a StringAttr naming the expected reduction kind
 //
 // Succeeds when `op` is a linalg.generic whose body matches `expected_kind`:
 //   "sum"    — single arith.addf
