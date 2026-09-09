@@ -32,7 +32,6 @@
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
-#include "dataflow-scheduler/Dialect/KTDF/Analysis/PipelineScope.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/DebugLog.h"
@@ -75,13 +74,13 @@ class DataTransferLegality {
     mlir::ktdf::StageOp                  stage;
     std::unique_ptr<PipelineAnalysis>    nestedPipeline; // non-null if stage wraps a nested pipeline
     llvm::SmallVector<TransferStep>      transfers;      // empty when nestedPipeline is set
+    mlir::scf::ForOp                     innermostLoop;  // innermost scf.for enclosing the transfers
   };
 
   /// Root node of a per-pipeline analysis tree. Shared parameters (targetDim,
   /// requiredSize) are stored here so all child nodes can read them directly.
   struct PipelineAnalysis {
     mlir::ktdf::PipelineOp                   pipeline;
-    llvm::SmallVector<mlir::scf::ForOp>      loops;           // enclosing scf.for loops
     llvm::SmallVector<mlir::memref::AllocOp> allocs;          // staging buffer allocs in ktdf.private
     int64_t                                  targetDim    = -1; // dimension to target the size change with
     int64_t                                  requiredSize =  0; // elements per hardware word (wordBytes / elemBytes)
@@ -96,10 +95,6 @@ class DataTransferLegality {
       const scheduler::arch_view::ResourceKinds& resourceKinds) {
     PipelineAnalysis pa{};
     pa.pipeline = pipeline;
-
-    // Collect enclosing scf.for loops (innermost-to-outermost).
-    auto scope = mlir::ktdf::getPipelineEnclosingScope(pipeline);
-    pa.loops = std::move(scope.loops);
 
     // Collect staging buffer allocs from the ktdf.private region.
     if (auto privateOp = pipeline.getPrivateOp()) {
@@ -169,7 +164,7 @@ private:
   /// Returns the single applicable unit kind for the stage enclosing `op`,
   /// stopping at any PipelineOp boundary. Returns nullptr if the stage has
   /// zero or more than one unit.
-  [[maybe_unused]] mlir::Attribute getUnitKind(mlir::Operation* op) {
+  mlir::Attribute getUnitKind(mlir::Operation* op) {
     mlir::Operation* cursor = op->getParentOp();
     while (cursor && !mlir::isa<mlir::ktdf::StageOp>(cursor)) {
       if (mlir::isa<mlir::ktdf::PipelineOp>(cursor)) return nullptr;
@@ -183,7 +178,7 @@ private:
   }
 
   /// Returns the Load feature for the unit enclosing `op`.
-  [[maybe_unused]] std::optional<mlir::ktdf_arch::feature::Load> getLoad(
+  std::optional<mlir::ktdf_arch::feature::Load> getLoad(
       mlir::Operation* op,
       const scheduler::arch_view::ResourceKinds& resourceKinds) {
     auto kind = getUnitKind(op);
@@ -194,7 +189,7 @@ private:
   }
 
   /// Returns the Store feature for the unit enclosing `op`.
-  [[maybe_unused]] std::optional<mlir::ktdf_arch::feature::Store> getStore(
+  std::optional<mlir::ktdf_arch::feature::Store> getStore(
       mlir::Operation* op,
       const scheduler::arch_view::ResourceKinds& resourceKinds) {
     auto kind = getUnitKind(op);
@@ -205,7 +200,7 @@ private:
   }
 
   /// Returns the word size in bytes for `load` accessing `space`.
-  [[maybe_unused]] std::optional<uint64_t> getWordSize(
+  std::optional<uint64_t> getWordSize(
       mlir::ktdf_arch::feature::Load load, mlir::Attribute space) {
     auto map = load.getWordSize();
     if (!map) return std::nullopt;
@@ -213,7 +208,7 @@ private:
   }
 
   /// Returns the word size in bytes for `store` accessing `space`.
-  [[maybe_unused]] std::optional<uint64_t> getWordSize(
+  std::optional<uint64_t> getWordSize(
       mlir::ktdf_arch::feature::Store store, mlir::Attribute space) {
     auto map = store.getWordSize();
     if (!map) return std::nullopt;
@@ -221,7 +216,7 @@ private:
   }
 
   /// Returns the access granularity list for `load` and `space`.
-  [[maybe_unused]] std::optional<mlir::ktdf_arch::AccessGranularityListAttr>
+  std::optional<mlir::ktdf_arch::AccessGranularityListAttr>
   getAccessGranularity(mlir::ktdf_arch::feature::Load load, mlir::Attribute space) {
     auto list = load.getAccessGranularity(space);
     if (!list) return std::nullopt;
@@ -229,7 +224,7 @@ private:
   }
 
   /// Returns the access granularity list for `store` and `space`.
-  [[maybe_unused]] std::optional<mlir::ktdf_arch::AccessGranularityListAttr>
+  std::optional<mlir::ktdf_arch::AccessGranularityListAttr>
   getAccessGranularity(mlir::ktdf_arch::feature::Store store, mlir::Attribute space) {
     auto list = store.getAccessGranularity(space);
     if (!list) return std::nullopt;
@@ -238,7 +233,7 @@ private:
 
   /// Returns the word size in bytes for `op`'s unit accessing `space`.
   /// Tries load feature first, then store.
-  [[maybe_unused]] std::optional<uint64_t> getWordSize(
+  std::optional<uint64_t> getWordSize(
       mlir::ktdf::DataTransferOp op,
       mlir::Attribute space,
       const scheduler::arch_view::ResourceKinds& resourceKinds) {
@@ -251,7 +246,7 @@ private:
 
   /// Returns the access granularity list for `op`'s unit accessing `space`.
   /// Tries load feature first, then store.
-  [[maybe_unused]] std::optional<mlir::ktdf_arch::AccessGranularityListAttr>
+  std::optional<mlir::ktdf_arch::AccessGranularityListAttr>
   getAccessGranularity(
       mlir::ktdf::DataTransferOp op,
       mlir::Attribute space,
@@ -265,7 +260,7 @@ private:
 
   /// Returns the innermost stride of `memref`. Returns 1 for identity/default
   /// row-major layouts. Returns failure() if the innermost stride is dynamic.
-  [[maybe_unused]] llvm::FailureOr<int64_t> innermostStride(mlir::MemRefType memref) {
+  llvm::FailureOr<int64_t> innermostStride(mlir::MemRefType memref) {
     llvm::SmallVector<int64_t, 4> strides;
     int64_t offset;
     if (mlir::failed(memref.getStridesAndOffset(strides, offset)) || strides.empty())
@@ -281,7 +276,7 @@ private:
   ///
   /// Returns true if legal, false if illegal but correctable, nullopt on
   /// hard failure (error already emitted).
-  [[maybe_unused]] std::optional<bool> checkSourceMemRef(
+  std::optional<bool> checkSourceMemRef(
       mlir::ktdf::DataTransferOp dt,
       mlir::MemRefType srcMemref,
       llvm::ArrayRef<int64_t> transferSizes,
@@ -421,6 +416,11 @@ private:
       return sa;
     }
 
+    // Find the innermost scf.for enclosing the transfers in this stage.
+    stage->walk<mlir::WalkOrder::PreOrder>([&](mlir::scf::ForOp forOp) {
+      sa.innermostLoop = forOp;
+    });
+
     // Leaf stage: collect every data_transfer op.
     stage->walk([&](mlir::ktdf::DataTransferOp dt) {
       auto ts = classifyTransferStep(dt, resourceKinds);
@@ -462,6 +462,10 @@ static llvm::raw_ostream& printStageAnalysis(llvm::raw_ostream& os,
                                              llvm::StringRef indent) {
   os << indent << "StageAnalysis{stage=";
   if (sa.stage) os << sa.stage->getLoc(); else os << "<unset>";
+  if (sa.innermostLoop) {
+    os << "\n" << indent << "  innermostLoop=";
+    sa.innermostLoop->print(os, mlir::OpPrintingFlags().skipRegions());
+  }
   if (sa.nestedPipeline) {
     os << ", nestedPipeline=\n";
     printPipelineAnalysis(os, *sa.nestedPipeline, (indent + "  ").str());
@@ -494,14 +498,6 @@ static llvm::raw_ostream& printPipelineAnalysis(llvm::raw_ostream& os,
   os << "\n";
   os << indent << "  targetDim=" << pa.targetDim << "\n";
   os << indent << "  requiredSize=" << pa.requiredSize << "\n";
-  if (pa.loops.empty()) {
-    os << indent << "  loops=<none>\n";
-  } else {
-    for (auto loop : pa.loops) {
-      os << indent << "  loop=[" << loop.getLowerBound() << ", "
-         << loop.getUpperBound() << ", " << loop.getStep() << "]\n";
-    }
-  }
   if (pa.allocs.empty()) {
     os << indent << "  allocs=<none>\n";
   } else {
