@@ -516,14 +516,13 @@ def HoistConstantStoragePass : Pass<"hoist-constant-storage", "mlir::func::FuncO
 }
 
 def DataTransferAlignmentPass : Pass<"data-transfer-alignment", "mlir::ModuleOp"> {
-  let summary = "Widen illegal ktdf.data_transfer strides to hardware-legal granularity";
+  let summary = "Align ktdf.data_transfer ops to hardware requirements";
   let description = [{
-    Detects ktdf.data_transfer ops whose source address map has a non-unit
-    innermost stride (illegal for the Load unit) and widens them — and any
-    peer transfers in the same enclosing scf.for — to a size that is both a
-    multiple of the transfer granularity and aligned to the access granularity
-    read from the ktdf_arch.device spec.  The fix-and-re-analyse loop runs
-    until no violations remain or a hard iteration limit (64) is hit.
+    Reads word size and access alignment constraints from the ktdf_arch.device
+    spec and rewrites any transfers that violate those constraints, resizing
+    staging buffers and transfer shapes until all transfers are legal.
+
+    Must run after stage-coarsening + canonicalize and before double-buffering.
   }];
   let constructor = "::scheduler::createDataTransferAlignmentPass()";
 }
