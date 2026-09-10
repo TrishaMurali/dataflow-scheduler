@@ -432,6 +432,13 @@ private:
       PipelineAnalysis stub{};
       stub.pipeline = nestedPipeline;
       sa.nestedPipeline = std::make_unique<PipelineAnalysis>(std::move(stub));
+      // Also find the innermost loop enclosing the nested pipeline — it needs
+      // to be collapsed to ub=1 just like leaf stage loops, so that the only
+      // column iteration is the loop inserted by insertLoopAroundPipeline.
+      stage->walk<mlir::WalkOrder::PreOrder>([&](mlir::scf::ForOp forOp) {
+        if (!nestedPipeline->isAncestor(forOp))
+          sa.innermostLoop = forOp;
+      });
       return sa;
     }
 
@@ -769,8 +776,11 @@ static void rewriteTransferShape(const DataTransferLegality::TransferStep& ts,
 
 /// Replaces ts.transfer with a new DataTransferOp with pa.targetDim shrunk to
 /// 1 and transfer_mode set to `mode` ("splat" or "extract").
+/// outerE is the enclosing pipeline's requiredSize (E), used to locate the
+/// column dimension in the ct_local buffer by matching its stride value.
 static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
                                   const DataTransferLegality::PipelineAnalysis& pa,
+                                  int64_t outerE,
                                   llvm::StringRef mode,
                                   mlir::OpBuilder& builder) {
   mlir::ktdf::DataTransferOp op = ts.transfer;
@@ -791,16 +801,83 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
   if (dst_dim >= 0 && dst_dim < dst_rank)
     new_dst_sizes[dst_dim] = one;
 
+  // Find the column loop IV by walking up to the nearest scf.for outside the
+  // enclosing ktdf.pipeline. This is the loop inserted by
+  // insertLoopAroundPipeline and its IV indexes the column of the tile.
+  mlir::Value col_iv;
+  mlir::Operation* cursor = op->getParentOp();
+  while (cursor) {
+    if (mlir::isa<mlir::ktdf::PipelineOp>(cursor)) {
+      cursor = cursor->getParentOp();
+      continue;
+    }
+    if (auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(cursor)) {
+      col_iv = for_op.getInductionVar();
+      break;
+    }
+    cursor = cursor->getParentOp();
+  }
+
+  // Extend the affine map on the ct_local side to include the column loop IV.
+  // The column dimension is the one whose stride equals E — this varies per
+  // buffer since load and store buffers have transposed stride layouts.
+  auto extendMap = [&](mlir::Value memref_val, mlir::AffineMap map,
+                       llvm::SmallVector<mlir::Value>& indices)
+      -> mlir::AffineMap {
+    if (!col_iv) return map;
+    auto mrt = mlir::dyn_cast<mlir::MemRefType>(memref_val.getType());
+    if (!mrt) return map;
+    auto ms = mlir::dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(
+        mrt.getMemorySpace());
+    if (!ms || ms.getKind() != mlir::ktdp::MemorySpaceKind::ct_local)
+      return map;
+
+    // Find the column dimension: among the two innermost dims, pick the one
+    // with stride 1 — that is the contiguous (column-traversal) direction.
+    llvm::SmallVector<int64_t> strides;
+    int64_t offset;
+    int64_t col_idx = -1;
+    if (mlir::succeeded(mrt.getStridesAndOffset(strides, offset))) {
+      int64_t rank = (int64_t)strides.size();
+      for (int64_t i = rank - 2; i < rank; ++i) {
+        if (strides[i] == 1) {
+          col_idx = i;
+          break;
+        }
+      }
+    }
+    if (col_idx < 0 || col_idx >= (int64_t)mrt.getRank()) return map;
+
+    // Append col_iv as a new affine map dimension.
+    indices.push_back(col_iv);
+    unsigned new_dim = map.getNumDims(); // index of the newly added dim
+
+    // Rebuild the map results, replacing the constant 0 at col_idx with the
+    // new dimension expression.
+    llvm::SmallVector<mlir::AffineExpr> results(map.getResults());
+    results[col_idx] = mlir::getAffineDimExpr(new_dim, ctx);
+    return mlir::AffineMap::get(map.getNumDims() + 1, map.getNumSymbols(),
+                                results, ctx);
+  };
+
+  auto new_src_indices =
+      llvm::SmallVector<mlir::Value>(op.getSourceIndices());
+  auto new_dst_indices =
+      llvm::SmallVector<mlir::Value>(op.getDestIndices());
+
   mlir::AffineMap src_map =
       op.isSourceMemRef() ? op.getSourceMapAttr().getValue() : mlir::AffineMap{};
   mlir::AffineMap dst_map =
       op.isDestMemRef() ? op.getDestMapAttr().getValue() : mlir::AffineMap{};
 
+  src_map = extendMap(op.getSource(), src_map, new_src_indices);
+  dst_map = extendMap(op.getDestination(), dst_map, new_dst_indices);
+
   builder.setInsertionPoint(op);
   auto new_op = mlir::ktdf::DataTransferOp::create(
       builder, op.getLoc(),
-      op.getSource(), src_map, op.getSourceIndices(), new_src_sizes,
-      op.getDestination(), dst_map, op.getDestIndices(), new_dst_sizes);
+      op.getSource(), src_map, new_src_indices, new_src_sizes,
+      op.getDestination(), dst_map, new_dst_indices, new_dst_sizes);
 
   for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
     new_op->setDiscardableAttr(attr.getName(), attr.getValue());
@@ -850,6 +927,7 @@ static mlir::LogicalResult fixPipeline(
     DataTransferLegality& legality,
     DataTransferLegality::PipelineAnalysis& pa,
     const scheduler::arch_view::ResourceKinds& resourceKinds,
+    int64_t outerE,
     mlir::OpBuilder& builder) {
   LDBG(1) << "  fixPipeline: pipeline at " << pa.pipeline.getLoc()
           << " E=" << pa.requiredSize;
@@ -857,12 +935,18 @@ static mlir::LogicalResult fixPipeline(
   for (DataTransferLegality::StageAnalysis& sa : pa.stages) {
 
     if (sa.nestedPipeline != nullptr) {
+      // Collapse the tile loop enclosing the nested pipeline to ub=1 so the
+      // only column iteration is the element loop inserted below.
+      if (mlir::failed(adjustLoopBounds(sa, pa, builder)))
+        return mlir::failure();
+
       *sa.nestedPipeline = legality.analyzePipeline(
           sa.nestedPipeline->pipeline, resourceKinds);
       LDBG(1) << "  nested PipelineAnalysis:\n" << *sa.nestedPipeline;
 
       insertLoopAroundPipeline(sa.nestedPipeline.get(), pa.requiredSize, builder);
-      if (mlir::failed(fixPipeline(legality, *sa.nestedPipeline, resourceKinds, builder)))
+      if (mlir::failed(fixPipeline(legality, *sa.nestedPipeline, resourceKinds,
+                                   pa.requiredSize, builder)))
         return mlir::failure();
       continue;
     }
@@ -876,14 +960,14 @@ static mlir::LogicalResult fixPipeline(
       // FIFO-side transfers are checked first — splat/extract describe the
       // fundamental transfer kind and take priority over stride illegality.
       if (ts.needsSplat) {
-        rewriteTransferShrink(ts, pa, "splat", builder);
+        rewriteTransferShrink(ts, pa, outerE, "splat", builder);
         continue;
       }
 
       // FIFO→memref transfers are shrunk to size [1] with no transfer_mode
       // attr — the lowering handles single-element receive + store implicitly.
       if (ts.transfer.isSourceFifo() && ts.transfer.isDestMemRef()) {
-        rewriteTransferShrink(ts, pa, "", builder);
+        rewriteTransferShrink(ts, pa, outerE, "", builder);
         continue;
       }
 
@@ -923,7 +1007,7 @@ struct DataTransferAlignmentPass
     for (auto& pa : pipelines) {
       LDBG(1) << pa;
       if (pa.requiredSize == 0) continue;  // nothing to fix for this pipeline
-      if (mlir::failed(fixPipeline(legality_, pa, resource_kinds, builder))) {
+      if (mlir::failed(fixPipeline(legality_, pa, resource_kinds, pa.requiredSize, builder))) {
         signalPassFailure();
         return;
       }
