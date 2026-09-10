@@ -29,7 +29,7 @@
 #include <memory>
 
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
-#include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
@@ -96,7 +96,7 @@ class DataTransferLegality {
   /// calls analyzePipeline on them after applying outer-level corrections.
   PipelineAnalysis analyzePipeline(
       mlir::ktdf::PipelineOp pipeline,
-      const scheduler::arch_view::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
     PipelineAnalysis pa{};
     pa.pipeline = pipeline;
 
@@ -199,7 +199,7 @@ private:
   /// Returns the Load feature for the unit enclosing `op`.
   std::optional<mlir::ktdf_arch::feature::Load> getLoad(
       mlir::Operation* op,
-      const scheduler::arch_view::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
     auto kind = getUnitKind(op);
     if (!kind) return std::nullopt;
     auto feat = resourceKinds.getFeature<mlir::ktdf_arch::feature::Load>(kind);
@@ -210,7 +210,7 @@ private:
   /// Returns the Store feature for the unit enclosing `op`.
   std::optional<mlir::ktdf_arch::feature::Store> getStore(
       mlir::Operation* op,
-      const scheduler::arch_view::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
     auto kind = getUnitKind(op);
     if (!kind) return std::nullopt;
     auto feat = resourceKinds.getFeature<mlir::ktdf_arch::feature::Store>(kind);
@@ -255,7 +255,7 @@ private:
   std::optional<uint64_t> getWordSize(
       mlir::ktdf::DataTransferOp op,
       mlir::Attribute space,
-      const scheduler::arch_view::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
     if (auto load = getLoad(op, resourceKinds))
       return getWordSize(*load, space);
     if (auto store = getStore(op, resourceKinds))
@@ -269,7 +269,7 @@ private:
   getAccessGranularity(
       mlir::ktdf::DataTransferOp op,
       mlir::Attribute space,
-      const scheduler::arch_view::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
     if (auto load = getLoad(op, resourceKinds))
       return getAccessGranularity(*load, space);
     if (auto store = getStore(op, resourceKinds))
@@ -299,7 +299,7 @@ private:
       mlir::ktdf::DataTransferOp dt,
       mlir::MemRefType srcMemref,
       llvm::ArrayRef<int64_t> transferSizes,
-      const scheduler::arch_view::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
     auto space = srcMemref.getMemorySpace();
 
     auto wordBytes    = getWordSize(dt, space, resourceKinds);
@@ -385,7 +385,7 @@ private:
   /// requiredSize is known. Returns nullopt on hard failure (error already emitted).
   std::optional<TransferStep> classifyTransferStep(
       mlir::ktdf::DataTransferOp dt,
-      const scheduler::arch_view::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
     TransferStep ts{};
     ts.transfer = dt;
 
@@ -416,7 +416,7 @@ private:
   /// transfer is illegal; isDisplaced/needsSplat are set later.
   StageAnalysis analyzeStage(
       mlir::ktdf::StageOp stage,
-      const scheduler::arch_view::ResourceKinds& resourceKinds,
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds,
       bool& hasIllegal) {
     StageAnalysis sa{};
     sa.stage = stage;
@@ -926,7 +926,7 @@ static void insertLoopAroundPipeline(
 static mlir::LogicalResult fixPipeline(
     DataTransferLegality& legality,
     DataTransferLegality::PipelineAnalysis& pa,
-    const scheduler::arch_view::ResourceKinds& resourceKinds,
+    const mlir::ktdf_arch::ResourceKinds& resourceKinds,
     int64_t outerE,
     mlir::OpBuilder& builder) {
   LDBG(1) << "  fixPipeline: pipeline at " << pa.pipeline.getLoc()
@@ -994,7 +994,7 @@ struct DataTransferAlignmentPass
       return;
     }
     auto& resource_kinds =
-        device_manager.getOrCreateView<scheduler::arch_view::ResourceKinds>(*device);
+        device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
 
     llvm::SmallVector<DataTransferLegality::PipelineAnalysis> pipelines;
     getOperation()->walk<mlir::WalkOrder::PreOrder>(
