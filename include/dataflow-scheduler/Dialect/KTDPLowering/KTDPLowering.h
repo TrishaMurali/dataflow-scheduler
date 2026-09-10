@@ -31,7 +31,10 @@
 #include <mlir/Interfaces/ViewLikeInterface.h>
 
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLoweringDialect.h"  // IWYU pragma: keep
-#include "ktir/Dialect/KTDP/KTDPTypes.h"
+// Full KTDP ops header needed so that ktdp::RegionTerminatorOp (used as the
+// SingleBlockImplicitTerminator of our hidden region) is declared before the
+// generated .h.inc is parsed by the C++ compiler.
+#include "ktir/Dialect/KTDP/KTDP.h"
 
 /// Auto-generated includes.
 #define GET_OP_CLASSES
