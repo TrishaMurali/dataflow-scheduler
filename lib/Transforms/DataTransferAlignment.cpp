@@ -71,7 +71,6 @@ class DataTransferLegality {
     bool                          isIllegal    = false;  // source memref has non-contiguous stride
     bool                          isDisplaced  = false;  // peer of an illegal transfer in the same pipeline
     bool                          needsSplat   = false;  // local->FIFO: splat scalar to vector
-    bool                          needsExtract = false;  // FIFO->local: extract lane 0
   };
 
   /// Per-stage node. Exactly one of nestedPipeline or transfers is populated.
@@ -161,6 +160,19 @@ class DataTransferLegality {
         break;
       }
       if (pa.targetDim != -1) break;
+    }
+
+    // Post-analysis fixup: set needsSplat on memref→FIFO transfers now that
+    // requiredSize is known. classifyTransferStep returns early for FIFO
+    // sources so this flag must be applied here.
+    if (pa.requiredSize > 0) {
+      for (auto& sa : pa.stages) {
+        for (auto& ts : sa.transfers) {
+          mlir::ktdf::DataTransferOp dt = ts.transfer;
+          if (dt.isSourceMemRef() && dt.isDestFifo())
+            ts.needsSplat = true;
+        }
+      }
     }
 
     return pa;
@@ -401,7 +413,7 @@ private:
   /// Analyses a single stage. If it contains a nested ktdf.pipeline, stores a
   /// stub in sa.nestedPipeline for fixPipeline to resolve. Otherwise classifies
   /// every ktdf.data_transfer into sa.transfers. Sets hasIllegal if any
-  /// transfer is illegal; isDisplaced/needsSplat/needsExtract are set later.
+  /// transfer is illegal; isDisplaced/needsSplat are set later.
   StageAnalysis analyzeStage(
       mlir::ktdf::StageOp stage,
       const scheduler::arch_view::ResourceKinds& resourceKinds,
@@ -455,7 +467,6 @@ static llvm::raw_ostream& printTransferStep(llvm::raw_ostream& os,
      << indent << "  isIllegal="    << ts.isIllegal    << "\n"
      << indent << "  isDisplaced="  << ts.isDisplaced  << "\n"
      << indent << "  needsSplat="   << ts.needsSplat   << "\n"
-     << indent << "  needsExtract=" << ts.needsExtract << "\n"
      << indent << "}";
   return os;
 }
@@ -794,9 +805,10 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
   for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
     new_op->setDiscardableAttr(attr.getName(), attr.getValue());
 
-  new_op->setDiscardableAttr(
-      mlir::StringAttr::get(ctx, "transfer_mode"),
-      mlir::StringAttr::get(ctx, mode));
+  if (!mode.empty())
+    new_op->setDiscardableAttr(
+        mlir::StringAttr::get(ctx, "transfer_mode"),
+        mlir::StringAttr::get(ctx, mode));
 
   LDBG(1) << "  rewriteTransferShrink(" << mode << "): shrunk dim "
           << pa.targetDim << " to 1: " << new_op;
@@ -861,19 +873,23 @@ static mlir::LogicalResult fixPipeline(
       return mlir::failure();
 
     for (DataTransferLegality::TransferStep& ts : sa.transfers) {
-      if (ts.isIllegal || ts.isDisplaced) {
-        widenAlloc(ts, pa, builder);
-        rewriteTransferShape(ts, pa, builder);
-        continue;
-      }
-
+      // FIFO-side transfers are checked first — splat/extract describe the
+      // fundamental transfer kind and take priority over stride illegality.
       if (ts.needsSplat) {
         rewriteTransferShrink(ts, pa, "splat", builder);
         continue;
       }
 
-      if (ts.needsExtract) {
-        rewriteTransferShrink(ts, pa, "extract", builder);
+      // FIFO→memref transfers are shrunk to size [1] with no transfer_mode
+      // attr — the lowering handles single-element receive + store implicitly.
+      if (ts.transfer.isSourceFifo() && ts.transfer.isDestMemRef()) {
+        rewriteTransferShrink(ts, pa, "", builder);
+        continue;
+      }
+
+      if (ts.isIllegal || ts.isDisplaced) {
+        widenAlloc(ts, pa, builder);
+        rewriteTransferShape(ts, pa, builder);
       }
     }
   }
