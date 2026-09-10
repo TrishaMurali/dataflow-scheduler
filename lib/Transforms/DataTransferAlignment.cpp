@@ -861,7 +861,7 @@ static mlir::LogicalResult fixPipeline(
           sa.nestedPipeline->pipeline, resourceKinds);
       LDBG(1) << "  nested PipelineAnalysis:\n" << *sa.nestedPipeline;
 
-      insertLoopAroundPipeline(sa.nestedPipeline.get(), sa.nestedPipeline->requiredSize, builder);
+      insertLoopAroundPipeline(sa.nestedPipeline.get(), pa.requiredSize, builder);
       if (mlir::failed(fixPipeline(legality, *sa.nestedPipeline, resourceKinds, builder)))
         return mlir::failure();
       continue;
