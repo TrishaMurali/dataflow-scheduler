@@ -532,63 +532,6 @@ static llvm::raw_ostream& operator<<(llvm::raw_ostream& os,
   return printPipelineAnalysis(os, pa, "");
 }
 
-// Forward declaration — fixPipeline and widenAlloc are defined below, inside
-// this same anonymous namespace.
-static mlir::LogicalResult fixPipeline(
-    DataTransferLegality::PipelineAnalysis& pa,
-    const scheduler::arch_view::ResourceKinds& resourceKinds,
-    mlir::OpBuilder& builder);
-
-static void widenAlloc(const DataTransferLegality::TransferStep& ts,
-                       const DataTransferLegality::PipelineAnalysis& pa,
-                       mlir::OpBuilder& builder);
-
-struct DataTransferAlignmentPass
-    : public scheduler::impl::DataTransferAlignmentPassBase<
-          DataTransferAlignmentPass> {
-  void runOnOperation() override {
-    LDBG(1) << "========= " PASS_NAME " =========";
-
-    auto& device_manager = getAnalysis<mlir::ktdf_arch::DeviceManager>();
-    auto* device = device_manager.getOrImportDevice();
-    if (!device) {
-      getOperation()->emitError(PASS_NAME ": failed to import device spec");
-      signalPassFailure();
-      return;
-    }
-    auto& resource_kinds =
-        device_manager.getOrCreateView<scheduler::arch_view::ResourceKinds>(*device);
-
-    llvm::SmallVector<DataTransferLegality::PipelineAnalysis> pipelines;
-    getOperation()->walk<mlir::WalkOrder::PreOrder>(
-        [&](mlir::ktdf::PipelineOp pipeline) {
-          pipelines.push_back(legality_.analyzePipeline(pipeline, resource_kinds));
-          return mlir::WalkResult::skip();
-        });
-
-    mlir::OpBuilder builder(getOperation()->getContext());
-    for (auto& pa : pipelines) {
-      LDBG(1) << pa;
-      if (pa.requiredSize == 0) continue;  // nothing to fix for this pipeline
-      if (mlir::failed(fixPipeline(pa, resource_kinds, builder))) {
-        signalPassFailure();
-        return;
-      }
-    }
-  }
-
-private:
-  DataTransferLegality legality_;
-};
-
-} // namespace
-
-std::unique_ptr<mlir::Pass> scheduler::createDataTransferAlignmentPass() {
-  return std::make_unique<DataTransferAlignmentPass>();
-}
-
-namespace {
-
 /// Widens the ct_local destination alloc of `ts` at pa.targetDim to E
 /// (pa.requiredSize). Non-ct_local destinations are skipped silently.
 /// Missing AllocOp on a ct_local destination is an error.
@@ -925,4 +868,46 @@ static mlir::LogicalResult fixPipeline(
   return mlir::success();
 }
 
+struct DataTransferAlignmentPass
+    : public scheduler::impl::DataTransferAlignmentPassBase<
+          DataTransferAlignmentPass> {
+  void runOnOperation() override {
+    LDBG(1) << "========= " PASS_NAME " =========";
+
+    auto& device_manager = getAnalysis<mlir::ktdf_arch::DeviceManager>();
+    auto* device = device_manager.getOrImportDevice();
+    if (!device) {
+      getOperation()->emitError(PASS_NAME ": failed to import device spec");
+      signalPassFailure();
+      return;
+    }
+    auto& resource_kinds =
+        device_manager.getOrCreateView<scheduler::arch_view::ResourceKinds>(*device);
+
+    llvm::SmallVector<DataTransferLegality::PipelineAnalysis> pipelines;
+    getOperation()->walk<mlir::WalkOrder::PreOrder>(
+        [&](mlir::ktdf::PipelineOp pipeline) {
+          pipelines.push_back(legality_.analyzePipeline(pipeline, resource_kinds));
+          return mlir::WalkResult::skip();
+        });
+
+    mlir::OpBuilder builder(getOperation()->getContext());
+    for (auto& pa : pipelines) {
+      LDBG(1) << pa;
+      if (pa.requiredSize == 0) continue;  // nothing to fix for this pipeline
+      if (mlir::failed(fixPipeline(pa, resource_kinds, builder))) {
+        signalPassFailure();
+        return;
+      }
+    }
+  }
+
+private:
+  DataTransferLegality legality_;
+};
+
 } // namespace
+
+std::unique_ptr<mlir::Pass> scheduler::createDataTransferAlignmentPass() {
+  return std::make_unique<DataTransferAlignmentPass>();
+}
