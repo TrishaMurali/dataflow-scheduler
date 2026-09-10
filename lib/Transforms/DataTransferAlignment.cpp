@@ -87,7 +87,7 @@ class DataTransferLegality {
   struct PipelineAnalysis {
     mlir::ktdf::PipelineOp                   pipeline;
     llvm::SmallVector<mlir::memref::AllocOp> allocs;          // staging buffer allocs in ktdf.private
-    int64_t                                  targetDim    = -1; // dimension to target the size change with
+    int64_t                                  targetDim    = -1; // offset from end (0 = innermost, 1 = second-from-end)
     int64_t                                  requiredSize =  0; // elements per hardware word (wordBytes / elemBytes)
     llvm::SmallVector<StageAnalysis>         stages;            // one entry per ktdf.stage
   };
@@ -149,11 +149,13 @@ class DataTransferLegality {
 
         if (isSingleElement) {
           // Shrink: element-addressable memory, collapse to one element.
-          pa.targetDim    = srcMemref.getRank() - 1;
+          // targetDim=0 means the innermost dimension (offset 0 from end).
+          pa.targetDim    = 0;
           pa.requiredSize = 1;
         } else {
           // Widen: word-granular memory, expand to full word.
-          pa.targetDim    = srcMemref.getRank() - 2;
+          // targetDim=1 means the second-to-last dimension (offset 1 from end).
+          pa.targetDim    = 1;
           pa.requiredSize = static_cast<int64_t>(*wordBytes / *elemBytes);
         }
         break;
@@ -532,9 +534,8 @@ static llvm::raw_ostream& operator<<(llvm::raw_ostream& os,
   return printPipelineAnalysis(os, pa, "");
 }
 
-/// Widens the ct_local destination alloc of `ts` at pa.targetDim to E
-/// (pa.requiredSize). Non-ct_local destinations are skipped silently.
-/// Missing AllocOp on a ct_local destination is an error.
+/// Widens any ct_local alloc backing a source or destination of `ts` at
+/// pa.targetDim to E (pa.requiredSize). Non-ct_local sides are skipped.
 static void widenAlloc(const DataTransferLegality::TransferStep& ts,
                        const DataTransferLegality::PipelineAnalysis& pa,
                        mlir::OpBuilder& builder) {
@@ -544,113 +545,119 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
   // accessors without needing to drop the const on the TransferStep.
   mlir::ktdf::DataTransferOp dt = ts.transfer;
 
-  // Only act when the transfer destination is a ct_local memref.
-  auto dest_type =
-      mlir::dyn_cast<mlir::MemRefType>(dt.getDestination().getType());
-  if (!dest_type) return;
+  // Tries to widen the alloc backing `val` if it is a ct_local memref owned
+  // by this pipeline. Returns early silently for non-ct_local or foreign allocs.
+  auto tryWiden = [&](mlir::Value val, mlir::Value stride_source) {
+    auto memref_type = mlir::dyn_cast<mlir::MemRefType>(val.getType());
+    if (!memref_type) return;
 
-  auto mem_space = mlir::dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(
-      dest_type.getMemorySpace());
-  if (!mem_space || mem_space.getKind() != mlir::ktdp::MemorySpaceKind::ct_local)
-    return;
+    auto mem_space = mlir::dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(
+        memref_type.getMemorySpace());
+    if (!mem_space || mem_space.getKind() != mlir::ktdp::MemorySpaceKind::ct_local)
+      return;
 
-  // ct_local buffers are exposed as ktdf.private results; follow the result
-  // index into the private_yield operands to reach the backing memref.alloc.
-  // Track private_op so its declared result type can be updated to match.
-  mlir::Value base = dt.getDestination();
-
-  mlir::ktdf::PrivateOp private_op;
-  unsigned private_result_number = 0;
-  if (auto pop = mlir::dyn_cast_or_null<mlir::ktdf::PrivateOp>(
-          base.getDefiningOp())) {
-    private_result_number =
-        mlir::cast<mlir::OpResult>(base).getResultNumber();
-    base = pop.getYieldOp().getOperand(private_result_number);
-    private_op = pop;
-  }
-
-  auto alloc = mlir::dyn_cast_or_null<mlir::memref::AllocOp>(
-      base.getDefiningOp());
-  if (!alloc) {
-    ts.transfer->emitError(
-        "widenAlloc: ct_local destination has no backing AllocOp");
-    return;
-  }
-
-  mlir::MemRefType orig_type = alloc.getType();
-  llvm::SmallVector<int64_t> new_shape(orig_type.getShape());
-
-  // Map targetDim (relative to the source rank) to the alloc rank by
-  // preserving the same offset from the end:
-  //   alloc_dim = alloc_rank - (src_rank - pa.targetDim)
-  auto src_type = mlir::cast<mlir::MemRefType>(dt.getSource().getType());
-  int64_t alloc_dim =
-      (int64_t)orig_type.getRank() - (src_type.getRank() - pa.targetDim);
-  if (alloc_dim < 0 || alloc_dim >= (int64_t)orig_type.getRank()) {
-    ts.transfer->emitError("widenAlloc: computed alloc dim ")
-        << alloc_dim << " is out of range for alloc rank "
-        << orig_type.getRank();
-    return;
-  }
-
-  // Already widened — nothing to do.
-  if (new_shape[alloc_dim] == E) {
-    LDBG(1) << "  widenAlloc: already widened, skipping";
-    return;
-  }
-
-  // Widen the mapped alloc dim to E.
-  new_shape[alloc_dim] = E;
-
-  // Build a strided layout for the widened alloc derived from the source
-  // memref's strides. Keep only the innermost two stride values (which govern
-  // the E×E block traversal) and set all outer strides to 1, the outer dims
-  // are tile indices, not byte-offset multipliers.
-  mlir::MemRefLayoutAttrInterface new_layout = orig_type.getLayout();
-  {
-    llvm::SmallVector<int64_t, 4> src_strides;
-    int64_t src_offset;
-    if (mlir::succeeded(src_type.getStridesAndOffset(src_strides, src_offset))
-        && (int64_t)src_strides.size() >= 2) {
-      int64_t alloc_rank = (int64_t)new_shape.size();
-      llvm::SmallVector<int64_t> new_strides(alloc_rank, 1);
-      new_strides[alloc_rank - 1] = src_strides[src_strides.size() - 1];
-      new_strides[alloc_rank - 2] = src_strides[src_strides.size() - 2];
-      new_layout = mlir::StridedLayoutAttr::get(
-          orig_type.getContext(), /*offset=*/0, new_strides);
+    // ct_local buffers are exposed as ktdf.private results; follow the result
+    // index into the private_yield operands to reach the backing memref.alloc.
+    // Track private_op so its declared result type can be updated to match.
+    mlir::Value base = val;
+    mlir::ktdf::PrivateOp private_op;
+    unsigned private_result_number = 0;
+    if (auto pop = mlir::dyn_cast_or_null<mlir::ktdf::PrivateOp>(
+            base.getDefiningOp())) {
+      private_result_number =
+          mlir::cast<mlir::OpResult>(base).getResultNumber();
+      base = pop.getYieldOp().getOperand(private_result_number);
+      private_op = pop;
     }
-  }
 
-  mlir::MemRefType new_type =
-      mlir::MemRefType::get(new_shape, orig_type.getElementType(),
-                            new_layout,
-                            orig_type.getMemorySpace());
-
-  // Rebuild dynamic-size operands, dropping the one for alloc_dim if it
-  // was dynamic (it is now a constant).
-  auto orig_dynamic = alloc.getDynamicSizes();
-  llvm::SmallVector<mlir::Value> new_dynamic;
-  unsigned dyn_idx = 0;
-  for (int64_t i = 0; i < (int64_t)orig_type.getRank(); ++i) {
-    if (mlir::ShapedType::isDynamic(orig_type.getShape()[i])) {
-      if (mlir::ShapedType::isDynamic(new_shape[i]))
-        new_dynamic.push_back(orig_dynamic[dyn_idx]);
-      ++dyn_idx;
+    auto alloc = mlir::dyn_cast_or_null<mlir::memref::AllocOp>(
+        base.getDefiningOp());
+    if (!alloc) {
+      ts.transfer->emitError(
+          "widenAlloc: ct_local operand has no backing AllocOp");
+      return;
     }
-  }
 
-  builder.setInsertionPoint(alloc);
-  auto new_alloc = mlir::memref::AllocOp::create(
-      builder, alloc.getLoc(), new_type, new_dynamic);
+    // Only widen allocs that belong to this pipeline's ktdf.private region.
+    // Allocs from an outer pipeline are already handled and must not be touched.
+    if (!llvm::is_contained(pa.allocs, alloc))
+      return;
 
-  // Keep the ktdf.private result type in sync; the verifier requires it to
-  // match the private_yield operand type and the alloc type.
-  if (private_op)
-    private_op.getResult(private_result_number).setType(new_type);
+    mlir::MemRefType orig_type = alloc.getType();
+    llvm::SmallVector<int64_t> new_shape(orig_type.getShape());
 
-  LDBG(1) << "  widenAlloc: " << orig_type << " → " << new_type;
-  alloc.getResult().replaceAllUsesWith(new_alloc.getResult());
-  alloc.erase();
+    // Convert offset-from-end to an absolute index into the alloc shape.
+    int64_t alloc_dim = (int64_t)orig_type.getRank() - 1 - pa.targetDim;
+    if (alloc_dim < 0 || alloc_dim >= (int64_t)orig_type.getRank()) {
+      ts.transfer->emitError("widenAlloc: targetDim ")
+          << alloc_dim << " is out of range for alloc rank "
+          << orig_type.getRank();
+      return;
+    }
+
+    // Already widened — nothing to do.
+    if (new_shape[alloc_dim] == E) {
+      LDBG(1) << "  widenAlloc: already widened, skipping";
+      return;
+    }
+
+    // Widen the mapped alloc dim to E.
+    new_shape[alloc_dim] = E;
+
+    // Build a strided layout from the global-side (non-ct_local) operand's
+    // strides. Skip if that operand is a FIFO or has no layout.
+    auto global_type = mlir::dyn_cast<mlir::MemRefType>(stride_source.getType());
+    mlir::MemRefLayoutAttrInterface new_layout = orig_type.getLayout();
+    if (global_type) {
+      llvm::SmallVector<int64_t, 4> src_strides;
+      int64_t src_offset;
+      if (mlir::succeeded(global_type.getStridesAndOffset(src_strides, src_offset))
+          && (int64_t)src_strides.size() >= 2) {
+        int64_t alloc_rank = (int64_t)new_shape.size();
+        llvm::SmallVector<int64_t> new_strides(alloc_rank, 1);
+        new_strides[alloc_rank - 1] = src_strides[src_strides.size() - 1];
+        new_strides[alloc_rank - 2] = src_strides[src_strides.size() - 2];
+        new_layout = mlir::StridedLayoutAttr::get(
+            orig_type.getContext(), /*offset=*/0, new_strides);
+      }
+    }
+
+    mlir::MemRefType new_type =
+        mlir::MemRefType::get(new_shape, orig_type.getElementType(),
+                              new_layout,
+                              orig_type.getMemorySpace());
+
+    // Rebuild dynamic-size operands, dropping the one for alloc_dim if it
+    // was dynamic (it is now a constant).
+    auto orig_dynamic = alloc.getDynamicSizes();
+    llvm::SmallVector<mlir::Value> new_dynamic;
+    unsigned dyn_idx = 0;
+    for (int64_t i = 0; i < (int64_t)orig_type.getRank(); ++i) {
+      if (mlir::ShapedType::isDynamic(orig_type.getShape()[i])) {
+        if (mlir::ShapedType::isDynamic(new_shape[i]))
+          new_dynamic.push_back(orig_dynamic[dyn_idx]);
+        ++dyn_idx;
+      }
+    }
+
+    builder.setInsertionPoint(alloc);
+    auto new_alloc = mlir::memref::AllocOp::create(
+        builder, alloc.getLoc(), new_type, new_dynamic);
+
+    // Keep the ktdf.private result type in sync; the verifier requires it to
+    // match the private_yield operand type and the alloc type.
+    if (private_op)
+      private_op.getResult(private_result_number).setType(new_type);
+
+    LDBG(1) << "  widenAlloc: " << orig_type << " → " << new_type;
+    alloc.getResult().replaceAllUsesWith(new_alloc.getResult());
+    alloc.erase();
+  };
+
+  // Try both sides: dest-side ct_local (e.g. load into staging buffer) and
+  // source-side ct_local (e.g. store out of staging buffer).
+  tryWiden(dt.getDestination(), dt.getSource());
+  tryWiden(dt.getSource(), dt.getDestination());
 }
 
 /// Collapses sa.innermostLoop to a single iteration (ub=1) after verifying
@@ -718,16 +725,13 @@ static void rewriteTransferShape(const DataTransferLegality::TransferStep& ts,
   mlir::OpFoldResult e_ofr =
       mlir::IntegerAttr::get(mlir::IndexType::get(ctx), pa.requiredSize);
 
-  // Source and dest may have different ranks. Use the smaller rank as the
-  // reference (always the global side) and map targetDim to each side:
-  //   dim = rank - (ref_rank - targetDim)
+  // Convert offset-from-end to absolute indices for src and dst size vectors.
   auto new_src_sizes = op.getMixedSourceSizes();
   auto new_dst_sizes = op.getMixedDestSizes();
   int64_t src_rank  = (int64_t)new_src_sizes.size();
   int64_t dst_rank  = (int64_t)new_dst_sizes.size();
-  int64_t ref_rank  = std::min(src_rank, dst_rank); // always the global memory side
-  int64_t src_dim   = src_rank - (ref_rank - pa.targetDim);
-  int64_t dst_dim   = dst_rank - (ref_rank - pa.targetDim);
+  int64_t src_dim   = src_rank - 1 - pa.targetDim;
+  int64_t dst_dim   = dst_rank - 1 - pa.targetDim;
   if (src_dim >= 0 && src_dim < src_rank)
     new_src_sizes[src_dim] = e_ofr;
   if (dst_dim >= 0 && dst_dim < dst_rank)
@@ -764,14 +768,17 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
   mlir::OpFoldResult one =
       mlir::IntegerAttr::get(mlir::IndexType::get(ctx), 1);
 
-  // Only shrink targetDim, leave all other dimensions as-is.
+  // Convert offset-from-end to absolute indices and shrink those dimensions.
   auto new_src_sizes = op.getMixedSourceSizes();
-  if (pa.targetDim < (int64_t)new_src_sizes.size())
-    new_src_sizes[pa.targetDim] = one;
-
   auto new_dst_sizes = op.getMixedDestSizes();
-  if (pa.targetDim < (int64_t)new_dst_sizes.size())
-    new_dst_sizes[pa.targetDim] = one;
+  int64_t src_rank  = (int64_t)new_src_sizes.size();
+  int64_t dst_rank  = (int64_t)new_dst_sizes.size();
+  int64_t src_dim   = src_rank - 1 - pa.targetDim;
+  int64_t dst_dim   = dst_rank - 1 - pa.targetDim;
+  if (src_dim >= 0 && src_dim < src_rank)
+    new_src_sizes[src_dim] = one;
+  if (dst_dim >= 0 && dst_dim < dst_rank)
+    new_dst_sizes[dst_dim] = one;
 
   mlir::AffineMap src_map =
       op.isSourceMemRef() ? op.getSourceMapAttr().getValue() : mlir::AffineMap{};
@@ -828,6 +835,7 @@ static void insertLoopAroundPipeline(
 /// and rewrites every transfer shape (illegal/displaced → widen; FIFO →
 /// splat/extract shrink).
 static mlir::LogicalResult fixPipeline(
+    DataTransferLegality& legality,
     DataTransferLegality::PipelineAnalysis& pa,
     const scheduler::arch_view::ResourceKinds& resourceKinds,
     mlir::OpBuilder& builder) {
@@ -837,9 +845,13 @@ static mlir::LogicalResult fixPipeline(
   for (DataTransferLegality::StageAnalysis& sa : pa.stages) {
 
     if (sa.nestedPipeline != nullptr) {
-      // This stage contains a nested pipeline — insert the column loop.
-      // Full recursive re-analysis and rewrite is not yet implemented.
-      insertLoopAroundPipeline(sa.nestedPipeline.get(), pa.requiredSize, builder);
+      *sa.nestedPipeline = legality.analyzePipeline(
+          sa.nestedPipeline->pipeline, resourceKinds);
+      LDBG(1) << "  nested PipelineAnalysis:\n" << *sa.nestedPipeline;
+
+      insertLoopAroundPipeline(sa.nestedPipeline.get(), sa.nestedPipeline->requiredSize, builder);
+      if (mlir::failed(fixPipeline(legality, *sa.nestedPipeline, resourceKinds, builder)))
+        return mlir::failure();
       continue;
     }
 
@@ -895,7 +907,7 @@ struct DataTransferAlignmentPass
     for (auto& pa : pipelines) {
       LDBG(1) << pa;
       if (pa.requiredSize == 0) continue;  // nothing to fix for this pipeline
-      if (mlir::failed(fixPipeline(pa, resource_kinds, builder))) {
+      if (mlir::failed(fixPipeline(legality_, pa, resource_kinds, builder))) {
         signalPassFailure();
         return;
       }
