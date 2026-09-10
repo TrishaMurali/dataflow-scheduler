@@ -659,9 +659,28 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
   // Widen the mapped alloc dim to E.
   new_shape[alloc_dim] = E;
 
+  // Build a strided layout for the widened alloc derived from the source
+  // memref's strides. Keep only the innermost two stride values (which govern
+  // the E×E block traversal) and set all outer strides to 1, the outer dims
+  // are tile indices, not byte-offset multipliers.
+  mlir::MemRefLayoutAttrInterface new_layout = orig_type.getLayout();
+  {
+    llvm::SmallVector<int64_t, 4> src_strides;
+    int64_t src_offset;
+    if (mlir::succeeded(src_type.getStridesAndOffset(src_strides, src_offset))
+        && (int64_t)src_strides.size() >= 2) {
+      int64_t alloc_rank = (int64_t)new_shape.size();
+      llvm::SmallVector<int64_t> new_strides(alloc_rank, 1);
+      new_strides[alloc_rank - 1] = src_strides[src_strides.size() - 1];
+      new_strides[alloc_rank - 2] = src_strides[src_strides.size() - 2];
+      new_layout = mlir::StridedLayoutAttr::get(
+          orig_type.getContext(), /*offset=*/0, new_strides);
+    }
+  }
+
   mlir::MemRefType new_type =
       mlir::MemRefType::get(new_shape, orig_type.getElementType(),
-                            orig_type.getLayout(),
+                            new_layout,
                             orig_type.getMemorySpace());
 
   // Rebuild dynamic-size operands, dropping the one for alloc_dim if it
