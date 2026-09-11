@@ -679,8 +679,7 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
 }
 
 /// Collapses sa.innermostLoop to a single iteration (ub=1) after verifying
-/// that the loop's total_size operand equals E (pa.requiredSize). The upper
-/// bound must be a ktdf.tiling.derive_size result; any other form is an error.
+/// that the loop's total_size operand equals E (pa.requiredSize).
 static mlir::LogicalResult adjustLoopBounds(
     const DataTransferLegality::StageAnalysis& sa,
     const DataTransferLegality::PipelineAnalysis& pa,
@@ -689,29 +688,37 @@ static mlir::LogicalResult adjustLoopBounds(
 
   mlir::scf::ForOp loop = sa.innermostLoop;
 
-  // After StageCoarseningPass the upper bound is always a
-  // ktdf.tiling.derive_size result, not a bare constant.
+  // The upper bound is normally a ktdf.tiling.derive_size result (produced by
+  // StageCoarseningPass). When the IR was not tiled it may instead be a bare
+  // arith.constant.
+  int64_t total_val = -1;
   auto derive = mlir::dyn_cast_or_null<mlir::ktdf::TilingDeriveSizeOp>(
       loop.getUpperBound().getDefiningOp());
-  if (!derive) {
-    return loop->emitError(
-        PASS_NAME ": innermost stage loop upper bound is not a "
-        "ktdf.tiling.derive_size — cannot verify dimension size against E=")
-        << pa.requiredSize;
+  if (derive) {
+    // total_size is the constant full trip count for this dimension.
+    // tile_sizes are still symbolic reserve_size placeholders at this stage.
+    auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
+        derive.getTotalSize().getDefiningOp());
+    if (!cst) {
+      return loop->emitError(
+          PASS_NAME ": ktdf.tiling.derive_size total_size is not a constant "
+          "— cannot verify dimension size against E=")
+          << pa.requiredSize;
+    }
+    total_val = cst.value();
+  } else {
+    auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
+        loop.getUpperBound().getDefiningOp());
+    if (!cst) {
+      return loop->emitError(
+          PASS_NAME ": innermost stage loop upper bound is neither a "
+          "ktdf.tiling.derive_size nor a constant index "
+          "— cannot verify dimension size against E=")
+          << pa.requiredSize;
+    }
+    total_val = cst.value();
   }
 
-  // total_size is the constant full trip count for this dimension.
-  // tile_sizes are still symbolic reserve_size placeholders at this stage.
-  auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
-      derive.getTotalSize().getDefiningOp());
-  if (!cst) {
-    return loop->emitError(
-        PASS_NAME ": ktdf.tiling.derive_size total_size is not a constant "
-        "— cannot verify dimension size against E=")
-        << pa.requiredSize;
-  }
-
-  int64_t total_val = cst.value();
   if (total_val != pa.requiredSize) {
     return loop->emitError(PASS_NAME ": dimension total size (")
         << total_val << ") does not match required alignment size E="
@@ -833,14 +840,16 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
       return map;
 
     // Find the column dimension: among the two innermost dims, pick the one
-    // with stride 1 — that is the contiguous (column-traversal) direction.
+    // whose stride equals outerE (the column-to-column step). Stride 1 is the
+    // contiguous row direction within a single FIFO delivery; stride outerE is
+    // the step between columns.
     llvm::SmallVector<int64_t> strides;
     int64_t offset;
     int64_t col_idx = -1;
     if (mlir::succeeded(mrt.getStridesAndOffset(strides, offset))) {
       int64_t rank = (int64_t)strides.size();
       for (int64_t i = rank - 2; i < rank; ++i) {
-        if (strides[i] == 1) {
+        if (strides[i] == outerE) {
           col_idx = i;
           break;
         }
@@ -984,6 +993,8 @@ struct DataTransferAlignmentPass
     : public scheduler::impl::DataTransferAlignmentPassBase<
           DataTransferAlignmentPass> {
   void runOnOperation() override {
+    llvm::errs() << "[" PASS_NAME "] running on: "
+                 << getOperation()->getName() << "\n";
     LDBG(1) << "========= " PASS_NAME " =========";
 
     auto& device_manager = getAnalysis<mlir::ktdf_arch::DeviceManager>();
