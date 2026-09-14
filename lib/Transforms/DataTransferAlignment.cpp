@@ -637,15 +637,17 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     }
 
     // Already widened — nothing to do.
-    if (new_shape[alloc_dim] == E) {
+    if (new_shape[alloc_dim] == E && new_shape[0] == 1) {
       LDBG(1) << "  widenAlloc: already widened, skipping";
       return;
     }
 
-    // Widen the mapped alloc dim to E, preserving the existing layout.
-    // Stride propagation is handled implicitly via inheritedStrides in
-    // analyzePipeline and must not be written into the alloc type.
+    // Widen the data dimension to E and collapse the outermost (stick-count)
+    // dimension to 1. The outer pipeline iterated over 'sticks'; after
+    // alignment we address one E-element block directly, so dim 0 is no
+    // longer needed as a loop dimension.
     new_shape[alloc_dim] = E;
+    new_shape[0] = 1;
 
     mlir::MemRefType new_type =
         mlir::MemRefType::get(new_shape, orig_type.getElementType(),
