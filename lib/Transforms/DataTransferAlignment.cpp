@@ -790,10 +790,11 @@ static void rewriteTransferShape(const DataTransferLegality::TransferStep& ts,
   op.erase();
 }
 
-/// Replaces ts.transfer with a new DataTransferOp with pa.targetDim shrunk to
-/// 1 and transfer_mode set to `mode` ("splat" or "extract").
-/// outerE is the enclosing pipeline's requiredSize (E), used to locate the
-/// column dimension in the ct_local buffer by matching its stride value.
+/// Replaces ts.transfer with a new DataTransferOp sized [1,1,1,1] with
+/// transfer_mode set to `mode` ("splat") or empty for FIFO→memref.
+/// The two innermost indices on any ct_local memref operand are replaced with
+/// the row and column IVs from the nested scf.for loops inserted by
+/// insertLoopAroundPipeline, giving direct [0, 0, %row, %col] addressing.
 static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
                                   const DataTransferLegality::PipelineAnalysis& pa,
                                   int64_t outerE,
@@ -805,22 +806,17 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
   mlir::OpFoldResult one =
       mlir::IntegerAttr::get(mlir::IndexType::get(ctx), 1);
 
-  // Convert offset-from-end to absolute indices and shrink those dimensions.
+  // Shrink all dimensions to 1: splat operates on a single scalar element,
+  // so every size on both sides must be collapsed.
   auto new_src_sizes = op.getMixedSourceSizes();
   auto new_dst_sizes = op.getMixedDestSizes();
-  int64_t src_rank  = (int64_t)new_src_sizes.size();
-  int64_t dst_rank  = (int64_t)new_dst_sizes.size();
-  int64_t src_dim   = src_rank - 1 - pa.targetDim;
-  int64_t dst_dim   = dst_rank - 1 - pa.targetDim;
-  if (src_dim >= 0 && src_dim < src_rank)
-    new_src_sizes[src_dim] = one;
-  if (dst_dim >= 0 && dst_dim < dst_rank)
-    new_dst_sizes[dst_dim] = one;
+  for (auto& s : new_src_sizes) s = one;
+  for (auto& s : new_dst_sizes) s = one;
 
-  // Find the column loop IV by walking up to the nearest scf.for outside the
-  // enclosing ktdf.pipeline. This is the loop inserted by
-  // insertLoopAroundPipeline and its IV indexes the column of the tile.
-  mlir::Value col_iv;
+  // Find the two loop IVs inserted by insertLoopAroundPipeline. Walking out
+  // past the enclosing ktdf.pipeline(s) we expect to hit the inner scf.for
+  // (col) first, then the outer scf.for (row).
+  mlir::Value row_iv, col_iv;
   mlir::Operation* cursor = op->getParentOp();
   while (cursor) {
     if (mlir::isa<mlir::ktdf::PipelineOp>(cursor)) {
@@ -828,54 +824,53 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
       continue;
     }
     if (auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(cursor)) {
-      col_iv = for_op.getInductionVar();
-      break;
+      if (!col_iv) {
+        col_iv = for_op.getInductionVar();
+        LDBG(1) << "  rewriteTransferShrink: found col_iv at " << for_op->getLoc();
+      } else {
+        row_iv = for_op.getInductionVar();
+        LDBG(1) << "  rewriteTransferShrink: found row_iv at " << for_op->getLoc();
+        break;
+      }
     }
     cursor = cursor->getParentOp();
   }
+  if (!row_iv || !col_iv)
+    LDBG(1) << "  rewriteTransferShrink: row_iv=" << (bool)row_iv
+            << " col_iv=" << (bool)col_iv << " — applyRowCol will no-op";
 
-  // Extend the affine map on the ct_local side to include the column loop IV.
-  // The column dimension is the one whose stride equals E — this varies per
-  // buffer since load and store buffers have transposed stride layouts.
-  auto extendMap = [&](mlir::Value memref_val, mlir::AffineMap map,
-                       llvm::SmallVector<mlir::Value>& indices)
-      -> mlir::AffineMap {
-    if (!col_iv) return map;
+  // For ct_local memref operands, build a new affine map that passes through
+  // all existing indices unchanged but replaces the two innermost map results
+  // with the new row_iv / col_iv dimensions appended to the index list.
+  // This gives [0, 0, %row, %col] addressing without reusing constant-baked
+  // map results from the original transfer.
+  auto applyRowCol = [&](mlir::Value memref_val,
+                         mlir::AffineMap& map,
+                         llvm::SmallVector<mlir::Value>& indices) {
+    if (!row_iv || !col_iv) return;
     auto mrt = mlir::dyn_cast<mlir::MemRefType>(memref_val.getType());
-    if (!mrt) return map;
+    if (!mrt) return;
     auto ms = mlir::dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(
         mrt.getMemorySpace());
     if (!ms || ms.getKind() != mlir::ktdp::MemorySpaceKind::ct_local)
-      return map;
+      return;
 
-    // Find the column dimension: among the two innermost dims, pick the one
-    // whose stride equals outerE (the column-to-column step). Stride 1 is the
-    // contiguous row direction within a single FIFO delivery; stride outerE is
-    // the step between columns.
-    llvm::SmallVector<int64_t> strides;
-    int64_t offset;
-    int64_t col_idx = -1;
-    if (mlir::succeeded(mrt.getStridesAndOffset(strides, offset))) {
-      int64_t rank = (int64_t)strides.size();
-      for (int64_t i = rank - 2; i < rank; ++i) {
-        if (strides[i] == outerE) {
-          col_idx = i;
-          break;
-        }
-      }
-    }
-    if (col_idx < 0 || col_idx >= (int64_t)mrt.getRank()) return map;
+    int64_t rank = (int64_t)mrt.getRank();
+    if (rank < 2) return;
 
-    // Append col_iv as a new affine map dimension.
+    // Append row_iv and col_iv as two new affine map dimensions.
+    unsigned row_dim = map.getNumDims();
+    unsigned col_dim = row_dim + 1;
+    indices.push_back(row_iv);
     indices.push_back(col_iv);
-    unsigned new_dim = map.getNumDims(); // index of the newly added dim
 
-    // Rebuild the map results, replacing the constant 0 at col_idx with the
-    // new dimension expression.
+    // Rebuild map results: keep all leading results, replace the two
+    // innermost (rank-2 and rank-1) with the new dim expressions.
     llvm::SmallVector<mlir::AffineExpr> results(map.getResults());
-    results[col_idx] = mlir::getAffineDimExpr(new_dim, ctx);
-    return mlir::AffineMap::get(map.getNumDims() + 1, map.getNumSymbols(),
-                                results, ctx);
+    results[rank - 2] = mlir::getAffineDimExpr(row_dim, ctx);
+    results[rank - 1] = mlir::getAffineDimExpr(col_dim, ctx);
+    map = mlir::AffineMap::get(map.getNumDims() + 2, map.getNumSymbols(),
+                               results, ctx);
   };
 
   auto new_src_indices =
@@ -888,8 +883,8 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
   mlir::AffineMap dst_map =
       op.isDestMemRef() ? op.getDestMapAttr().getValue() : mlir::AffineMap{};
 
-  src_map = extendMap(op.getSource(), src_map, new_src_indices);
-  dst_map = extendMap(op.getDestination(), dst_map, new_dst_indices);
+  applyRowCol(op.getSource(),      src_map, new_src_indices);
+  applyRowCol(op.getDestination(), dst_map, new_dst_indices);
 
   builder.setInsertionPoint(op);
   auto new_op = mlir::ktdf::DataTransferOp::create(
@@ -910,8 +905,9 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
   op.erase();
 }
 
-/// Wraps the nested ktdf.pipeline in a new scf.for loop from 0 to E (step 1)
-/// so that transfers can index each element of the widened alloc independently.
+/// Wraps the nested ktdf.pipeline in two nested scf.for loops over [0,E)
+/// so that each element of the widened [E, E] alloc block can be addressed
+/// directly via %row and %col IVs without any index arithmetic.
 static void insertLoopAroundPipeline(
     DataTransferLegality::PipelineAnalysis* nestedPA, int64_t E,
     mlir::OpBuilder& builder) {
@@ -927,20 +923,26 @@ static void insertLoopAroundPipeline(
   mlir::Value c1 =
       mlir::arith::ConstantIndexOp::create(builder, loc, 1).getResult();
 
+  // Outer loop: rows [0, E)
+  auto row_loop = mlir::scf::ForOp::create(builder, loc, c0, cE, c1);
+  mlir::Block* row_body = row_loop.getBody();
+
+  // Inner loop: cols [0, E) — inserted inside the row loop body.
+  builder.setInsertionPoint(row_body, row_body->getTerminator()->getIterator());
   auto col_loop = mlir::scf::ForOp::create(builder, loc, c0, cE, c1);
 
-  // Move the nested pipeline into the new loop's body (before the terminator).
-  mlir::Block* loop_body = col_loop.getBody();
-  nested_pipeline->moveBefore(loop_body, loop_body->getTerminator()->getIterator());
+  // Move the nested pipeline into the col loop body.
+  mlir::Block* col_body = col_loop.getBody();
+  nested_pipeline->moveBefore(col_body, col_body->getTerminator()->getIterator());
 
-  LDBG(1) << "  insertLoopAroundPipeline: inserted col loop (E=" << E
+  LDBG(1) << "  insertLoopAroundPipeline: inserted row/col loops (E=" << E
           << ") around nested pipeline at " << loc;
 }
 
 /// Applies corrective rewrites to the PipelineAnalysis tree: inserts a loop
 /// around nested pipelines, then for each leaf stage adjusts the loop bound
 /// and rewrites every transfer shape (illegal/displaced → widen; FIFO →
-/// splat/extract shrink).
+/// splat shrink).
 static mlir::LogicalResult fixPipeline(
     DataTransferLegality& legality,
     DataTransferLegality::PipelineAnalysis& pa,
@@ -980,7 +982,7 @@ static mlir::LogicalResult fixPipeline(
       return mlir::failure();
 
     for (DataTransferLegality::TransferStep& ts : sa.transfers) {
-      // FIFO-side transfers are checked first — splat/extract describe the
+      // FIFO-side transfers are checked first — splat describes the
       // fundamental transfer kind and take priority over stride illegality.
       if (ts.needsSplat) {
         rewriteTransferShrink(ts, pa, outerE, "splat", builder);
