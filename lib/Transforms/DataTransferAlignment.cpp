@@ -94,9 +94,15 @@ class DataTransferLegality {
   /// Build a PipelineAnalysis for `pipeline`. Stages containing a nested
   /// ktdf.pipeline are recorded as stubs (PipelineOp handle only); fixPipeline
   /// calls analyzePipeline on them after applying outer-level corrections.
+  ///
+  /// When `inheritedStrides` is non-empty the legality check uses those stride
+  /// values instead of reading them from the actual memref layout. This lets the
+  /// outer pipeline's non-contiguous stride be visible to nested-pipeline
+  /// analysis without touching any IR types.
   PipelineAnalysis analyzePipeline(
       mlir::ktdf::PipelineOp pipeline,
-      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds,
+      llvm::ArrayRef<int64_t> inheritedStrides = {}) {
     PipelineAnalysis pa{};
     pa.pipeline = pipeline;
 
@@ -110,7 +116,8 @@ class DataTransferLegality {
     // Visit every stage.
     bool hasIllegal = false;
     for (auto stage : pipeline.getStages()) {
-      pa.stages.push_back(analyzeStage(stage, resourceKinds, hasIllegal));
+      pa.stages.push_back(analyzeStage(stage, resourceKinds, hasIllegal,
+                                       inheritedStrides));
     }
 
     if (!hasIllegal)
@@ -293,13 +300,17 @@ private:
   /// Checks whether the source memref of a data_transfer is legal against the
   /// arch spec. Only source contiguity and granularity are checked.
   ///
+  /// When `inheritedStrides` is non-empty those values are used in place of the
+  /// memref's actual layout strides for the contiguity check.
+  ///
   /// Returns true if legal, false if illegal but correctable, nullopt on
   /// hard failure (error already emitted).
   std::optional<bool> checkSourceMemRef(
       mlir::ktdf::DataTransferOp dt,
       mlir::MemRefType srcMemref,
       llvm::ArrayRef<int64_t> transferSizes,
-      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds,
+      llvm::ArrayRef<int64_t> inheritedStrides = {}) {
     auto space = srcMemref.getMemorySpace();
 
     auto wordBytes    = getWordSize(dt, space, resourceKinds);
@@ -334,11 +345,18 @@ private:
       }
     }
 
-    // Innermost stride must not be dynamic.
-    auto stride = innermostStride(srcMemref);
-    if (mlir::failed(stride)) {
-      dt->emitError(PASS_NAME ": source memref has a dynamic innermost stride");
-      return std::nullopt;
+    // Use inherited strides (from an outer pipeline) when provided; otherwise
+    // read the innermost stride from the memref layout.
+    int64_t strideVal = 1;
+    if (!inheritedStrides.empty()) {
+      strideVal = inheritedStrides.back();
+    } else {
+      auto stride = innermostStride(srcMemref);
+      if (mlir::failed(stride)) {
+        dt->emitError(PASS_NAME ": source memref has a dynamic innermost stride");
+        return std::nullopt;
+      }
+      strideVal = *stride;
     }
 
     // Total bytes being transferred (product of all sizes × element size).
@@ -373,7 +391,7 @@ private:
 
     // Multi-element transfer: requires contiguous stride.
     // A single element is always legal regardless of stride.
-    if (totalElems == 1 || *stride == 1)
+    if (totalElems == 1 || strideVal == 1)
       return true;  // legal
 
     // Non-contiguous multi-element transfer, correctable.
@@ -383,9 +401,11 @@ private:
   /// Classifies a single ktdf.data_transfer and returns a TransferStep.
   /// FIFO sources are returned with all flags false; they are handled once
   /// requiredSize is known. Returns nullopt on hard failure (error already emitted).
+  /// When `inheritedStrides` is non-empty it is forwarded to checkSourceMemRef.
   std::optional<TransferStep> classifyTransferStep(
       mlir::ktdf::DataTransferOp dt,
-      const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
+      const mlir::ktdf_arch::ResourceKinds& resourceKinds,
+      llvm::ArrayRef<int64_t> inheritedStrides = {}) {
     TransferStep ts{};
     ts.transfer = dt;
 
@@ -402,7 +422,8 @@ private:
       return std::nullopt;
     }
 
-    auto result = checkSourceMemRef(dt, srcMemref, *sizes, resourceKinds);
+    auto result = checkSourceMemRef(dt, srcMemref, *sizes, resourceKinds,
+                                    inheritedStrides);
     if (!result.has_value())
       return std::nullopt;
 
@@ -414,10 +435,12 @@ private:
   /// stub in sa.nestedPipeline for fixPipeline to resolve. Otherwise classifies
   /// every ktdf.data_transfer into sa.transfers. Sets hasIllegal if any
   /// transfer is illegal; isDisplaced/needsSplat are set later.
+  /// When `inheritedStrides` is non-empty it is forwarded to classifyTransferStep.
   StageAnalysis analyzeStage(
       mlir::ktdf::StageOp stage,
       const mlir::ktdf_arch::ResourceKinds& resourceKinds,
-      bool& hasIllegal) {
+      bool& hasIllegal,
+      llvm::ArrayRef<int64_t> inheritedStrides = {}) {
     StageAnalysis sa{};
     sa.stage = stage;
 
@@ -451,7 +474,7 @@ private:
 
     // Leaf stage: collect every data_transfer op.
     stage->walk([&](mlir::ktdf::DataTransferOp dt) {
-      auto ts = classifyTransferStep(dt, resourceKinds);
+      auto ts = classifyTransferStep(dt, resourceKinds, inheritedStrides);
       if (ts) {
         if (ts->isIllegal)
           hasIllegal = true;
@@ -565,7 +588,7 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
 
   // Tries to widen the alloc backing `val` if it is a ct_local memref owned
   // by this pipeline. Returns early silently for non-ct_local or foreign allocs.
-  auto tryWiden = [&](mlir::Value val, mlir::Value stride_source) {
+  auto tryWiden = [&](mlir::Value val) {
     auto memref_type = mlir::dyn_cast<mlir::MemRefType>(val.getType());
     if (!memref_type) return;
 
@@ -619,30 +642,14 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
       return;
     }
 
-    // Widen the mapped alloc dim to E.
+    // Widen the mapped alloc dim to E, preserving the existing layout.
+    // Stride propagation is handled implicitly via inheritedStrides in
+    // analyzePipeline and must not be written into the alloc type.
     new_shape[alloc_dim] = E;
-
-    // Build a strided layout from the global-side (non-ct_local) operand's
-    // strides. Skip if that operand is a FIFO or has no layout.
-    auto global_type = mlir::dyn_cast<mlir::MemRefType>(stride_source.getType());
-    mlir::MemRefLayoutAttrInterface new_layout = orig_type.getLayout();
-    if (global_type) {
-      llvm::SmallVector<int64_t, 4> src_strides;
-      int64_t src_offset;
-      if (mlir::succeeded(global_type.getStridesAndOffset(src_strides, src_offset))
-          && (int64_t)src_strides.size() >= 2) {
-        int64_t alloc_rank = (int64_t)new_shape.size();
-        llvm::SmallVector<int64_t> new_strides(alloc_rank, 1);
-        new_strides[alloc_rank - 1] = src_strides[src_strides.size() - 1];
-        new_strides[alloc_rank - 2] = src_strides[src_strides.size() - 2];
-        new_layout = mlir::StridedLayoutAttr::get(
-            orig_type.getContext(), /*offset=*/0, new_strides);
-      }
-    }
 
     mlir::MemRefType new_type =
         mlir::MemRefType::get(new_shape, orig_type.getElementType(),
-                              new_layout,
+                              orig_type.getLayout(),
                               orig_type.getMemorySpace());
 
     // Rebuild dynamic-size operands, dropping the one for alloc_dim if it
@@ -674,8 +681,8 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
 
   // Try both sides: dest-side ct_local (e.g. load into staging buffer) and
   // source-side ct_local (e.g. store out of staging buffer).
-  tryWiden(dt.getDestination(), dt.getSource());
-  tryWiden(dt.getSource(), dt.getDestination());
+  tryWiden(dt.getDestination());
+  tryWiden(dt.getSource());
 }
 
 /// Collapses sa.innermostLoop to a single iteration (ub=1) after verifying
@@ -949,8 +956,13 @@ static mlir::LogicalResult fixPipeline(
       if (mlir::failed(adjustLoopBounds(sa, pa, builder)))
         return mlir::failure();
 
+      // Pass the outer pipeline's requiredSize as an inherited stride so that
+      // the nested pipeline's transfers see a non-contiguous stride and are
+      // classified correctly (isIllegal / isDisplaced / needsSplat) without
+      // any IR types being modified.
+      llvm::SmallVector<int64_t, 1> inheritedStrides = {pa.requiredSize};
       *sa.nestedPipeline = legality.analyzePipeline(
-          sa.nestedPipeline->pipeline, resourceKinds);
+          sa.nestedPipeline->pipeline, resourceKinds, inheritedStrides);
       LDBG(1) << "  nested PipelineAnalysis:\n" << *sa.nestedPipeline;
 
       insertLoopAroundPipeline(sa.nestedPipeline.get(), pa.requiredSize, builder);
