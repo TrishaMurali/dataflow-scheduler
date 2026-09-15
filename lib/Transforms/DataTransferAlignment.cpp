@@ -34,6 +34,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -649,9 +650,11 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     new_shape[alloc_dim] = E;
     new_shape[0] = 1;
 
+    // Use the default identity layout - the affine maps on the data_transfer
+    // ops encode all access patterns.
     mlir::MemRefType new_type =
         mlir::MemRefType::get(new_shape, orig_type.getElementType(),
-                              orig_type.getLayout(),
+                              mlir::MemRefLayoutAttrInterface{},
                               orig_type.getMemorySpace());
 
     // Rebuild dynamic-size operands, dropping the one for alloc_dim if it
@@ -750,6 +753,10 @@ static mlir::LogicalResult adjustLoopBounds(
 
 /// Replaces ts.transfer with a new DataTransferOp with pa.targetDim widened
 /// to E (pa.requiredSize). All other dimensions are preserved unchanged.
+/// Any explicit StridedLayoutAttr on a global (non-ct_local) memref operand
+/// is stripped via a memref.cast to identity layout — the strided layout was
+/// used by the analysis to detect illegality but must not appear on the
+/// rewritten transfer.
 static void rewriteTransferShape(const DataTransferLegality::TransferStep& ts,
                                  const DataTransferLegality::PipelineAnalysis& pa,
                                  mlir::OpBuilder& builder) {
@@ -775,6 +782,104 @@ static void rewriteTransferShape(const DataTransferLegality::TransferStep& ts,
       op.isSourceMemRef() ? op.getSourceMapAttr().getValue() : mlir::AffineMap{};
   mlir::AffineMap dst_map =
       op.isDestMemRef() ? op.getDestMapAttr().getValue() : mlir::AffineMap{};
+
+  // Fix non-row-major strides on any global (non-ct_local) memref operand by
+  // walking back to the ktdp.construct_memory_view and rewriting its
+  // static_strides attribute to natural row-major values in place. The
+  // strided layout was used during analysis to detect illegality;
+  auto fixConstructStrides = [&](mlir::Value val) {
+    auto mrt = mlir::dyn_cast<mlir::MemRefType>(val.getType());
+    if (!mrt) return;
+    auto ms = mlir::dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(
+        mrt.getMemorySpace());
+    if (ms && ms.getKind() == mlir::ktdp::MemorySpaceKind::ct_local)
+      return;
+    if (!mlir::isa<mlir::StridedLayoutAttr>(mrt.getLayout()))
+      return;
+
+    // Walk up view-like ops to find the construct_memory_view.
+    mlir::Value cursor = val;
+    mlir::ktdp::ConstructMemoryViewOp construct;
+    while (auto defOp = cursor.getDefiningOp()) {
+      if (auto c = mlir::dyn_cast<mlir::ktdp::ConstructMemoryViewOp>(defOp)) {
+        construct = c;
+        break;
+      }
+      if (auto castOp = mlir::dyn_cast<mlir::memref::CastOp>(defOp))
+        cursor = castOp.getSource();
+      else if (auto mscastOp = mlir::dyn_cast<mlir::memref::MemorySpaceCastOp>(defOp))
+        cursor = mscastOp.getSource();
+      else if (auto ricastOp = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(defOp))
+        cursor = ricastOp.getSource();
+      else
+        break;
+    }
+    if (!construct) return;
+
+    // Compute row-major strides from the construct op's result shape.
+    auto orig_mrt = mlir::cast<mlir::MemRefType>(construct.getResult().getType());
+    auto shape = orig_mrt.getShape();
+    int64_t rank = (int64_t)shape.size();
+    llvm::SmallVector<int64_t> row_major(rank, 1);
+    for (int64_t i = rank - 2; i >= 0; --i)
+      row_major[i] = row_major[i + 1] * shape[i + 1];
+
+    LDBG(1) << "  fixConstructStrides: rewriting strides on "
+            << construct->getLoc() << " to row-major";
+    construct.setStaticStridesAttr(
+        mlir::DenseI64ArrayAttr::get(ctx, row_major));
+
+    // Update the construct op's result type to carry the new row-major layout,
+    // then propagate the updated type forward through all downstream view-like
+    // ops (memory_space_cast, cast, reinterpret_cast) so the strided layout
+    // doesn't linger in their result types.
+    auto new_layout = mlir::StridedLayoutAttr::get(
+        ctx, /*offset=*/mlir::ShapedType::kDynamic, row_major);
+    auto new_construct_type = mlir::MemRefType::get(
+        shape, orig_mrt.getElementType(), new_layout,
+        orig_mrt.getMemorySpace());
+    construct.getResult().setType(new_construct_type);
+
+    // Walk forward through uses, updating each view-like op's result type.
+    llvm::SmallVector<mlir::Value> worklist = {construct.getResult()};
+    while (!worklist.empty()) {
+      mlir::Value v = worklist.pop_back_val();
+      for (mlir::Operation* user : v.getUsers()) {
+        mlir::Value new_val;
+        mlir::MemRefType src_type =
+            mlir::dyn_cast<mlir::MemRefType>(v.getType());
+        if (!src_type) continue;
+
+        if (auto castOp = mlir::dyn_cast<mlir::memref::CastOp>(user)) {
+          // Propagate the new layout into the cast result type.
+          auto res_type = mlir::dyn_cast<mlir::MemRefType>(
+              castOp.getResult().getType());
+          if (!res_type) continue;
+          auto updated = mlir::MemRefType::get(
+              res_type.getShape(), res_type.getElementType(),
+              src_type.getLayout(), res_type.getMemorySpace());
+          castOp.getResult().setType(updated);
+          new_val = castOp.getResult();
+        } else if (auto mscastOp =
+                       mlir::dyn_cast<mlir::memref::MemorySpaceCastOp>(user)) {
+          auto res_type = mlir::dyn_cast<mlir::MemRefType>(
+              mscastOp.getResult().getType());
+          if (!res_type) continue;
+          auto updated = mlir::MemRefType::get(
+              res_type.getShape(), res_type.getElementType(),
+              src_type.getLayout(), res_type.getMemorySpace());
+          mscastOp.getResult().setType(updated);
+          new_val = mscastOp.getResult();
+        } else {
+          continue;
+        }
+        worklist.push_back(new_val);
+      }
+    }
+  };
+
+  fixConstructStrides(op.getSource());
+  fixConstructStrides(op.getDestination());
 
   builder.setInsertionPoint(op);
   auto new_op = mlir::ktdf::DataTransferOp::create(
@@ -806,12 +911,14 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
   mlir::OpFoldResult one =
       mlir::IntegerAttr::get(mlir::IndexType::get(ctx), 1);
 
-  // Shrink all dimensions to 1: splat operates on a single scalar element,
-  // so every size on both sides must be collapsed.
+  // Splat: 1 source element broadcast to fill the FIFO (E elements).
+  // Collapse the ct_local source to [1,1,1,1] — one scalar element —
+  // and keep the FIFO destination at its natural size [E] so the hardware
+  // knows to broadcast that scalar across the full slot.
   auto new_src_sizes = op.getMixedSourceSizes();
   auto new_dst_sizes = op.getMixedDestSizes();
   for (auto& s : new_src_sizes) s = one;
-  for (auto& s : new_dst_sizes) s = one;
+  // Leave new_dst_sizes unchanged — the FIFO slot size is already correct.
 
   // Find the two loop IVs inserted by insertLoopAroundPipeline. Walking out
   // past the enclosing ktdf.pipeline(s) we expect to hit the inner scf.for
@@ -839,14 +946,14 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
     LDBG(1) << "  rewriteTransferShrink: row_iv=" << (bool)row_iv
             << " col_iv=" << (bool)col_iv << " — applyRowCol will no-op";
 
-  // For ct_local memref operands, build a new affine map that passes through
-  // all existing indices unchanged but replaces the two innermost map results
-  // with the new row_iv / col_iv dimensions appended to the index list.
-  // This gives [0, 0, %row, %col] addressing without reusing constant-baked
-  // map results from the original transfer.
+  // For ct_local memref operands, build a fresh affine map and index list.
+  // The load (source) buffer is row-major: index [0, 0, %row, %col].
+  // The store (destination) buffer is transposed (column-major): index
+  // [0, 0, %col, %row] — row and col are swapped to match the stick layout.
   auto applyRowCol = [&](mlir::Value memref_val,
                          mlir::AffineMap& map,
-                         llvm::SmallVector<mlir::Value>& indices) {
+                         llvm::SmallVector<mlir::Value>& indices,
+                         bool transpose) {
     if (!row_iv || !col_iv) return;
     auto mrt = mlir::dyn_cast<mlir::MemRefType>(memref_val.getType());
     if (!mrt) return;
@@ -858,19 +965,18 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
     int64_t rank = (int64_t)mrt.getRank();
     if (rank < 2) return;
 
-    // Append row_iv and col_iv as two new affine map dimensions.
-    unsigned row_dim = map.getNumDims();
-    unsigned col_dim = row_dim + 1;
-    indices.push_back(row_iv);
-    indices.push_back(col_iv);
+    // d0 = first IV, d1 = second IV.
+    // For load: (row, col) -> [0,0,row,col].
+    // For store (transposed): (col, row) -> [0,0,col,row] i.e. swap the IVs.
+    mlir::Value first_iv  = transpose ? col_iv : row_iv;
+    mlir::Value second_iv = transpose ? row_iv : col_iv;
 
-    // Rebuild map results: keep all leading results, replace the two
-    // innermost (rank-2 and rank-1) with the new dim expressions.
-    llvm::SmallVector<mlir::AffineExpr> results(map.getResults());
-    results[rank - 2] = mlir::getAffineDimExpr(row_dim, ctx);
-    results[rank - 1] = mlir::getAffineDimExpr(col_dim, ctx);
-    map = mlir::AffineMap::get(map.getNumDims() + 2, map.getNumSymbols(),
-                               results, ctx);
+    llvm::SmallVector<mlir::AffineExpr> results(rank,
+        mlir::getAffineConstantExpr(0, ctx));
+    results[rank - 2] = mlir::getAffineDimExpr(0, ctx);
+    results[rank - 1] = mlir::getAffineDimExpr(1, ctx);
+    map     = mlir::AffineMap::get(/*dims=*/2, /*syms=*/0, results, ctx);
+    indices = {first_iv, second_iv};
   };
 
   auto new_src_indices =
@@ -883,8 +989,8 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
   mlir::AffineMap dst_map =
       op.isDestMemRef() ? op.getDestMapAttr().getValue() : mlir::AffineMap{};
 
-  applyRowCol(op.getSource(),      src_map, new_src_indices);
-  applyRowCol(op.getDestination(), dst_map, new_dst_indices);
+  applyRowCol(op.getSource(),      src_map, new_src_indices, /*transpose=*/false);
+  applyRowCol(op.getDestination(), dst_map, new_dst_indices, /*transpose=*/true);
 
   builder.setInsertionPoint(op);
   auto new_op = mlir::ktdf::DataTransferOp::create(
