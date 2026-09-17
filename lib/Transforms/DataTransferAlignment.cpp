@@ -133,24 +133,31 @@ class DataTransferLegality {
     }
 
     // Derive targetDim and requiredSize from the first illegal transfer.
-    // Whether we widen or shrink is determined by the arch spec granularity
-    // for the transfer's source memory space:
+    //
+    // The required transfer size is determined by the non-contiguous stride on
+    // the source memref: to move the data the transfer requests, we must pull
+    // a contiguous block of (innermostStride) elements from the source memory.
+    // The arch spec granularity is then a validity check that this stride-derived
+    // size is actually a legal transfer size for the hardware — it is not the
+    // source of truth for the size.
     for (auto& sa : pa.stages) {
       for (auto& ts : sa.transfers) {
         if (!ts.isIllegal) continue;
         auto srcMemref = mlir::cast<mlir::MemRefType>(
             ts.transfer.getSource().getType());
         auto space     = srcMemref.getMemorySpace();
-        auto wordBytes = getWordSize(ts.transfer, space, resourceKinds);
         auto elemBytes = scheduler::tryGetSizeInBytes(srcMemref.getElementType());
-        if (!wordBytes || !elemBytes || *elemBytes == 0) break;
+        if (!elemBytes || *elemBytes == 0) break;
 
         auto granularities = getAccessGranularity(ts.transfer, space, resourceKinds);
         bool isSingleElement = false;
         if (granularities) {
-          for (auto entry : *granularities) {
-            uint64_t granBytes = entry.getSizeInWords() * *wordBytes;
-            if (granBytes == *elemBytes) { isSingleElement = true; break; }
+          auto wordBytes = getWordSize(ts.transfer, space, resourceKinds);
+          if (wordBytes) {
+            for (auto entry : *granularities) {
+              uint64_t granBytes = entry.getSizeInWords() * *wordBytes;
+              if (granBytes == *elemBytes) { isSingleElement = true; break; }
+            }
           }
         }
 
@@ -160,10 +167,21 @@ class DataTransferLegality {
           pa.targetDim    = 0;
           pa.requiredSize = 1;
         } else {
-          // Widen: word-granular memory, expand to full word.
+          // Widen: the non-contiguous innermost stride tells us exactly how
+          // many contiguous elements we must transfer to cover the requested
+          // data. Use inheritedStrides when set (nested pipeline case), otherwise
+          // read the stride directly from the source memref layout.
+          int64_t strideElems = 1;
+          if (!inheritedStrides.empty()) {
+            strideElems = inheritedStrides.back();
+          } else {
+            auto stride = innermostStride(srcMemref);
+            if (!mlir::failed(stride))
+              strideElems = *stride;
+          }
           // targetDim=1 means the second-to-last dimension (offset 1 from end).
           pa.targetDim    = 1;
-          pa.requiredSize = static_cast<int64_t>(*wordBytes / *elemBytes);
+          pa.requiredSize = strideElems;
         }
         break;
       }
@@ -171,14 +189,24 @@ class DataTransferLegality {
     }
 
     // Post-analysis fixup: set needsSplat on memref→FIFO transfers now that
-    // requiredSize is known. classifyTransferStep returns early for FIFO
-    // sources so this flag must be applied here.
+    // requiredSize is known. Only units with ktdf_arch.feature.simd { splat }
+    // can legally broadcast a scalar element across a FIFO slot. If the unit
+    // lacks that capability the transfer is unresolvable — emit an error.
+    // classifyTransferStep returns early for FIFO sources so this flag must
+    // be applied here.
     if (pa.requiredSize > 0) {
       for (auto& sa : pa.stages) {
         for (auto& ts : sa.transfers) {
           mlir::ktdf::DataTransferOp dt = ts.transfer;
-          if (dt.isSourceMemRef() && dt.isDestFifo())
-            ts.needsSplat = true;
+          if (dt.isSourceMemRef() && dt.isDestFifo()) {
+            if (canSplat(dt, resourceKinds)) {
+              ts.needsSplat = true;
+            } else {
+              dt->emitError(PASS_NAME
+                  ": memref→FIFO transfer requires splat but the enclosing "
+                  "unit does not declare ktdf_arch.feature.simd { splat }");
+            }
+          }
         }
       }
     }
@@ -226,20 +254,26 @@ private:
     return feat;
   }
 
-  /// Returns the word size in bytes for `load` accessing `space`.
-  std::optional<uint64_t> getWordSize(
-      mlir::ktdf_arch::feature::Load load, mlir::Attribute space) {
-    auto map = load.getWordSize();
-    if (!map) return std::nullopt;
-    return map.getValue(space);
+  /// Returns true if the unit enclosing `op` has a SIMD feature with splat
+  /// capability declared in the arch spec.
+  bool canSplat(mlir::Operation* op,
+                const mlir::ktdf_arch::ResourceKinds& resourceKinds) {
+    auto kind = getUnitKind(op);
+    if (!kind) return false;
+    auto simd = resourceKinds.getFeature<mlir::ktdf_arch::feature::SIMD>(kind);
+    return simd && simd.canSplat();
   }
 
-  /// Returns the word size in bytes for `store` accessing `space`.
-  std::optional<uint64_t> getWordSize(
+  /// Returns the word size in bytes for the load unit accessing `space`.
+  uint64_t getWordSize(
+      mlir::ktdf_arch::feature::Load load, mlir::Attribute space) {
+    return load.getWordSize(space);
+  }
+
+  /// Returns the word size in bytes for the store unit accessing `space`.
+  uint64_t getWordSize(
       mlir::ktdf_arch::feature::Store store, mlir::Attribute space) {
-    auto map = store.getWordSize();
-    if (!map) return std::nullopt;
-    return map.getValue(space);
+    return store.getWordSize(space);
   }
 
   /// Returns the access granularity list for `load` and `space`.
@@ -259,6 +293,7 @@ private:
   }
 
   /// Returns the word size in bytes for `op`'s unit accessing `space`.
+  /// Returns nullopt only when the unit has no Load or Store feature at all.
   /// Tries load feature first, then store.
   std::optional<uint64_t> getWordSize(
       mlir::ktdf::DataTransferOp op,
@@ -314,15 +349,8 @@ private:
       llvm::ArrayRef<int64_t> inheritedStrides = {}) {
     auto space = srcMemref.getMemorySpace();
 
-    auto wordBytes    = getWordSize(dt, space, resourceKinds);
+    auto wordBytes     = getWordSize(dt, space, resourceKinds);
     auto granularities = getAccessGranularity(dt, space, resourceKinds);
-
-    if (!wordBytes) {
-      dt->emitError(PASS_NAME ": no word-size entry in the arch spec for "
-                    "memory space ")
-          << space;
-      return std::nullopt;
-    }
 
     // Element byte size must be statically known.
     auto elemBytes = scheduler::tryGetSizeInBytes(srcMemref.getElementType());
@@ -365,13 +393,15 @@ private:
     for (int64_t s : transferSizes) totalElems *= s;
     uint64_t transferBytes = static_cast<uint64_t>(totalElems) * *elemBytes;
 
-    // Find the matching granularity entry for this transfer size.
+    // Find a granularity entry that the transfer size is a multiple of.
+    // A transfer of N bytes is legal if N is a positive integer multiple of
+    // some entry's granularity.
     if (granularities) {
       bool matched = false;
       uint64_t matchedGranBytes = 0;
       for (auto entry : *granularities) {
         uint64_t granBytes = entry.getSizeInWords() * *wordBytes;
-        if (granBytes == transferBytes) {
+        if (granBytes != 0 && transferBytes % granBytes == 0) {
           matched = true;
           matchedGranBytes = granBytes;
           break;
