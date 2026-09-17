@@ -28,6 +28,7 @@
 
 #include <memory>
 
+#include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
@@ -82,14 +83,21 @@ class DataTransferLegality {
     mlir::scf::ForOp                     innermostLoop;  // innermost scf.for enclosing the transfers
   };
 
-  /// Root node of a per-pipeline analysis tree. Shared parameters (targetDim,
-  /// requiredSize) are stored here so all child nodes can read them directly.
+  /// Whether the pass needs to widen transfers to cover a full contiguous block,
+  /// or shrink them to a single element (element-addressable memory).
+  enum class AlignmentKind { Widen, Shrink };
+
+  /// Root node of a per-pipeline analysis tree. Shared parameters
+  /// (alignmentKind, alignDim, alignmentFactor) are stored here so all child
+  /// nodes can read them directly.
   struct PipelineAnalysis {
     mlir::ktdf::PipelineOp                   pipeline;
-    llvm::SmallVector<mlir::memref::AllocOp> allocs;          // staging buffer allocs in ktdf.private
-    int64_t                                  targetDim    = -1; // offset from end (0 = innermost, 1 = second-from-end)
-    int64_t                                  requiredSize =  0; // elements per hardware word (wordBytes / elemBytes)
-    llvm::SmallVector<StageAnalysis>         stages;            // one entry per ktdf.stage
+    llvm::SmallVector<mlir::memref::AllocOp> allocs;              // staging buffer allocs in ktdf.private
+    AlignmentKind                            alignmentKind   = AlignmentKind::Widen;
+    int64_t                                  alignDim        = -1; // which dim to align, offset from end
+    int64_t                                  alignmentFactor =  0; // factor to multiply the data transfer size by on alignDim
+    int64_t                                  strideElems     =  0; // full contiguous block extent in elements
+    llvm::SmallVector<StageAnalysis>         stages;              // one entry per ktdf.stage
   };
 
   /// Build a PipelineAnalysis for `pipeline`. Stages containing a nested
@@ -132,7 +140,8 @@ class DataTransferLegality {
       }
     }
 
-    // Derive targetDim and requiredSize from the first illegal transfer.
+    // Derive alignDim, alignmentFactor, and alignmentKind from the first illegal
+    // transfer.
     //
     // The required transfer size is determined by the non-contiguous stride on
     // the source memref: to move the data the transfer requests, we must pull
@@ -163,13 +172,16 @@ class DataTransferLegality {
 
         if (isSingleElement) {
           // Shrink: element-addressable memory, collapse to one element.
-          // targetDim=0 means the innermost dimension (offset 0 from end).
-          pa.targetDim    = 0;
-          pa.requiredSize = 1;
+          // alignDim=0 means the innermost dimension (offset 0 from end).
+          pa.alignmentKind   = AlignmentKind::Shrink;
+          pa.alignDim        = 0;
+          pa.alignmentFactor = 1;
         } else {
-          // Widen: the non-contiguous innermost stride tells us exactly how
-          // many contiguous elements we must transfer to cover the requested
-          // data. Use inheritedStrides when set (nested pipeline case), otherwise
+          // Widen: the non-contiguous innermost stride tells us the total span
+          // of the source in elements. Each transfer iteration already covers
+          // elemsPerIter (the innermost transfer size), so the number of loop
+          // iterations — and hence the loop bound E — is stride / elemsPerIter.
+          // Use inheritedStrides when set (nested pipeline case), otherwise
           // read the stride directly from the source memref layout.
           int64_t strideElems = 1;
           if (!inheritedStrides.empty()) {
@@ -179,22 +191,38 @@ class DataTransferLegality {
             if (!mlir::failed(stride))
               strideElems = *stride;
           }
-          // targetDim=1 means the second-to-last dimension (offset 1 from end).
-          pa.targetDim    = 1;
-          pa.requiredSize = strideElems;
+
+          // Elements covered per loop iteration = the transfer size at alignDim
+          // (offset 1 from the end, i.e. sizes[rank-2]).
+          // E = strideElems / elemsPerIter gives the number of iterations needed
+          // to cover one full contiguous block.
+          int64_t elemsPerIter = 1;
+          if (auto sizes = ts.transfer.getStaticSourceSizesArray()) {
+            // alignDim=1 → index from end = 1 → absolute index = rank-2
+            int64_t rank = (int64_t)sizes->size();
+            int64_t idx  = rank - 1 - 1;  // rank - 1 - alignDim(=1)
+            if (idx >= 0 && idx < rank)
+              elemsPerIter = std::max<int64_t>(1, (*sizes)[idx]);
+          }
+
+          // alignDim=1 means the second-to-last dimension (offset 1 from end).
+          pa.alignmentKind   = AlignmentKind::Widen;
+          pa.alignDim        = 1;
+          pa.strideElems     = strideElems;
+          pa.alignmentFactor = strideElems / elemsPerIter;
         }
         break;
       }
-      if (pa.targetDim != -1) break;
+      if (pa.alignDim != -1) break;
     }
 
     // Post-analysis fixup: set needsSplat on memref→FIFO transfers now that
-    // requiredSize is known. Only units with ktdf_arch.feature.simd { splat }
+    // alignmentFactor is known. Only units with ktdf_arch.feature.simd { splat }
     // can legally broadcast a scalar element across a FIFO slot. If the unit
     // lacks that capability the transfer is unresolvable — emit an error.
     // classifyTransferStep returns early for FIFO sources so this flag must
     // be applied here.
-    if (pa.requiredSize > 0) {
+    if (pa.alignmentFactor > 0) {
       for (auto& sa : pa.stages) {
         for (auto& ts : sa.transfers) {
           mlir::ktdf::DataTransferOp dt = ts.transfer;
@@ -219,7 +247,7 @@ private:
   /// Returns the single applicable unit kind for the stage enclosing `op`,
   /// stopping at any PipelineOp boundary. Returns nullptr if the stage has
   /// zero or more than one unit.
-  mlir::Attribute getUnitKind(mlir::Operation* op) {
+  mlir::ktdf_arch::KindAttr getUnitKind(mlir::Operation* op) {
     mlir::Operation* cursor = op->getParentOp();
     while (cursor && !mlir::isa<mlir::ktdf::StageOp>(cursor)) {
       if (mlir::isa<mlir::ktdf::PipelineOp>(cursor)) return nullptr;
@@ -229,7 +257,7 @@ private:
     if (!stage) return nullptr;
     auto units = stage.getApplicableUnits();
     if (!units || units->size() != 1) return nullptr;
-    return (*units)[0];
+    return mlir::dyn_cast<mlir::ktdf_arch::KindAttr>((*units)[0]);
   }
 
   /// Returns the Load feature for the unit enclosing `op`.
@@ -431,7 +459,7 @@ private:
 
   /// Classifies a single ktdf.data_transfer and returns a TransferStep.
   /// FIFO sources are returned with all flags false; they are handled once
-  /// requiredSize is known. Returns nullopt on hard failure (error already emitted).
+  /// alignmentFactor is known. Returns nullopt on hard failure (error already emitted).
   /// When `inheritedStrides` is non-empty it is forwarded to checkSourceMemRef.
   std::optional<TransferStep> classifyTransferStep(
       mlir::ktdf::DataTransferOp dt,
@@ -577,8 +605,12 @@ static llvm::raw_ostream& printPipelineAnalysis(llvm::raw_ostream& os,
     os << "<unset>";
   }
   os << "\n";
-  os << indent << "  targetDim=" << pa.targetDim << "\n";
-  os << indent << "  requiredSize=" << pa.requiredSize << "\n";
+  os << indent << "  alignmentKind="
+     << (pa.alignmentKind == DataTransferLegality::AlignmentKind::Widen
+             ? "Widen" : "Shrink") << "\n";
+  os << indent << "  alignDim=" << pa.alignDim << "\n";
+  os << indent << "  alignmentFactor=" << pa.alignmentFactor << "\n";
+  os << indent << "  strideElems=" << pa.strideElems << "\n";
   if (pa.allocs.empty()) {
     os << indent << "  allocs=<none>\n";
   } else {
@@ -606,12 +638,25 @@ static llvm::raw_ostream& operator<<(llvm::raw_ostream& os,
   return printPipelineAnalysis(os, pa, "");
 }
 
+/// Returns true if `val` is a memref located in per-core ct_local memory.
+static bool isPerCoreScratchpad(
+    mlir::Value val, const scheduler::arch_view::MemoryTree& memory_tree) {
+  auto mrt = mlir::dyn_cast<mlir::MemRefType>(val.getType());
+  if (!mrt) return false;
+  auto space = mrt.getMemorySpace();
+  if (!space) return false;
+  auto kind = mlir::dyn_cast<mlir::ktdf_arch::KindAttr>(space);
+  if (!kind) return false;
+  return memory_tree.isPerCoreScratchPadMemory(kind);
+}
+
 /// Widens any ct_local alloc backing a source or destination of `ts` at
-/// pa.targetDim to E (pa.requiredSize). Non-ct_local sides are skipped.
+/// pa.alignDim by pa.alignmentFactor. Non-ct_local sides are skipped.
 static void widenAlloc(const DataTransferLegality::TransferStep& ts,
                        const DataTransferLegality::PipelineAnalysis& pa,
+                       const scheduler::arch_view::MemoryTree& memory_tree,
                        mlir::OpBuilder& builder) {
-  const int64_t E = pa.requiredSize;
+  const int64_t alignmentFactor = pa.alignmentFactor;
 
   // DataTransferOp is a pointer wrapper — copy it so we can call non-const
   // accessors without needing to drop the const on the TransferStep.
@@ -620,12 +665,7 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
   // Tries to widen the alloc backing `val` if it is a ct_local memref owned
   // by this pipeline. Returns early silently for non-ct_local or foreign allocs.
   auto tryWiden = [&](mlir::Value val) {
-    auto memref_type = mlir::dyn_cast<mlir::MemRefType>(val.getType());
-    if (!memref_type) return;
-
-    auto mem_space = mlir::dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(
-        memref_type.getMemorySpace());
-    if (!mem_space || mem_space.getKind() != mlir::ktdp::MemorySpaceKind::ct_local)
+    if (!isPerCoreScratchpad(val, memory_tree))
       return;
 
     // ct_local buffers are exposed as ktdf.private results; follow the result
@@ -658,27 +698,32 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     mlir::MemRefType orig_type = alloc.getType();
     llvm::SmallVector<int64_t> new_shape(orig_type.getShape());
 
+    // If the outermost dimension is already 1, this alloc was already widened.
+    if (new_shape[0] == 1)
+      return;
+
     // Convert offset-from-end to an absolute index into the alloc shape.
-    int64_t alloc_dim = (int64_t)orig_type.getRank() - 1 - pa.targetDim;
+    int64_t alloc_dim = (int64_t)orig_type.getRank() - 1 - pa.alignDim;
     if (alloc_dim < 0 || alloc_dim >= (int64_t)orig_type.getRank()) {
-      ts.transfer->emitError("widenAlloc: targetDim ")
+      ts.transfer->emitError("widenAlloc: alignDim ")
           << alloc_dim << " is out of range for alloc rank "
           << orig_type.getRank();
       return;
     }
 
-    // Already widened — nothing to do.
-    if (new_shape[alloc_dim] == E && new_shape[0] == 1) {
-      LDBG(1) << "  widenAlloc: already widened, skipping";
+    if (new_shape[0] % alignmentFactor != 0) {
+      ts.transfer->emitError("widenAlloc: outermost dimension (")
+          << new_shape[0] << ") is not divisible by alignment factor "
+          << alignmentFactor;
       return;
     }
 
-    // Widen the data dimension to E and collapse the outermost (stick-count)
-    // dimension to 1. The outer pipeline iterated over 'sticks'; after
-    // alignment we address one E-element block directly, so dim 0 is no
-    // longer needed as a loop dimension.
-    new_shape[alloc_dim] = E;
-    new_shape[0] = 1;
+    // Scale the data dimension by alignmentFactor and divide the outermost
+    // (word-count) dimension by alignmentFactor. The overall volume of the
+    // buffer is preserved while reshaping from N iterations of size K to
+    // N / alignmentFactor iterations of size K * alignmentFactor.
+    new_shape[alloc_dim] = new_shape[alloc_dim] * alignmentFactor;
+    new_shape[0] = new_shape[0] / alignmentFactor;
 
     // Use the default identity layout - the affine maps on the data_transfer
     // ops encode all access patterns.
@@ -687,22 +732,9 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
                               mlir::MemRefLayoutAttrInterface{},
                               orig_type.getMemorySpace());
 
-    // Rebuild dynamic-size operands, dropping the one for alloc_dim if it
-    // was dynamic (it is now a constant).
-    auto orig_dynamic = alloc.getDynamicSizes();
-    llvm::SmallVector<mlir::Value> new_dynamic;
-    unsigned dyn_idx = 0;
-    for (int64_t i = 0; i < (int64_t)orig_type.getRank(); ++i) {
-      if (mlir::ShapedType::isDynamic(orig_type.getShape()[i])) {
-        if (mlir::ShapedType::isDynamic(new_shape[i]))
-          new_dynamic.push_back(orig_dynamic[dyn_idx]);
-        ++dyn_idx;
-      }
-    }
-
     builder.setInsertionPoint(alloc);
     auto new_alloc = mlir::memref::AllocOp::create(
-        builder, alloc.getLoc(), new_type, new_dynamic);
+        builder, alloc.getLoc(), new_type, mlir::ValueRange{});
 
     // Keep the ktdf.private result type in sync; the verifier requires it to
     // match the private_yield operand type and the alloc type.
@@ -720,8 +752,8 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
   tryWiden(dt.getSource());
 }
 
-/// Collapses sa.innermostLoop to a single iteration (ub=1) after verifying
-/// that the loop's total_size operand equals E (pa.requiredSize).
+/// Reduces sa.innermostLoop upper bound by pa.alignmentFactor after verifying
+/// that the loop's total_size operand is divisible by pa.alignmentFactor.
 static mlir::LogicalResult adjustLoopBounds(
     const DataTransferLegality::StageAnalysis& sa,
     const DataTransferLegality::PipelineAnalysis& pa,
@@ -743,9 +775,9 @@ static mlir::LogicalResult adjustLoopBounds(
         derive.getTotalSize().getDefiningOp());
     if (!cst) {
       return loop->emitError(
-          PASS_NAME ": ktdf.tiling.derive_size total_size is not a constant "
-          "— cannot verify dimension size against E=")
-          << pa.requiredSize;
+            PASS_NAME ": ktdf.tiling.derive_size total_size is not a constant "
+            "— cannot verify dimension size against alignmentFactor=")
+            << pa.alignmentFactor;
     }
     total_val = cst.value();
   } else {
@@ -753,76 +785,79 @@ static mlir::LogicalResult adjustLoopBounds(
         loop.getUpperBound().getDefiningOp());
     if (!cst) {
       return loop->emitError(
-          PASS_NAME ": innermost stage loop upper bound is neither a "
-          "ktdf.tiling.derive_size nor a constant index "
-          "— cannot verify dimension size against E=")
-          << pa.requiredSize;
+            PASS_NAME ": innermost stage loop upper bound is neither a "
+            "ktdf.tiling.derive_size nor a constant index "
+            "— cannot verify dimension size against alignmentFactor=")
+            << pa.alignmentFactor;
     }
     total_val = cst.value();
   }
 
-  if (total_val != pa.requiredSize) {
+  if (pa.alignmentFactor <= 0 || total_val % pa.alignmentFactor != 0) {
     return loop->emitError(PASS_NAME ": dimension total size (")
-        << total_val << ") does not match required alignment size E="
-        << pa.requiredSize
+        << total_val << ") is not divisible by alignment factor "
+        << pa.alignmentFactor
         << "; tiling and alignment constraints are inconsistent";
   }
 
-  // Total size confirmed == E; collapse to one iteration.
+  // Each widened transfer now covers alignmentFactor times as much data per
+  // iteration, so the loop only needs total_val / alignmentFactor iterations.
+  int64_t new_ub = total_val / pa.alignmentFactor;
   builder.setInsertionPoint(loop);
-  mlir::Value c1 =
-      mlir::arith::ConstantIndexOp::create(builder, loop.getLoc(), 1)
+  mlir::Value new_ub_val =
+      mlir::arith::ConstantIndexOp::create(builder, loop.getLoc(), new_ub)
           .getResult();
-  loop.setUpperBound(c1);
+  loop.setUpperBound(new_ub_val);
 
   LDBG(1) << "  adjustLoopBounds: total_size=" << total_val
-          << " == E=" << pa.requiredSize
-          << ", collapsed loop to ub=1 at " << loop.getLoc();
+          << " / alignmentFactor=" << pa.alignmentFactor
+          << " → new ub=" << new_ub << " at " << loop.getLoc();
   return mlir::success();
 }
 
-/// Replaces ts.transfer with a new DataTransferOp with pa.targetDim widened
-/// to E (pa.requiredSize). All other dimensions are preserved unchanged.
+/// Replaces ts.transfer with a new DataTransferOp with pa.alignDim widened
 /// Any explicit StridedLayoutAttr on a global (non-ct_local) memref operand
 /// is stripped via a memref.cast to identity layout — the strided layout was
 /// used by the analysis to detect illegality but must not appear on the
 /// rewritten transfer.
 static void rewriteTransferShape(const DataTransferLegality::TransferStep& ts,
                                  const DataTransferLegality::PipelineAnalysis& pa,
+                                 const scheduler::arch_view::MemoryTree& memory_tree,
                                  mlir::OpBuilder& builder) {
   mlir::ktdf::DataTransferOp op = ts.transfer;
   mlir::MLIRContext* ctx = op->getContext();
-
-  mlir::OpFoldResult e_ofr =
-      mlir::IntegerAttr::get(mlir::IndexType::get(ctx), pa.requiredSize);
 
   // Convert offset-from-end to absolute indices for src and dst size vectors.
   auto new_src_sizes = op.getMixedSourceSizes();
   auto new_dst_sizes = op.getMixedDestSizes();
   int64_t src_rank  = (int64_t)new_src_sizes.size();
   int64_t dst_rank  = (int64_t)new_dst_sizes.size();
-  int64_t src_dim   = src_rank - 1 - pa.targetDim;
-  int64_t dst_dim   = dst_rank - 1 - pa.targetDim;
+  int64_t src_dim   = src_rank - 1 - pa.alignDim;
+  int64_t dst_dim   = dst_rank - 1 - pa.alignDim;
+
+  auto getScaled = [&](mlir::OpFoldResult ofr) -> mlir::OpFoldResult {
+    int64_t existing = mlir::cast<mlir::IntegerAttr>(mlir::cast<mlir::Attribute>(ofr)).getInt();
+    return mlir::IntegerAttr::get(mlir::IndexType::get(ctx), existing * pa.alignmentFactor);
+  };
+
   if (src_dim >= 0 && src_dim < src_rank)
-    new_src_sizes[src_dim] = e_ofr;
+    new_src_sizes[src_dim] = getScaled(new_src_sizes[src_dim]);
   if (dst_dim >= 0 && dst_dim < dst_rank)
-    new_dst_sizes[dst_dim] = e_ofr;
+    new_dst_sizes[dst_dim] = getScaled(new_dst_sizes[dst_dim]);
 
   mlir::AffineMap src_map =
       op.isSourceMemRef() ? op.getSourceMapAttr().getValue() : mlir::AffineMap{};
   mlir::AffineMap dst_map =
       op.isDestMemRef() ? op.getDestMapAttr().getValue() : mlir::AffineMap{};
 
-  // Fix non-row-major strides on any global (non-ct_local) memref operand by
+  // Fix non-row-major strides on any global memref operand by
   // walking back to the ktdp.construct_memory_view and rewriting its
   // static_strides attribute to natural row-major values in place. The
   // strided layout was used during analysis to detect illegality;
   auto fixConstructStrides = [&](mlir::Value val) {
     auto mrt = mlir::dyn_cast<mlir::MemRefType>(val.getType());
     if (!mrt) return;
-    auto ms = mlir::dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(
-        mrt.getMemorySpace());
-    if (ms && ms.getKind() == mlir::ktdp::MemorySpaceKind::ct_local)
+    if (isPerCoreScratchpad(val, memory_tree))
       return;
     if (!mlir::isa<mlir::StridedLayoutAttr>(mrt.getLayout()))
       return;
@@ -920,8 +955,8 @@ static void rewriteTransferShape(const DataTransferLegality::TransferStep& ts,
   for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
     new_op->setDiscardableAttr(attr.getName(), attr.getValue());
 
-  LDBG(1) << "  rewriteTransferShape: widened dim " << pa.targetDim
-          << " to " << pa.requiredSize << ": " << new_op;
+  LDBG(1) << "  rewriteTransferShape: scaled dim " << pa.alignDim
+          << " by factor " << pa.alignmentFactor << ": " << new_op;
   op.erase();
 }
 
@@ -932,7 +967,7 @@ static void rewriteTransferShape(const DataTransferLegality::TransferStep& ts,
 /// insertLoopAroundPipeline, giving direct [0, 0, %row, %col] addressing.
 static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
                                   const DataTransferLegality::PipelineAnalysis& pa,
-                                  int64_t outerE,
+                                  const scheduler::arch_view::MemoryTree& memory_tree,
                                   llvm::StringRef mode,
                                   mlir::OpBuilder& builder) {
   mlir::ktdf::DataTransferOp op = ts.transfer;
@@ -942,7 +977,7 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
       mlir::IntegerAttr::get(mlir::IndexType::get(ctx), 1);
 
   // Splat: 1 source element broadcast to fill the FIFO (E elements).
-  // Collapse the ct_local source to [1,1,1,1] — one scalar element —
+  // Collapse the source to [1,1,1,1] — one scalar element —
   // and keep the FIFO destination at its natural size [E] so the hardware
   // knows to broadcast that scalar across the full slot.
   auto new_src_sizes = op.getMixedSourceSizes();
@@ -979,18 +1014,15 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
   // For ct_local memref operands, build a fresh affine map and index list.
   // The load (source) buffer is row-major: index [0, 0, %row, %col].
   // The store (destination) buffer is transposed (column-major): index
-  // [0, 0, %col, %row] — row and col are swapped to match the stick layout.
+  // [0, 0, %col, %row] — row and col are swapped to match the word layout.
   auto applyRowCol = [&](mlir::Value memref_val,
                          mlir::AffineMap& map,
                          llvm::SmallVector<mlir::Value>& indices,
                          bool transpose) {
     if (!row_iv || !col_iv) return;
-    auto mrt = mlir::dyn_cast<mlir::MemRefType>(memref_val.getType());
-    if (!mrt) return;
-    auto ms = mlir::dyn_cast_or_null<mlir::ktdp::MemorySpaceAttr>(
-        mrt.getMemorySpace());
-    if (!ms || ms.getKind() != mlir::ktdp::MemorySpaceKind::ct_local)
+    if (!isPerCoreScratchpad(memref_val, memory_tree))
       return;
+    auto mrt = mlir::cast<mlir::MemRefType>(memref_val.getType());
 
     int64_t rank = (int64_t)mrt.getRank();
     if (rank < 2) return;
@@ -1037,15 +1069,15 @@ static void rewriteTransferShrink(const DataTransferLegality::TransferStep& ts,
         mlir::StringAttr::get(ctx, mode));
 
   LDBG(1) << "  rewriteTransferShrink(" << mode << "): shrunk dim "
-          << pa.targetDim << " to 1: " << new_op;
+          << pa.alignDim << " to 1: " << new_op;
   op.erase();
 }
 
-/// Wraps the nested ktdf.pipeline in two nested scf.for loops over [0,E)
-/// so that each element of the widened [E, E] alloc block can be addressed
+/// Wraps the nested ktdf.pipeline in two nested scf.for loops over [0, bound)
+/// so that each element of the widened alloc block can be addressed
 /// directly via %row and %col IVs without any index arithmetic.
 static void insertLoopAroundPipeline(
-    DataTransferLegality::PipelineAnalysis* nestedPA, int64_t E,
+    DataTransferLegality::PipelineAnalysis* nestedPA, int64_t bound,
     mlir::OpBuilder& builder) {
   mlir::ktdf::PipelineOp nested_pipeline = nestedPA->pipeline;
   mlir::Location loc = nested_pipeline.getLoc();
@@ -1054,24 +1086,24 @@ static void insertLoopAroundPipeline(
 
   mlir::Value c0 =
       mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
-  mlir::Value cE =
-      mlir::arith::ConstantIndexOp::create(builder, loc, E).getResult();
+  mlir::Value cBound =
+      mlir::arith::ConstantIndexOp::create(builder, loc, bound).getResult();
   mlir::Value c1 =
       mlir::arith::ConstantIndexOp::create(builder, loc, 1).getResult();
 
-  // Outer loop: rows [0, E)
-  auto row_loop = mlir::scf::ForOp::create(builder, loc, c0, cE, c1);
+  // Outer loop: rows [0, bound)
+  auto row_loop = mlir::scf::ForOp::create(builder, loc, c0, cBound, c1);
   mlir::Block* row_body = row_loop.getBody();
 
-  // Inner loop: cols [0, E) — inserted inside the row loop body.
+  // Inner loop: cols [0, bound) — inserted inside the row loop body.
   builder.setInsertionPoint(row_body, row_body->getTerminator()->getIterator());
-  auto col_loop = mlir::scf::ForOp::create(builder, loc, c0, cE, c1);
+  auto col_loop = mlir::scf::ForOp::create(builder, loc, c0, cBound, c1);
 
   // Move the nested pipeline into the col loop body.
   mlir::Block* col_body = col_loop.getBody();
   nested_pipeline->moveBefore(col_body, col_body->getTerminator()->getIterator());
 
-  LDBG(1) << "  insertLoopAroundPipeline: inserted row/col loops (E=" << E
+  LDBG(1) << "  insertLoopAroundPipeline: inserted row/col loops (bound=" << bound
           << ") around nested pipeline at " << loc;
 }
 
@@ -1083,10 +1115,11 @@ static mlir::LogicalResult fixPipeline(
     DataTransferLegality& legality,
     DataTransferLegality::PipelineAnalysis& pa,
     const mlir::ktdf_arch::ResourceKinds& resourceKinds,
-    int64_t outerE,
+    const scheduler::arch_view::MemoryTree& memoryTree,
     mlir::OpBuilder& builder) {
   LDBG(1) << "  fixPipeline: pipeline at " << pa.pipeline.getLoc()
-          << " E=" << pa.requiredSize;
+          << " alignmentFactor=" << pa.alignmentFactor
+          << " strideElems=" << pa.strideElems;
 
   for (DataTransferLegality::StageAnalysis& sa : pa.stages) {
 
@@ -1096,45 +1129,41 @@ static mlir::LogicalResult fixPipeline(
       if (mlir::failed(adjustLoopBounds(sa, pa, builder)))
         return mlir::failure();
 
-      // Pass the outer pipeline's requiredSize as an inherited stride so that
-      // the nested pipeline's transfers see a non-contiguous stride and are
+      // Pass the outer pipeline's strideElems as an inherited stride so that
+      // the nested pipeline's transfers see the full non-contiguous stride and are
       // classified correctly (isIllegal / isDisplaced / needsSplat) without
       // any IR types being modified.
-      llvm::SmallVector<int64_t, 1> inheritedStrides = {pa.requiredSize};
+      llvm::SmallVector<int64_t, 1> inheritedStrides = {pa.strideElems};
       *sa.nestedPipeline = legality.analyzePipeline(
           sa.nestedPipeline->pipeline, resourceKinds, inheritedStrides);
       LDBG(1) << "  nested PipelineAnalysis:\n" << *sa.nestedPipeline;
 
-      insertLoopAroundPipeline(sa.nestedPipeline.get(), pa.requiredSize, builder);
+      insertLoopAroundPipeline(sa.nestedPipeline.get(), pa.strideElems, builder);
       if (mlir::failed(fixPipeline(legality, *sa.nestedPipeline, resourceKinds,
-                                   pa.requiredSize, builder)))
+                                   memoryTree, builder)))
         return mlir::failure();
       continue;
     }
 
     // Adjust the dimension loop bound for this stage before visiting
-    // its transfers. Fails if the tile size != E.
+    // its transfers.
     if (mlir::failed(adjustLoopBounds(sa, pa, builder)))
       return mlir::failure();
 
     for (DataTransferLegality::TransferStep& ts : sa.transfers) {
-      // FIFO-side transfers are checked first — splat describes the
-      // fundamental transfer kind and take priority over stride illegality.
-      if (ts.needsSplat) {
-        rewriteTransferShrink(ts, pa, outerE, "splat", builder);
-        continue;
-      }
-
-      // FIFO→memref transfers are shrunk to size [1] with no transfer_mode
-      // attr — the lowering handles single-element receive + store implicitly.
-      if (ts.transfer.isSourceFifo() && ts.transfer.isDestMemRef()) {
-        rewriteTransferShrink(ts, pa, outerE, "", builder);
-        continue;
-      }
-
-      if (ts.isIllegal || ts.isDisplaced) {
-        widenAlloc(ts, pa, builder);
-        rewriteTransferShape(ts, pa, builder);
+      if (pa.alignmentKind == DataTransferLegality::AlignmentKind::Widen) {
+        // Outer pipeline: widen staging allocs and bulk transfer shapes
+        if (ts.isIllegal || ts.isDisplaced) {
+          widenAlloc(ts, pa, memoryTree, builder);
+          rewriteTransferShape(ts, pa, memoryTree, builder);
+        }
+      } else {
+        // Nested / inner pipeline: shrink transfers to scalar access with IV indexing
+        if (ts.needsSplat) {
+          rewriteTransferShrink(ts, pa, memoryTree, "splat", builder);
+        } else if (ts.transfer.isSourceFifo() && ts.transfer.isDestMemRef()) {
+          rewriteTransferShrink(ts, pa, memoryTree, "", builder);
+        }
       }
     }
   }
@@ -1158,6 +1187,8 @@ struct DataTransferAlignmentPass
     }
     auto& resource_kinds =
         device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
+    auto& memory_tree =
+        device_manager.getOrCreateView<scheduler::arch_view::MemoryTree>(*device);
 
     llvm::SmallVector<DataTransferLegality::PipelineAnalysis> pipelines;
     getOperation()->walk<mlir::WalkOrder::PreOrder>(
@@ -1169,8 +1200,9 @@ struct DataTransferAlignmentPass
     mlir::OpBuilder builder(getOperation()->getContext());
     for (auto& pa : pipelines) {
       LDBG(1) << pa;
-      if (pa.requiredSize == 0) continue;  // nothing to fix for this pipeline
-      if (mlir::failed(fixPipeline(legality_, pa, resource_kinds, pa.requiredSize, builder))) {
+      if (pa.alignmentFactor == 0) continue;  // nothing to fix for this pipeline
+      if (mlir::failed(fixPipeline(legality_, pa, resource_kinds, memory_tree,
+                                   builder))) {
         signalPassFailure();
         return;
       }
