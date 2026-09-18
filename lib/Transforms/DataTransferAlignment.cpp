@@ -152,10 +152,28 @@ class DataTransferLegality {
     for (auto& sa : pa.stages) {
       for (auto& ts : sa.transfers) {
         if (!ts.isIllegal) continue;
-        auto srcMemref = mlir::cast<mlir::MemRefType>(
-            ts.transfer.getSource().getType());
-        auto space     = srcMemref.getMemorySpace();
-        auto elemBytes = scheduler::tryGetSizeInBytes(srcMemref.getElementType());
+
+        // Select the strided operand: prefer source if it is a non-unit-stride
+        // memref; fall back to destination (store-back to strided global memory).
+        // Only switch to destination when it is actually a memref.
+        mlir::ktdf::DataTransferOp dt = ts.transfer;
+        bool useDest = false;
+        if (dt.isSourceMemRef()) {
+          auto srcMrt = mlir::cast<mlir::MemRefType>(dt.getSource().getType());
+          auto stride = innermostStride(srcMrt);
+          if (!mlir::failed(stride) && *stride == 1 && dt.isDestMemRef())
+            useDest = true;  // source is contiguous — illegality is on dest
+        } else if (dt.isDestMemRef()) {
+          useDest = true;  // source is a FIFO, destination carries the stride
+        } else {
+          continue;  // neither operand is a memref; nothing to derive here
+        }
+
+        auto stridedMemref = useDest
+            ? mlir::cast<mlir::MemRefType>(dt.getDestination().getType())
+            : mlir::cast<mlir::MemRefType>(dt.getSource().getType());
+        auto space     = stridedMemref.getMemorySpace();
+        auto elemBytes = scheduler::tryGetSizeInBytes(stridedMemref.getElementType());
         if (!elemBytes || *elemBytes == 0) break;
 
         auto granularities = getAccessGranularity(ts.transfer, space, resourceKinds);
@@ -178,16 +196,16 @@ class DataTransferLegality {
           pa.alignmentFactor = 1;
         } else {
           // Widen: the non-contiguous innermost stride tells us the total span
-          // of the source in elements. Each transfer iteration already covers
-          // elemsPerIter (the innermost transfer size), so the number of loop
-          // iterations — and hence the loop bound E — is stride / elemsPerIter.
+          // of the strided operand in elements. Each transfer iteration already
+          // covers elemsPerIter (the innermost transfer size), so the number of
+          // loop iterations — and hence the loop bound E — is stride / elemsPerIter.
           // Use inheritedStrides when set (nested pipeline case), otherwise
-          // read the stride directly from the source memref layout.
+          // read the stride directly from the strided memref layout.
           int64_t strideElems = 1;
           if (!inheritedStrides.empty()) {
             strideElems = inheritedStrides.back();
           } else {
-            auto stride = innermostStride(srcMemref);
+            auto stride = innermostStride(stridedMemref);
             if (!mlir::failed(stride))
               strideElems = *stride;
           }
@@ -197,7 +215,9 @@ class DataTransferLegality {
           // E = strideElems / elemsPerIter gives the number of iterations needed
           // to cover one full contiguous block.
           int64_t elemsPerIter = 1;
-          if (auto sizes = ts.transfer.getStaticSourceSizesArray()) {
+          auto sizes = useDest ? dt.getStaticDestSizesArray()
+                               : dt.getStaticSourceSizesArray();
+          if (sizes) {
             // alignDim=1 → index from end = 1 → absolute index = rank-2
             int64_t rank = (int64_t)sizes->size();
             int64_t idx  = rank - 1 - 1;  // rank - 1 - alignDim(=1)
@@ -361,30 +381,30 @@ private:
     return s;
   }
 
-  /// Checks whether the source memref of a data_transfer is legal against the
-  /// arch spec. Only source contiguity and granularity are checked.
+  /// Checks whether a memref operand of a data_transfer is legal against the
+  /// arch spec. Checks contiguity and granularity.
   ///
   /// When `inheritedStrides` is non-empty those values are used in place of the
   /// memref's actual layout strides for the contiguity check.
   ///
   /// Returns true if legal, false if illegal but correctable, nullopt on
   /// hard failure (error already emitted).
-  std::optional<bool> checkSourceMemRef(
+  std::optional<bool> checkMemRef(
       mlir::ktdf::DataTransferOp dt,
-      mlir::MemRefType srcMemref,
+      mlir::MemRefType memref,
       llvm::ArrayRef<int64_t> transferSizes,
       const mlir::ktdf_arch::ResourceKinds& resourceKinds,
       llvm::ArrayRef<int64_t> inheritedStrides = {}) {
-    auto space = srcMemref.getMemorySpace();
+    auto space = memref.getMemorySpace();
 
     auto wordBytes     = getWordSize(dt, space, resourceKinds);
     auto granularities = getAccessGranularity(dt, space, resourceKinds);
 
     // Element byte size must be statically known.
-    auto elemBytes = scheduler::tryGetSizeInBytes(srcMemref.getElementType());
+    auto elemBytes = scheduler::tryGetSizeInBytes(memref.getElementType());
     if (!elemBytes) {
       dt->emitError(PASS_NAME ": element type has unknown size: ")
-          << srcMemref.getElementType();
+          << memref.getElementType();
       return std::nullopt;
     }
 
@@ -408,9 +428,9 @@ private:
     if (!inheritedStrides.empty()) {
       strideVal = inheritedStrides.back();
     } else {
-      auto stride = innermostStride(srcMemref);
+      auto stride = innermostStride(memref);
       if (mlir::failed(stride)) {
-        dt->emitError(PASS_NAME ": source memref has a dynamic innermost stride");
+        dt->emitError(PASS_NAME ": memref has a dynamic innermost stride");
         return std::nullopt;
       }
       strideVal = *stride;
@@ -460,7 +480,7 @@ private:
   /// Classifies a single ktdf.data_transfer and returns a TransferStep.
   /// FIFO sources are returned with all flags false; they are handled once
   /// alignmentFactor is known. Returns nullopt on hard failure (error already emitted).
-  /// When `inheritedStrides` is non-empty it is forwarded to checkSourceMemRef.
+  /// When `inheritedStrides` is non-empty it is forwarded to checkMemRef.
   std::optional<TransferStep> classifyTransferStep(
       mlir::ktdf::DataTransferOp dt,
       const mlir::ktdf_arch::ResourceKinds& resourceKinds,
@@ -468,25 +488,34 @@ private:
     TransferStep ts{};
     ts.transfer = dt;
 
-    // If the source is a FIFO there is no memref to check.
-    if (dt.isSourceFifo())
-      return ts;
+    // Check a memref operand; returns false on hard failure (error emitted).
+    auto checkOperand = [&](mlir::Value operand,
+                            llvm::StringRef side,
+                            std::optional<llvm::SmallVector<int64_t>> sizes)
+        -> bool {
+      if (!sizes) {
+        dt->emitError(PASS_NAME ": ") << side << " transfer has dynamic sizes; "
+                      "static sizes are required";
+        return false;
+      }
+      auto memref = mlir::cast<mlir::MemRefType>(operand.getType());
+      auto result = checkMemRef(dt, memref, *sizes, resourceKinds,
+                                inheritedStrides);
+      if (!result.has_value())
+        return false;
+      if (!*result)
+        ts.isIllegal = true;
+      return true;
+    };
 
-    // Source is a memref, check it.
-    auto srcMemref = mlir::cast<mlir::MemRefType>(dt.getSource().getType());
-    auto sizes     = dt.getStaticSourceSizesArray();
-    if (!sizes) {
-      dt->emitError(PASS_NAME ": source transfer has dynamic sizes; "
-                    "static sizes are required");
+    if (dt.isSourceMemRef() &&
+        !checkOperand(dt.getSource(), "source", dt.getStaticSourceSizesArray()))
       return std::nullopt;
-    }
 
-    auto result = checkSourceMemRef(dt, srcMemref, *sizes, resourceKinds,
-                                    inheritedStrides);
-    if (!result.has_value())
+    if (dt.isDestMemRef() &&
+        !checkOperand(dt.getDestination(), "destination", dt.getStaticDestSizesArray()))
       return std::nullopt;
 
-    ts.isIllegal = !*result;
     return ts;
   }
 
