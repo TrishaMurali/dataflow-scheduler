@@ -739,11 +739,15 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     if (new_shape[alloc_dim] == new_shape[alloc_dim] * alignmentFactor)
       return;
 
-    if (new_shape[0] % alignmentFactor != 0) {
+    if (mlir::ShapedType::isDynamic(new_shape[0])) {
+      new_shape[0] = 1;
+    } else if (new_shape[0] % alignmentFactor != 0) {
       ts.transfer->emitError("widenAlloc: outermost dimension (")
           << new_shape[0] << ") is not divisible by alignment factor "
           << alignmentFactor;
       return;
+    } else {
+      new_shape[0] = new_shape[0] / alignmentFactor;
     }
 
     int64_t widened_dim = new_shape[alloc_dim] * alignmentFactor;
@@ -754,13 +758,7 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
           << innermost_dim << ")";
       return;
     }
-
-    // Scale the data dimension by alignmentFactor and divide the outermost
-    // (word-count) dimension by alignmentFactor. The overall volume of the
-    // buffer is preserved while reshaping from N iterations of size K to
-    // N / alignmentFactor iterations of size K * alignmentFactor.
     new_shape[alloc_dim] = widened_dim;
-    new_shape[0] = new_shape[0] / alignmentFactor;
 
     // Use the default identity layout - the affine maps on the data_transfer
     // ops encode all access patterns.
