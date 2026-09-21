@@ -186,6 +186,8 @@ class DataTransferLegality {
               if (granBytes == *elemBytes) { isSingleElement = true; break; }
             }
           }
+        } else if (!inheritedStrides.empty()) {
+          isSingleElement = true;
         }
 
         if (isSingleElement) {
