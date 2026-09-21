@@ -755,6 +755,7 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
         return;
       }
       new_shape[0] = new_shape[0] / alignmentFactor;
+    }
 
       int64_t widened_dim = new_shape[alloc_dim] * alignmentFactor;
       int64_t innermost_dim = new_shape[(int64_t)orig_type.getRank() - 1];
@@ -765,7 +766,6 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
         return;
       }
       new_shape[alloc_dim] = widened_dim;
-    }
 
     // Use the default identity layout - the affine maps on the data_transfer
     // ops encode all access patterns.
