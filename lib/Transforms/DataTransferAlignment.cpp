@@ -736,29 +736,36 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
       return;
     }
 
-    if (new_shape[alloc_dim] == new_shape[alloc_dim] * alignmentFactor)
-      return;
+    llvm::SmallVector<mlir::Value> new_dynamic_sizes(alloc.getDynamicSizes());
 
-    if (mlir::ShapedType::isDynamic(new_shape[0])) {
-      new_shape[0] = 1;
-    } else if (new_shape[0] % alignmentFactor != 0) {
-      ts.transfer->emitError("widenAlloc: outermost dimension (")
-          << new_shape[0] << ") is not divisible by alignment factor "
-          << alignmentFactor;
-      return;
+    if (orig_type.getNumDynamicDims() > 0 && !new_dynamic_sizes.empty()) {
+      builder.setInsertionPoint(alloc);
+      mlir::Value c1 =
+          mlir::arith::ConstantIndexOp::create(builder, alloc.getLoc(), 1)
+              .getResult();
+      new_dynamic_sizes.back() = c1;
     } else {
-      new_shape[0] = new_shape[0] / alignmentFactor;
-    }
+      if (new_shape[alloc_dim] == new_shape[alloc_dim] * alignmentFactor)
+        return;
 
-    int64_t widened_dim = new_shape[alloc_dim] * alignmentFactor;
-    int64_t innermost_dim = new_shape[(int64_t)orig_type.getRank() - 1];
-    if (innermost_dim > 0 && widened_dim % innermost_dim != 0) {
-      ts.transfer->emitError("widenAlloc: widened dimension (")
-          << widened_dim << ") is not a multiple of innermost dimension ("
-          << innermost_dim << ")";
-      return;
+      if (new_shape[0] % alignmentFactor != 0) {
+        ts.transfer->emitError("widenAlloc: outermost dimension (")
+            << new_shape[0] << ") is not divisible by alignment factor "
+            << alignmentFactor;
+        return;
+      }
+      new_shape[0] = new_shape[0] / alignmentFactor;
+
+      int64_t widened_dim = new_shape[alloc_dim] * alignmentFactor;
+      int64_t innermost_dim = new_shape[(int64_t)orig_type.getRank() - 1];
+      if (innermost_dim > 0 && widened_dim % innermost_dim != 0) {
+        ts.transfer->emitError("widenAlloc: widened dimension (")
+            << widened_dim << ") is not a multiple of innermost dimension ("
+            << innermost_dim << ")";
+        return;
+      }
+      new_shape[alloc_dim] = widened_dim;
     }
-    new_shape[alloc_dim] = widened_dim;
 
     // Use the default identity layout - the affine maps on the data_transfer
     // ops encode all access patterns.
@@ -769,7 +776,7 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
 
     builder.setInsertionPoint(alloc);
     auto new_alloc = mlir::memref::AllocOp::create(
-        builder, alloc.getLoc(), new_type, mlir::ValueRange{});
+        builder, alloc.getLoc(), new_type, new_dynamic_sizes);
 
     // Keep the ktdf.private result type in sync; the verifier requires it to
     // match the private_yield operand type and the alloc type.
