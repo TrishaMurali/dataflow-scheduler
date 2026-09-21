@@ -727,10 +727,6 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     mlir::MemRefType orig_type = alloc.getType();
     llvm::SmallVector<int64_t> new_shape(orig_type.getShape());
 
-    // If the outermost dimension is already 1, this alloc was already widened.
-    if (new_shape[0] == 1)
-      return;
-
     // Convert offset-from-end to an absolute index into the alloc shape.
     int64_t alloc_dim = (int64_t)orig_type.getRank() - 1 - pa.alignDim;
     if (alloc_dim < 0 || alloc_dim >= (int64_t)orig_type.getRank()) {
@@ -740,6 +736,9 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
       return;
     }
 
+    if (new_shape[alloc_dim] == new_shape[alloc_dim] * alignmentFactor)
+      return;
+
     if (new_shape[0] % alignmentFactor != 0) {
       ts.transfer->emitError("widenAlloc: outermost dimension (")
           << new_shape[0] << ") is not divisible by alignment factor "
@@ -747,11 +746,20 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
       return;
     }
 
+    int64_t widened_dim = new_shape[alloc_dim] * alignmentFactor;
+    int64_t innermost_dim = new_shape[(int64_t)orig_type.getRank() - 1];
+    if (innermost_dim > 0 && widened_dim % innermost_dim != 0) {
+      ts.transfer->emitError("widenAlloc: widened dimension (")
+          << widened_dim << ") is not a multiple of innermost dimension ("
+          << innermost_dim << ")";
+      return;
+    }
+
     // Scale the data dimension by alignmentFactor and divide the outermost
     // (word-count) dimension by alignmentFactor. The overall volume of the
     // buffer is preserved while reshaping from N iterations of size K to
     // N / alignmentFactor iterations of size K * alignmentFactor.
-    new_shape[alloc_dim] = new_shape[alloc_dim] * alignmentFactor;
+    new_shape[alloc_dim] = widened_dim;
     new_shape[0] = new_shape[0] / alignmentFactor;
 
     // Use the default identity layout - the affine maps on the data_transfer
