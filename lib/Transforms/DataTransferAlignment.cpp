@@ -72,7 +72,8 @@ class DataTransferLegality {
     bool is_illegal = false;  // source memref has non-contiguous stride
     bool is_displaced =
         false;  // peer of an illegal transfer in the same pipeline
-    bool needs_splat = false;  // local->FIFO: splat scalar to vector
+    bool needs_splat = false;   // local->FIFO: splat to vector
+    bool needs_extract = false; // FIFO->local
   };
 
   /// Per-stage node. Exactly one of nested_pipeline or transfers is populated.
@@ -246,11 +247,9 @@ class DataTransferLegality {
       if (pa.align_dim != -1) break;
     }
 
-    // Post-analysis fixup: set needs_splat on memref->FIFO transfers now that
-    // alignment_factor is known. Only units with ktdf_arch.feature.simd { splat
-    // } can legally broadcast a scalar element across a FIFO slot. If the unit
-    // lacks that capability the transfer is unresolvable — emit an error.
-    // classifyTransferStep returns early for FIFO sources so this flag must
+    // Post-analysis fixup: set needs_splat / needs_extract on element-scalar
+    // transfers now that alignment_factor is known.
+    // classifyTransferStep returns early for FIFO sources so both flags must
     // be applied here.
     if (pa.alignment_factor > 0) {
       for (auto& sa : pa.stages) {
@@ -264,6 +263,16 @@ class DataTransferLegality {
                   PASS_NAME
                   ": memref→FIFO transfer requires splat but the enclosing "
                   "unit does not declare ktdf_arch.feature.simd { splat }");
+            }
+          } else if (dt.isSourceFifo() && dt.isDestMemRef()) {
+            if (canExtract(dt, resource_kinds)) {
+              ts.needs_extract = true;
+            } else {
+              dt->emitError(
+                  PASS_NAME
+                  ": FIFO→memref transfer requires (extract) store "
+                  "but the enclosing unit does not declare a sub-element "
+                  "access_granularity entry for ct_local");
             }
           }
         }
@@ -321,6 +330,28 @@ class DataTransferLegality {
     if (!kind) return false;
     auto simd = resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(kind);
     return simd && simd.canSplat();
+  }
+
+  /// Returns true if the unit enclosing `op` has a Store feature with a 2-byte
+  /// access_granularity entry for ct_local, meaning it supports extract stores.
+  bool canExtract(mlir::Operation* op,
+                  const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+    auto kind = getUnitKind(op);
+    if (!kind) return false;
+    auto store =
+        resource_kinds.getFeature<mlir::ktdf_arch::feature::Store>(kind);
+    if (!store) return false;
+    auto space = mlir::cast<mlir::MemRefType>(
+                     mlir::cast<mlir::ktdf::DataTransferOp>(op)
+                         .getDestination()
+                         .getType())
+                     .getMemorySpace();
+    auto grans = store.getAccessGranularity(space);
+    if (!grans) return false;
+    auto word_bytes = store.getWordSize(space);
+    for (auto entry : grans)
+      if (entry.getSizeInWords() * word_bytes == 2) return true;
+    return false;
   }
 
   /// Returns the word size in bytes for the load unit accessing `space`.
@@ -591,6 +622,7 @@ static llvm::raw_ostream& printTransferStep(
      << indent << "  is_illegal=" << ts.is_illegal << "\n"
      << indent << "  is_displaced=" << ts.is_displaced << "\n"
      << indent << "  needs_splat=" << ts.needs_splat << "\n"
+     << indent << "  needs_extract=" << ts.needs_extract << "\n"
      << indent << "}";
   return os;
 }
@@ -1036,14 +1068,22 @@ static void rewriteTransferShrink(
 
   mlir::OpFoldResult one = mlir::IntegerAttr::get(mlir::IndexType::get(ctx), 1);
 
-  // Splat: 1 source element broadcast to fill the FIFO (E elements).
-  // Collapse the source to [1,1,1,1] — one scalar element —
-  // and keep the FIFO destination at its natural size [E] so the hardware
-  // knows to broadcast that scalar across the full slot.
+  // Splat (memref→FIFO): collapse the source memref to [1,1,1,1] — one scalar
+  // element — and keep the FIFO destination at its natural size [E] so the
+  // hardware knows to broadcast that scalar across the full slot.
+  //
+  // extract (FIFO→memref): collapse the destination memref to [1,1,1,1] — one
+  // scalar element — and keep the FIFO source at its natural size [E].
+  // In both cases the memref side collapses; the FIFO side stays.
   auto new_src_sizes = op.getMixedSourceSizes();
   auto new_dst_sizes = op.getMixedDestSizes();
-  for (auto& s : new_src_sizes) s = one;
-  // Leave new_dst_sizes unchanged — the FIFO slot size is already correct.
+  if (mode == "extract") {
+    for (auto& s : new_dst_sizes) s = one;
+    // Leave new_src_sizes unchanged — the FIFO slot size is already correct.
+  } else {
+    for (auto& s : new_src_sizes) s = one;
+    // Leave new_dst_sizes unchanged — the FIFO slot size is already correct.
+  }
 
   // Find the two loop IVs inserted by insertLoopAroundPipeline. Walking out
   // past the enclosing ktdf.pipeline(s) we expect to hit the inner scf.for
@@ -1220,6 +1260,8 @@ static mlir::LogicalResult fixPipeline(
         // indexing
         if (ts.needs_splat) {
           rewriteTransferShrink(ts, pa, memory_tree, "splat", builder);
+        } else if (ts.needs_extract) {
+          rewriteTransferShrink(ts, pa, memory_tree, "extract", builder);
         } else if (ts.transfer.isSourceFifo() && ts.transfer.isDestMemRef()) {
           rewriteTransferShrink(ts, pa, memory_tree, "", builder);
         }
