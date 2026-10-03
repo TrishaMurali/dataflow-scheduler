@@ -86,6 +86,25 @@ auto isUsedInRegion(Value value, Region& region) -> bool {
 
 }  // namespace
 
+namespace {
+
+/// Name of the discardable attribute recording how a data transfer fills its
+/// destination.
+constexpr StringLiteral kTransferModeAttrName = "transfer_mode";
+constexpr StringLiteral kExtractTransferMode = "extract";
+
+StringRef getTransferMode(ktdf::DataTransferOp transfer) {
+  auto mode = llvm::dyn_cast_if_present<StringAttr>(
+      transfer->getDiscardableAttr(kTransferModeAttrName));
+  return mode ? mode.getValue() : StringRef();
+}
+
+}  // namespace
+
+auto mlir::ktdf::isExtractTransfer(ktdf::DataTransferOp transfer) -> bool {
+  return getTransferMode(transfer) == kExtractTransferMode;
+}
+
 auto mlir::ktdf::setInnermostStaticSourceSize(RewriterBase& rewriter,
                                               ktdf::DataTransferOp transfer,
                                               int64_t size) -> bool {
