@@ -702,6 +702,7 @@ struct LowerDataTransferPattern
     // the hardware replicates or zero-pads to fill the vector. Skip the
     // equality check and use the destination size as the transfer width.
     const auto transfer_mode = data_transfer_op.getTransferMode();
+    const bool is_extract = mlir::ktdf::isExtractTransfer(data_transfer_op);
     if (transfer_mode != mlir::ktdf::TransferMode::Copy &&
         src_total_elements > dst_total_elements) {
       data_transfer_op.emitError(
@@ -790,7 +791,8 @@ struct LowerDataTransferPattern
             llvm::cast<mlir::ktdf::FifoSlotType>(src.getType());
         return lowerAsReceiveAndStore(rewriter, data_transfer_op, dst_memref,
                                       dst_indices, dst_static_sizes, num_dims,
-                                      vector_type, dst_map, src_fifo_slot_type);
+                                      vector_type, dst_map, src_fifo_slot_type,
+                                      is_extract, dst_total_elements);
       }
     }
 
@@ -1069,7 +1071,9 @@ struct LowerDataTransferPattern
       mlir::ktdf::DataTransferOp data_transfer_op, mlir::Value dst_memref,
       mlir::ValueRange dst_indices, llvm::ArrayRef<int64_t> dst_static_sizes,
       unsigned num_dims, mlir::VectorType vector_type, mlir::AffineMap dst_map,
-      mlir::ktdf::FifoSlotType src_fifo_slot_type) const {
+      mlir::ktdf::FifoSlotType src_fifo_slot_type,
+      bool is_extract = false,
+      int64_t dst_total_elements = 0) const {
     // Build store_set from destination sizes
     auto store_set =
         buildIntegerSetFromSizes(rewriter.getContext(), dst_static_sizes);
@@ -1095,9 +1099,17 @@ struct LowerDataTransferPattern
     }
     mlir::Value src_unit = *src_unit_result;
 
+    // For extract: narrow the receive to dst_total_elements
+    // infers the correct granularity from the result type.
+    auto receive_type =
+        (is_extract && dst_total_elements > 0)
+            ? mlir::VectorType::get({dst_total_elements},
+                                    vector_type.getElementType())
+            : vector_type;
+
     // Create dataflow.receive operation
     auto receive_op = mlir::dataflow::ReceiveOp::create(
-        rewriter, data_transfer_op.getLoc(), vector_type, src_unit,
+        rewriter, data_transfer_op.getLoc(), receive_type, src_unit,
         /*dbgName=*/nullptr);
 
     // Create vector_store operation
