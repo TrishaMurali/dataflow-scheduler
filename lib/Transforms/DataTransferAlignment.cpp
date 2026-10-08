@@ -866,6 +866,18 @@ static mlir::LogicalResult adjustLoopBounds(
              << pa.alignment_factor;
     }
     total_val = cst.value();
+
+    if (!derive.getTileSizes().empty()) {
+      mlir::Value ts = derive.getTileSizes().back();
+      if (auto reserve_op =
+              ts.getDefiningOp<mlir::ktdf::TilingReserveSizeOp>()) {
+        builder.setInsertionPoint(reserve_op);
+        auto cst_tile = mlir::arith::ConstantIndexOp::create(
+            builder, reserve_op.getLoc(), pa.alignment_factor);
+        reserve_op.replaceAllUsesWith(cst_tile.getResult());
+        reserve_op.erase();
+      }
+    }
   } else {
     auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
         loop.getUpperBound().getDefiningOp());
@@ -1133,12 +1145,25 @@ static void rewriteTransferShrink(
     mlir::Value first_iv = transpose ? col_iv : row_iv;
     mlir::Value second_iv = transpose ? row_iv : col_iv;
 
-    llvm::SmallVector<mlir::AffineExpr> results(
-        rank, mlir::getAffineConstantExpr(0, ctx));
-    results[rank - 2] = mlir::getAffineDimExpr(0, ctx);
-    results[rank - 1] = mlir::getAffineDimExpr(1, ctx);
-    map = mlir::AffineMap::get(/*dims=*/2, /*syms=*/0, results, ctx);
-    indices = {first_iv, second_iv};
+    // Pad indices with zeros if needed so it has length `rank`.
+    if (indices.size() < static_cast<size_t>(rank)) {
+      builder.setInsertionPoint(op);
+      mlir::Value c0 =
+          mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0)
+              .getResult();
+      indices.resize(rank, c0);
+    }
+
+    // Replace the innermost two dimension indices with row/col IVs while
+    // preserving the leading batch/tile indices.
+    indices[rank - 2] = first_iv;
+    indices[rank - 1] = second_iv;
+
+    llvm::SmallVector<mlir::AffineExpr> results;
+    for (int64_t i = 0; i < rank; ++i) {
+      results.push_back(mlir::getAffineDimExpr(i, ctx));
+    }
+    map = mlir::AffineMap::get(/*dims=*/rank, /*syms=*/0, results, ctx);
   };
 
   auto new_src_indices = llvm::SmallVector<mlir::Value>(op.getSourceIndices());
