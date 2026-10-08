@@ -103,6 +103,8 @@ class DataTransferLegality {
     int64_t alignment_factor =
         0;  // factor to multiply the data transfer size by on align_dim
     int64_t stride_elems = 0;  // full contiguous block extent in elements
+    llvm::SmallVector<int64_t>
+        outer_permutation;  // permutation of outer dimensions (rank > 2)
     llvm::SmallVector<StageAnalysis> stages;  // one entry per ktdf.stage
   };
 
@@ -241,6 +243,12 @@ class DataTransferLegality {
           pa.align_dim = 1;
           pa.stride_elems = stride_elems;
           pa.alignment_factor = stride_elems / elems_per_iter;
+
+          // Gate outer permutation derivation on non-nested pipeline
+          // (inherited_strides is empty for outer pipelines).
+          if (inherited_strides.empty()) {
+            pa.outer_permutation = computeOuterPermutation(strided_memref);
+          }
         }
         break;
       }
@@ -283,6 +291,38 @@ class DataTransferLegality {
   }
 
  private:
+  /// Derives the outer-dimension permutation from a strided memref's layout
+  /// strides (dimensions 0 to rank-3) by sorting in descending stride order
+  /// (highest stride = outermost physical dimension). Returns an empty vector
+  /// if rank <= 2 or if the outer dimensions already follow natural descending
+  /// order (identity permutation).
+  llvm::SmallVector<int64_t> computeOuterPermutation(
+      mlir::MemRefType memref) {
+    llvm::SmallVector<int64_t, 4> strides;
+    int64_t offset;
+    if (mlir::failed(memref.getStridesAndOffset(strides, offset)) ||
+        strides.size() <= 2)
+      return {};
+
+    int64_t outer_rank = (int64_t)strides.size() - 2;
+    llvm::SmallVector<int64_t> perm(outer_rank);
+    std::iota(perm.begin(), perm.end(), 0);
+
+    std::sort(perm.begin(), perm.end(), [&](int64_t a, int64_t b) {
+      return strides[a] > strides[b];
+    });
+
+    // If already identity (0, 1, 2, ...), no permutation needed.
+    bool is_identity = true;
+    for (int64_t i = 0; i < outer_rank; ++i) {
+      if (perm[i] != i) {
+        is_identity = false;
+        break;
+      }
+    }
+    if (is_identity) return {};
+    return perm;
+  }
   /// Returns the single applicable unit kind for the stage enclosing `op`,
   /// stopping at any PipelineOp boundary. Returns nullptr if the stage has
   /// zero or more than one unit.
@@ -684,6 +724,16 @@ static llvm::raw_ostream& printPipelineAnalysis(
   os << indent << "  align_dim=" << pa.align_dim << "\n";
   os << indent << "  alignment_factor=" << pa.alignment_factor << "\n";
   os << indent << "  stride_elems=" << pa.stride_elems << "\n";
+  if (pa.outer_permutation.empty()) {
+    os << indent << "  outer_permutation=<identity>\n";
+  } else {
+    os << indent << "  outer_permutation=[";
+    for (int64_t i = 0; i < (int64_t)pa.outer_permutation.size(); ++i) {
+      if (i > 0) os << ", ";
+      os << pa.outer_permutation[i];
+    }
+    os << "]\n";
+  }
   if (pa.allocs.empty()) {
     os << indent << "  allocs=<none>\n";
   } else {
@@ -954,6 +1004,21 @@ static void rewriteTransferShape(
   mlir::AffineMap dst_map =
       op.isDestMemRef() ? op.getDestMapAttr().getValue() : mlir::AffineMap{};
 
+  auto new_src_indices = llvm::SmallVector<mlir::Value>(op.getSourceIndices());
+  auto new_dst_indices = llvm::SmallVector<mlir::Value>(op.getDestIndices());
+
+  // Apply outer dimension permutation to source transfer indices if present on a global memref.
+  if (!pa.outer_permutation.empty() && op.isSourceMemRef() &&
+      !isPerCoreScratchpad(op.getSource(), memory_tree)) {
+    int64_t outer_rank = (int64_t)pa.outer_permutation.size();
+    auto orig_src_indices = op.getSourceIndices();
+    if (new_src_indices.size() >= static_cast<size_t>(outer_rank)) {
+      for (int64_t i = 0; i < outer_rank; ++i) {
+        new_src_indices[i] = orig_src_indices[pa.outer_permutation[i]];
+      }
+    }
+  }
+
   // Fix non-row-major strides on any global memref operand by
   // walking back to the ktdp.construct_memory_view and rewriting its
   // static_strides attribute to natural row-major values in place. The
@@ -986,18 +1051,40 @@ static void rewriteTransferShape(
     if (!construct) return;
 
     // Compute row-major strides from the construct op's result shape.
+    // If outer dimensions were permuted, permute the shape to match memory layout.
     auto orig_mrt =
         mlir::cast<mlir::MemRefType>(construct.getResult().getType());
     auto shape = orig_mrt.getShape();
     int64_t rank = (int64_t)shape.size();
+
+    auto orig_strides = construct.getStaticStrides();
+    bool needs_permute = false;
+    if (rank > 2 && !pa.outer_permutation.empty() && orig_strides.size() >= 2) {
+      for (size_t i = 0; i + 1 < orig_strides.size() - 2; ++i) {
+        if (orig_strides[i] < orig_strides[i + 1]) {
+          needs_permute = true;
+          break;
+        }
+      }
+    }
+
+    llvm::SmallVector<int64_t> new_shape(shape.begin(), shape.end());
+    if (needs_permute) {
+      int64_t outer_rank = (int64_t)pa.outer_permutation.size();
+      for (int64_t i = 0; i < outer_rank; ++i) {
+        new_shape[i] = shape[pa.outer_permutation[i]];
+      }
+    }
     llvm::SmallVector<int64_t> row_major(rank, 1);
     for (int64_t i = rank - 2; i >= 0; --i)
-      row_major[i] = row_major[i + 1] * shape[i + 1];
+      row_major[i] = row_major[i + 1] * new_shape[i + 1];
 
     LDBG(1) << "  fix_construct_strides: rewriting strides on "
             << construct->getLoc() << " to row-major";
     construct.setStaticStridesAttr(
         mlir::DenseI64ArrayAttr::get(ctx, row_major));
+    construct.setStaticSizesAttr(
+        mlir::DenseI64ArrayAttr::get(ctx, new_shape));
 
     // Update the construct op's result type to carry the new row-major layout,
     // then propagate the updated type forward through all downstream view-like
@@ -1006,7 +1093,7 @@ static void rewriteTransferShape(
     auto new_layout = mlir::StridedLayoutAttr::get(
         ctx, /*offset=*/mlir::ShapedType::kDynamic, row_major);
     auto new_construct_type =
-        mlir::MemRefType::get(shape, orig_mrt.getElementType(), new_layout,
+        mlir::MemRefType::get(new_shape, orig_mrt.getElementType(), new_layout,
                               orig_mrt.getMemorySpace());
     construct.getResult().setType(new_construct_type);
 
@@ -1026,7 +1113,7 @@ static void rewriteTransferShape(
               mlir::dyn_cast<mlir::MemRefType>(castOp.getResult().getType());
           if (!res_type) continue;
           auto updated = mlir::MemRefType::get(
-              res_type.getShape(), res_type.getElementType(),
+              src_type.getShape(), res_type.getElementType(),
               src_type.getLayout(), res_type.getMemorySpace());
           castOp.getResult().setType(updated);
           new_val = castOp.getResult();
@@ -1036,7 +1123,7 @@ static void rewriteTransferShape(
               mlir::dyn_cast<mlir::MemRefType>(mscastOp.getResult().getType());
           if (!res_type) continue;
           auto updated = mlir::MemRefType::get(
-              res_type.getShape(), res_type.getElementType(),
+              src_type.getShape(), res_type.getElementType(),
               src_type.getLayout(), res_type.getMemorySpace());
           mscastOp.getResult().setType(updated);
           new_val = mscastOp.getResult();
@@ -1053,8 +1140,8 @@ static void rewriteTransferShape(
 
   builder.setInsertionPoint(op);
   auto new_op = mlir::ktdf::DataTransferOp::create(
-      builder, op.getLoc(), op.getSource(), src_map, op.getSourceIndices(),
-      new_src_sizes, op.getDestination(), dst_map, op.getDestIndices(),
+      builder, op.getLoc(), op.getSource(), src_map, new_src_indices,
+      new_src_sizes, op.getDestination(), dst_map, new_dst_indices,
       new_dst_sizes);
 
   for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
@@ -1317,7 +1404,7 @@ struct DataTransferAlignmentPass
         device_manager.getOrCreateView<scheduler::arch_view::MemoryTree>(
             *device);
 
-    llvm::SmallVector<DataTransferLegality::PipelineAnalysis> pipelines;
+    llvm::SmallVector<DataTransferLegality::PipelineAnalysis, 2> pipelines;
     getOperation()->walk<mlir::WalkOrder::PreOrder>(
         [&](mlir::ktdf::PipelineOp pipeline) {
           pipelines.push_back(
