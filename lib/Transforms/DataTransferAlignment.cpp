@@ -108,9 +108,8 @@ class DataTransferLegality {
     llvm::SmallVector<StageAnalysis> stages;  // one entry per ktdf.stage
   };
 
-  /// Build a PipelineAnalysis for `pipeline`. Stages containing a nested
-  /// ktdf.pipeline are recorded as stubs (PipelineOp handle only); fixPipeline
-  /// calls analyzePipeline on them after applying outer-level corrections.
+  /// Build a PipelineAnalysis tree for `pipeline`, recursing into nested
+  /// ktdf.pipeline ops once the outer alignment is known. Read-only.
   ///
   /// When `inherited_strides` is non-empty the legality check uses those stride
   /// values instead of reading them from the actual memref layout. This lets
@@ -255,36 +254,42 @@ class DataTransferLegality {
       if (pa.align_dim != -1) break;
     }
 
-    // Post-analysis fixup: set needs_splat / needs_extract on element-scalar
-    // transfers now that alignment_factor is known.
-    // classifyTransferStep returns early for FIFO sources so both flags must
-    // be applied here.
-    if (pa.alignment_factor > 0) {
-      for (auto& sa : pa.stages) {
-        for (auto& ts : sa.transfers) {
-          mlir::ktdf::DataTransferOp dt = ts.transfer;
-          if (dt.isSourceMemRef() && dt.isDestFifo()) {
-            if (canSplat(dt, resource_kinds)) {
-              ts.needs_splat = true;
-            } else {
-              dt->emitError(
-                  PASS_NAME
-                  ": memref→FIFO transfer requires splat but the enclosing "
-                  "unit does not declare ktdf_arch.feature.simd { splat }");
-            }
-          } else if (dt.isSourceFifo() && dt.isDestMemRef()) {
-            if (canExtract(dt, resource_kinds)) {
-              ts.needs_extract = true;
-            } else {
-              dt->emitError(
-                  PASS_NAME
-                  ": FIFO→memref transfer requires (extract) store "
-                  "but the enclosing unit does not declare a sub-element "
-                  "access_granularity entry for ct_local");
-            }
+    if (pa.alignment_factor == 0) return pa;
+
+    // Set needs_splat / needs_extract on FIFO transfers now that
+    // alignment_factor is known (classifyTransferStep leaves them unset).
+    for (auto& sa : pa.stages) {
+      for (auto& ts : sa.transfers) {
+        mlir::ktdf::DataTransferOp dt = ts.transfer;
+        if (dt.isSourceMemRef() && dt.isDestFifo()) {
+          if (canSplat(dt, resource_kinds)) {
+            ts.needs_splat = true;
+          } else {
+            dt->emitError(
+                PASS_NAME
+                ": memref→FIFO transfer requires splat but the enclosing "
+                "unit does not declare ktdf_arch.feature.simd { splat }");
+          }
+        } else if (dt.isSourceFifo() && dt.isDestMemRef()) {
+          if (canExtract(dt, resource_kinds)) {
+            ts.needs_extract = true;
+          } else {
+            dt->emitError(
+                PASS_NAME
+                ": FIFO→memref transfer requires (extract) store "
+                "but the enclosing unit does not declare a sub-element "
+                "access_granularity entry for ct_local");
           }
         }
       }
+    }
+
+    // Nested pipelines see the outer non-contiguous stride.
+    for (auto& sa : pa.stages) {
+      if (!sa.nested_pipeline) continue;
+      *sa.nested_pipeline =
+          analyzePipeline(sa.nested_pipeline->pipeline, resource_kinds,
+                          {pa.stride_elems});
     }
 
     return pa;
@@ -598,7 +603,7 @@ class DataTransferLegality {
   }
 
   /// Analyses a single stage. If it contains a nested ktdf.pipeline, stores a
-  /// stub in sa.nested_pipeline for fixPipeline to resolve. Otherwise
+  /// stub in sa.nested_pipeline for analyzePipeline to fill in. Otherwise
   /// classifies every ktdf.data_transfer into sa.transfers. Sets has_illegal if
   /// any transfer is illegal; is_displaced/needs_splat are set later. When
   /// `inherited_strides` is non-empty it is forwarded to classifyTransferStep.
@@ -1324,8 +1329,7 @@ static void insertLoopAroundPipeline(
 /// and rewrites every transfer shape (illegal/displaced → widen; FIFO →
 /// splat shrink).
 static mlir::LogicalResult fixPipeline(
-    DataTransferLegality& legality, DataTransferLegality::PipelineAnalysis& pa,
-    const mlir::ktdf_arch::ResourceKinds& resource_kinds,
+    DataTransferLegality::PipelineAnalysis& pa,
     const scheduler::arch_view::MemoryTree& memory_tree,
     mlir::OpBuilder& builder) {
   LDBG(1) << "  fixPipeline: pipeline at " << pa.pipeline.getLoc()
@@ -1333,32 +1337,17 @@ static mlir::LogicalResult fixPipeline(
           << " stride_elems=" << pa.stride_elems;
 
   for (DataTransferLegality::StageAnalysis& sa : pa.stages) {
-    if (sa.nested_pipeline != nullptr) {
-      // Collapse the tile loop enclosing the nested pipeline to ub=1 so the
-      // only column iteration is the element loop inserted below.
-      if (mlir::failed(adjustLoopBounds(sa, pa, builder)))
-        return mlir::failure();
+    // For a nested pipeline this collapses the enclosing tile loop to ub=1 so
+    // the only column iteration is the element loop inserted below.
+    if (mlir::failed(adjustLoopBounds(sa, pa, builder))) return mlir::failure();
 
-      // Pass the outer pipeline's stride_elems as an inherited stride so that
-      // the nested pipeline's transfers see the full non-contiguous stride and
-      // are classified correctly (is_illegal / is_displaced / needs_splat)
-      // without any IR types being modified.
-      llvm::SmallVector<int64_t, 1> inherited_strides = {pa.stride_elems};
-      *sa.nested_pipeline = legality.analyzePipeline(
-          sa.nested_pipeline->pipeline, resource_kinds, inherited_strides);
-      LDBG(1) << "  nested PipelineAnalysis:\n" << *sa.nested_pipeline;
-
+    if (sa.nested_pipeline) {
       insertLoopAroundPipeline(sa.nested_pipeline.get(), pa.stride_elems,
                                builder);
-      if (mlir::failed(fixPipeline(legality, *sa.nested_pipeline,
-                                   resource_kinds, memory_tree, builder)))
+      if (mlir::failed(fixPipeline(*sa.nested_pipeline, memory_tree, builder)))
         return mlir::failure();
       continue;
     }
-
-    // Adjust the dimension loop bound for this stage before visiting
-    // its transfers.
-    if (mlir::failed(adjustLoopBounds(sa, pa, builder))) return mlir::failure();
 
     for (DataTransferLegality::TransferStep& ts : sa.transfers) {
       if (pa.alignment_kind == DataTransferLegality::AlignmentKind::Widen) {
@@ -1417,8 +1406,7 @@ struct DataTransferAlignmentPass
       LDBG(1) << pa;
       if (pa.alignment_factor == 0)
         continue;  // nothing to fix for this pipeline
-      if (mlir::failed(fixPipeline(legality_, pa, resource_kinds, memory_tree,
-                                   builder))) {
+      if (mlir::failed(fixPipeline(pa, memory_tree, builder))) {
         signalPassFailure();
         return;
       }
