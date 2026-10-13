@@ -22,11 +22,11 @@
 // CHECK:              scf.for %[[ARG5:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:                ktdf.pipeline {
 // CHECK:                  ktdf.stage {{.*}} {
-// CHECK:                    ktdf.data_transfer from %[[PRIV]]#0[0, 0, 0, %[[ARG4]], %[[ARG5]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
+// CHECK:                    ktdf.data_transfer from %[[PRIV]]#0[%[[ARG2]], %[[ARG3]], %{{.*}}, %[[ARG4]], %[[ARG5]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
 // CHECK:                  }
 // CHECK:                  ktdf.stage
 // CHECK:                  ktdf.stage {{.*}} {
-// CHECK:                    ktdf.data_transfer from %{{.*}} size [1] to %[[PRIV]]#1[0, 0, 0, %[[ARG5]], %[[ARG4]]] size [1, 1, 1, 1, 64]
+// CHECK:                    ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[%[[ARG2]], %[[ARG3]], %{{.*}}, %[[ARG5]], %[[ARG4]]] size [1, 1, 1, 1, 1] {transfer_mode = "extract"}
 // CHECK:                  }
 // CHECK:                }
 // CHECK:              }
