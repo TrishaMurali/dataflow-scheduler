@@ -26,7 +26,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
 #include <memory>
+#include <numeric>
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
@@ -36,6 +38,7 @@
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -58,6 +61,65 @@ namespace scheduler {
 
 namespace {
 
+/// Logical dims sorted by descending stride; empty for identity, rank 0,
+/// dynamic strides or a failed stride query.
+static llvm::SmallVector<int64_t> derivePermutation(
+    mlir::MemRefType memref) {
+  llvm::SmallVector<int64_t> strides;
+  int64_t offset;
+  if (mlir::failed(memref.getStridesAndOffset(strides, offset)) ||
+      strides.empty() || llvm::any_of(strides, mlir::ShapedType::isDynamic))
+    return {};
+
+  llvm::SmallVector<int64_t> perm(strides.size());
+  std::iota(perm.begin(), perm.end(), 0);
+  std::stable_sort(perm.begin(), perm.end(), [&](int64_t a, int64_t b) {
+    return strides[a] > strides[b];
+  });
+
+  bool is_identity = llvm::all_of(llvm::enumerate(perm), [](auto p) {
+    return p.value() == static_cast<int64_t>(p.index());
+  });
+  if (is_identity) return {};
+  return perm;
+}
+
+/// Composes permutation, returns empty vector if result is identity.
+static llvm::SmallVector<int64_t> composePermutations(
+    llvm::ArrayRef<int64_t> src_perm, llvm::ArrayRef<int64_t> dst_perm) {
+  if (dst_perm.empty()) return llvm::to_vector(src_perm);
+  if (src_perm.empty()) {
+    int64_t n = dst_perm.size();
+    llvm::SmallVector<int64_t> inv_dst(n);
+    for (int64_t i = 0; i < n; ++i) inv_dst[dst_perm[i]] = i;
+    bool is_id = llvm::all_of(llvm::enumerate(inv_dst), [](auto p) {
+      return p.value() == static_cast<int64_t>(p.index());
+    });
+    return is_id ? llvm::SmallVector<int64_t>{} : inv_dst;
+  }
+  if (src_perm.size() != dst_perm.size()) return llvm::to_vector(src_perm);
+  int64_t n = src_perm.size();
+  llvm::SmallVector<int64_t> inv_dst(n);
+  for (int64_t i = 0; i < n; ++i) inv_dst[dst_perm[i]] = i;
+  llvm::SmallVector<int64_t> result(n);
+  for (int64_t i = 0; i < n; ++i) result[i] = inv_dst[src_perm[i]];
+  bool is_id = llvm::all_of(llvm::enumerate(result), [](auto p) {
+    return p.value() == static_cast<int64_t>(p.index());
+  });
+  return is_id ? llvm::SmallVector<int64_t>{} : result;
+}
+
+/// result[i] = values[perm[i]]; an empty `perm` returns `values` unchanged.
+template <typename T>
+static llvm::SmallVector<T> applyPermutation(
+    llvm::ArrayRef<int64_t> perm, llvm::ArrayRef<T> values) {
+  if (perm.empty()) return llvm::SmallVector<T>(values.begin(), values.end());
+  llvm::SmallVector<T> result;
+  result.reserve(perm.size());
+  for (int64_t src : perm) result.push_back(values[src]);
+  return result;
+}
+
 /// Identifies illegal ktdf.data_transfer ops and builds a per-pipeline
 /// analysis tree used by the corrective rewrite phase.
 class DataTransferLegality {
@@ -65,46 +127,28 @@ class DataTransferLegality {
   struct PipelineAnalysis;  // forward declaration, mutually recursive with
                             // StageAnalysis
 
-  /// Describes a single ktdf.data_transfer op. Flags are set at analysis time
-  /// so the rewrite phase needs no re-analysis.
-  struct TransferStep {
-    mlir::ktdf::DataTransferOp transfer;  // the ktdf.data_transfer op
-    bool is_illegal = false;  // source memref has non-contiguous stride
-    bool is_displaced =
-        false;  // peer of an illegal transfer in the same pipeline
-    bool needs_splat = false;   // local->FIFO: splat to vector
-    bool needs_extract = false; // FIFO->local
-  };
-
   /// Per-stage node. Exactly one of nested_pipeline or transfers is populated.
   struct StageAnalysis {
     mlir::ktdf::StageOp stage;
     std::unique_ptr<PipelineAnalysis>
         nested_pipeline;  // non-null if stage wraps a nested pipeline
-    llvm::SmallVector<TransferStep>
+    llvm::SmallVector<mlir::ktdf::DataTransferOp>
         transfers;  // empty when nested_pipeline is set
-    mlir::scf::ForOp
-        innermost_loop;  // innermost scf.for enclosing the transfers
   };
 
-  /// Whether the pass needs to widen transfers to cover a full contiguous
-  /// block, or shrink them to a single element (element-addressable memory).
-  enum class AlignmentKind { Widen, Shrink };
-
   /// Root node of a per-pipeline analysis tree. Shared parameters
-  /// (alignment_kind, align_dim, alignment_factor) are stored here so all child
+  /// (alignment_factor, stride_elems, permutation) are stored here so all child
   /// nodes can read them directly.
   struct PipelineAnalysis {
     mlir::ktdf::PipelineOp pipeline;
     llvm::SmallVector<mlir::memref::AllocOp>
         allocs;  // staging buffer allocs in ktdf.private
-    AlignmentKind alignment_kind = AlignmentKind::Widen;
-    int64_t align_dim = -1;  // which dim to align, offset from end
     int64_t alignment_factor =
-        0;  // factor to multiply the data transfer size by on align_dim
+        0;  // factor to multiply the data transfer size by on the widened dim
     int64_t stride_elems = 0;  // full contiguous block extent in elements
-    llvm::SmallVector<int64_t>
-        outer_permutation;  // permutation of outer dimensions (rank > 2)
+    llvm::SmallVector<int64_t> permutation;  // stride-derived index permutation
+    llvm::SmallVector<mlir::scf::ForOp>
+        enclosing_loops;  // per-stage innermost scf.for to shrink
     llvm::SmallVector<StageAnalysis> stages;  // one entry per ktdf.stage
   };
 
@@ -118,7 +162,8 @@ class DataTransferLegality {
   PipelineAnalysis analyzePipeline(
       mlir::ktdf::PipelineOp pipeline,
       const mlir::ktdf_arch::ResourceKinds& resource_kinds,
-      llvm::ArrayRef<int64_t> inherited_strides = {}) {
+      llvm::ArrayRef<int64_t> inherited_strides = {},
+      llvm::ArrayRef<int64_t> inherited_permutation = {}) {
     PipelineAnalysis pa{};
     pa.pipeline = pipeline;
 
@@ -129,205 +174,178 @@ class DataTransferLegality {
     }
 
     // Visit every stage.
-    bool has_illegal = false;
+    mlir::ktdf::DataTransferOp first_illegal;
     for (auto stage : pipeline.getStages()) {
-      pa.stages.push_back(
-          analyzeStage(stage, resource_kinds, has_illegal, inherited_strides));
+      if (auto loop = findStageLoop(stage)) pa.enclosing_loops.push_back(loop);
+      pa.stages.push_back(analyzeStage(stage, resource_kinds, first_illegal,
+                                       inherited_strides));
     }
 
-    if (!has_illegal) return pa;
+    if (!first_illegal) return pa;
 
-    // Mark every non-illegal transfer as displaced.
-    for (auto& sa : pa.stages) {
-      for (auto& ts : sa.transfers) {
-        if (!ts.is_illegal) ts.is_displaced = true;
-      }
-    }
-
-    // Derive align_dim, alignment_factor, and alignment_kind from the first
-    // illegal transfer.
-    //
-    // The required transfer size is determined by the non-contiguous stride on
-    // the source memref: to move the data the transfer requests, we must pull
-    // a contiguous block of (innermostStride) elements from the source memory.
-    // The arch spec granularity is then a validity check that this
-    // stride-derived size is actually a legal transfer size for the hardware —
-    // it is not the source of truth for the size.
-    for (auto& sa : pa.stages) {
-      for (auto& ts : sa.transfers) {
-        if (!ts.is_illegal) continue;
-
-        // Select the strided operand: prefer source if it is a non-unit-stride
-        // memref; fall back to destination (store-back to strided global
-        // memory). Only switch to destination when it is actually a memref.
-        mlir::ktdf::DataTransferOp dt = ts.transfer;
-        bool use_dest = false;
-        if (dt.isSourceMemRef()) {
-          auto srcMrt = mlir::cast<mlir::MemRefType>(dt.getSource().getType());
-          auto stride = innermostStride(srcMrt);
-          if (!mlir::failed(stride) && *stride == 1 && dt.isDestMemRef())
-            use_dest = true;  // source is contiguous — illegality is on dest
-        } else if (dt.isDestMemRef()) {
-          use_dest = true;  // source is a FIFO, destination carries the stride
-        } else {
-          continue;  // neither operand is a memref; nothing to derive here
-        }
-
-        auto strided_memref =
-            use_dest
-                ? mlir::cast<mlir::MemRefType>(dt.getDestination().getType())
-                : mlir::cast<mlir::MemRefType>(dt.getSource().getType());
-        auto space = strided_memref.getMemorySpace();
-        auto elem_bytes =
-            scheduler::tryGetSizeInBytes(strided_memref.getElementType());
-        if (!elem_bytes || *elem_bytes == 0) break;
-
-        auto granularities =
-            getAccessGranularity(ts.transfer, space, resource_kinds);
-        bool is_single_element = false;
-        if (granularities) {
-          auto word_bytes = getWordSize(ts.transfer, space, resource_kinds);
-          if (word_bytes) {
-            for (auto entry : *granularities) {
-              uint64_t gran_bytes = entry.getSizeInWords() * *word_bytes;
-              if (gran_bytes == *elem_bytes) {
-                is_single_element = true;
-                break;
-              }
-            }
-          }
-        } else if (!inherited_strides.empty()) {
-          is_single_element = true;
-        }
-
-        if (is_single_element) {
-          // Shrink: element-addressable memory, collapse to one element.
-          // align_dim=0 means the innermost dimension (offset 0 from end).
-          pa.alignment_kind = AlignmentKind::Shrink;
-          pa.align_dim = 0;
-          pa.alignment_factor = 1;
-        } else {
-          // Widen: the non-contiguous innermost stride tells us the total span
-          // of the strided operand in elements. Each transfer iteration already
-          // covers elems_per_iter (the innermost transfer size), so the number
-          // of loop iterations — and hence the loop bound E — is stride /
-          // elems_per_iter. Use inherited_strides when set (nested pipeline
-          // case), otherwise read the stride directly from the strided memref
-          // layout.
-          int64_t stride_elems = 1;
-          if (!inherited_strides.empty()) {
-            stride_elems = inherited_strides.back();
-          } else {
-            auto stride = innermostStride(strided_memref);
-            if (!mlir::failed(stride)) stride_elems = *stride;
-          }
-
-          // Elements covered per loop iteration = the transfer size at
-          // align_dim (offset 1 from the end, i.e. sizes[rank-2]). E =
-          // stride_elems / elems_per_iter gives the number of iterations needed
-          // to cover one full contiguous block.
-          int64_t elems_per_iter = 1;
-          auto sizes = use_dest ? dt.getStaticDestSizesArray()
-                                : dt.getStaticSourceSizesArray();
-          if (sizes) {
-            // align_dim=1 → index from end = 1 → absolute index = rank-2
-            int64_t rank = (int64_t)sizes->size();
-            int64_t idx = rank - 1 - 1;  // rank - 1 - align_dim(=1)
-            if (idx >= 0 && idx < rank)
-              elems_per_iter = std::max<int64_t>(1, (*sizes)[idx]);
-          }
-
-          // align_dim=1 means the second-to-last dimension (offset 1 from end).
-          pa.alignment_kind = AlignmentKind::Widen;
-          pa.align_dim = 1;
-          pa.stride_elems = stride_elems;
-          pa.alignment_factor = stride_elems / elems_per_iter;
-
-          // Gate outer permutation derivation on non-nested pipeline
-          // (inherited_strides is empty for outer pipelines).
-          if (inherited_strides.empty()) {
-            pa.outer_permutation = computeOuterPermutation(strided_memref);
-          }
-        }
-        break;
-      }
-      if (pa.align_dim != -1) break;
-    }
-
+    deriveAlignment(pa, first_illegal, resource_kinds, inherited_strides,
+                    inherited_permutation);
     if (pa.alignment_factor == 0) return pa;
 
-    // Set needs_splat / needs_extract on FIFO transfers now that
-    // alignment_factor is known (classifyTransferStep leaves them unset).
-    for (auto& sa : pa.stages) {
-      for (auto& ts : sa.transfers) {
-        mlir::ktdf::DataTransferOp dt = ts.transfer;
-        if (dt.isSourceMemRef() && dt.isDestFifo()) {
-          if (canSplat(dt, resource_kinds)) {
-            ts.needs_splat = true;
-          } else {
-            dt->emitError(
-                PASS_NAME
-                ": memref→FIFO transfer requires splat but the enclosing "
-                "unit does not declare ktdf_arch.feature.simd { splat }");
-          }
-        } else if (dt.isSourceFifo() && dt.isDestMemRef()) {
-          if (canExtract(dt, resource_kinds)) {
-            ts.needs_extract = true;
-          } else {
-            dt->emitError(
-                PASS_NAME
-                ": FIFO→memref transfer requires (extract) store "
-                "but the enclosing unit does not declare a sub-element "
-                "access_granularity entry for ct_local");
-          }
-        }
-      }
-    }
+    validateFifoTransfers(pa, resource_kinds);
 
-    // Nested pipelines see the outer non-contiguous stride.
+    // Nested pipelines see the outer non-contiguous stride and permutation.
     for (auto& sa : pa.stages) {
       if (!sa.nested_pipeline) continue;
       *sa.nested_pipeline =
           analyzePipeline(sa.nested_pipeline->pipeline, resource_kinds,
-                          {pa.stride_elems});
+                          {pa.stride_elems}, pa.permutation);
     }
 
     return pa;
   }
 
+  /// Returns true if the unit enclosing `op` has a SIMD feature with splat
+  /// capability declared in the arch spec.
+  bool canSplat(mlir::Operation* op,
+                const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+    auto kind = getUnitKind(op);
+    if (!kind) return false;
+    auto simd = resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(kind);
+    return simd && simd.canSplat();
+  }
+
+  /// Returns true if the unit enclosing `op` has a Store feature with a 2-byte
+  /// access_granularity entry for ct_local, meaning it supports extract stores.
+  bool canExtract(mlir::Operation* op,
+                  const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+    auto kind = getUnitKind(op);
+    if (!kind) return false;
+    auto store =
+        resource_kinds.getFeature<mlir::ktdf_arch::feature::Store>(kind);
+    if (!store) return false;
+    auto space = mlir::cast<mlir::MemRefType>(
+                     mlir::cast<mlir::ktdf::DataTransferOp>(op)
+                         .getDestination()
+                         .getType())
+                     .getMemorySpace();
+    auto grans = store.getAccessGranularity(space);
+    if (!grans) return false;
+    auto word_bytes = store.getWordSize(space);
+    for (auto entry : grans)
+      if (entry.getSizeInWords() * word_bytes == 2) return true;
+    return false;
+  }
+
  private:
-  /// Derives the outer-dimension permutation from a strided memref's layout
-  /// strides (dimensions 0 to rank-3) by sorting in descending stride order
-  /// (highest stride = outermost physical dimension). Returns an empty vector
-  /// if rank <= 2 or if the outer dimensions already follow natural descending
-  /// order (identity permutation).
-  llvm::SmallVector<int64_t> computeOuterPermutation(
-      mlir::MemRefType memref) {
-    llvm::SmallVector<int64_t, 4> strides;
-    int64_t offset;
-    if (mlir::failed(memref.getStridesAndOffset(strides, offset)) ||
-        strides.size() <= 2)
-      return {};
+  /// Derives alignment_factor, stride_elems and permutation on `pa` from the
+  /// first illegal transfer `dt`.
+  ///
+  /// The required transfer size is determined by the non-contiguous stride on
+  /// the strided memref: to move the data the transfer requests, we must pull
+  /// a contiguous block of (innermostStride) elements from the source memory.
+  /// The arch spec granularity only decides Shrink (single element) vs Widen.
+  void deriveAlignment(PipelineAnalysis& pa, mlir::ktdf::DataTransferOp dt,
+                       const mlir::ktdf_arch::ResourceKinds& resource_kinds,
+                       llvm::ArrayRef<int64_t> inherited_strides,
+                       llvm::ArrayRef<int64_t> inherited_permutation) {
+    // Select the strided operand: prefer source if it is a non-unit-stride
+    // memref; fall back to destination (store-back to strided global memory).
+    bool use_dest = false;
+    if (dt.isSourceMemRef()) {
+      auto src_type = mlir::cast<mlir::MemRefType>(dt.getSource().getType());
+      auto stride = innermostStride(src_type);
+      if (!mlir::failed(stride) && *stride == 1 && dt.isDestMemRef())
+        use_dest = true;  // source is contiguous — illegality is on dest
+    } else if (dt.isDestMemRef()) {
+      use_dest = true;  // source is a FIFO, destination carries the stride
+    } else {
+      return;  // neither operand is a memref; nothing to derive here
+    }
 
-    int64_t outer_rank = (int64_t)strides.size() - 2;
-    llvm::SmallVector<int64_t> perm(outer_rank);
-    std::iota(perm.begin(), perm.end(), 0);
+    auto strided_memref =
+        use_dest ? mlir::cast<mlir::MemRefType>(dt.getDestination().getType())
+                 : mlir::cast<mlir::MemRefType>(dt.getSource().getType());
+    auto space = strided_memref.getMemorySpace();
+    auto elem_bytes =
+        scheduler::tryGetSizeInBytes(strided_memref.getElementType());
+    if (!elem_bytes || *elem_bytes == 0) return;
 
-    std::sort(perm.begin(), perm.end(), [&](int64_t a, int64_t b) {
-      return strides[a] > strides[b];
-    });
+    auto granularities = getAccessGranularity(dt, space, resource_kinds);
+    bool is_single_element = false;
+    if (granularities) {
+      auto word_bytes = getWordSize(dt, space, resource_kinds);
+      if (word_bytes) {
+        for (auto entry : *granularities) {
+          uint64_t gran_bytes = entry.getSizeInWords() * *word_bytes;
+          if (gran_bytes == *elem_bytes) {
+            is_single_element = true;
+            break;
+          }
+        }
+      }
+    } else if (!inherited_strides.empty()) {
+      is_single_element = true;
+    }
 
-    // If already identity (0, 1, 2, ...), no permutation needed.
-    bool is_identity = true;
-    for (int64_t i = 0; i < outer_rank; ++i) {
-      if (perm[i] != i) {
-        is_identity = false;
-        break;
+    // Shrink: element-addressable memory, collapse to one element.
+    if (is_single_element) {
+      pa.alignment_factor = 1;
+      return;
+    }
+
+    // Widen: the non-contiguous innermost stride is the total span of the
+    // strided operand in elements; each iteration covers elems_per_iter, so
+    // the factor is stride / elems_per_iter. Nested pipelines use the
+    // inherited stride instead of reading the memref layout.
+    int64_t stride_elems = 1;
+    if (!inherited_strides.empty()) {
+      stride_elems = inherited_strides.back();
+    } else {
+      auto stride = innermostStride(strided_memref);
+      if (!mlir::failed(stride)) stride_elems = *stride;
+    }
+
+    // Elements covered per iteration = transfer size at dim rank - 2.
+    int64_t elems_per_iter = 1;
+    auto sizes = use_dest ? dt.getStaticDestSizesArray()
+                          : dt.getStaticSourceSizesArray();
+    if (sizes && sizes->size() >= 2)
+      elems_per_iter = std::max<int64_t>(1, (*sizes)[sizes->size() - 2]);
+
+    pa.stride_elems = stride_elems;
+    pa.alignment_factor = stride_elems / elems_per_iter;
+
+    if (!inherited_permutation.empty()) {
+      pa.permutation = llvm::to_vector(inherited_permutation);
+      return;
+    }
+
+    // Prefer a strided global memref seen anywhere in the pipeline; fall back
+    // to the illegal transfer's own operands.
+    mlir::MemRefType global_src, global_dst;
+    for (auto& sa : pa.stages) {
+      for (mlir::ktdf::DataTransferOp op : sa.transfers) {
+        if (op.isSourceMemRef() && !global_src) {
+          auto mrt = mlir::cast<mlir::MemRefType>(op.getSource().getType());
+          if (mlir::isa<mlir::StridedLayoutAttr>(mrt.getLayout()))
+            global_src = mrt;
+        }
+        if (op.isDestMemRef() && !global_dst) {
+          auto mrt =
+              mlir::cast<mlir::MemRefType>(op.getDestination().getType());
+          if (mlir::isa<mlir::StridedLayoutAttr>(mrt.getLayout()))
+            global_dst = mrt;
+        }
       }
     }
-    if (is_identity) return {};
-    return perm;
+    if (!global_src && dt.isSourceMemRef())
+      global_src = mlir::cast<mlir::MemRefType>(dt.getSource().getType());
+    if (!global_dst && dt.isDestMemRef())
+      global_dst = mlir::cast<mlir::MemRefType>(dt.getDestination().getType());
+
+    auto src_perm = global_src ? derivePermutation(global_src)
+                               : llvm::SmallVector<int64_t>{};
+    auto dst_perm = global_dst ? derivePermutation(global_dst)
+                               : llvm::SmallVector<int64_t>{};
+    pa.permutation = composePermutations(src_perm, dst_perm);
   }
+
   /// Returns the single applicable unit kind for the stage enclosing `op`,
   /// stopping at any PipelineOp boundary. Returns nullptr if the stage has
   /// zero or more than one unit.
@@ -365,38 +383,6 @@ class DataTransferLegality {
         resource_kinds.getFeature<mlir::ktdf_arch::feature::Store>(kind);
     if (!feat) return std::nullopt;
     return feat;
-  }
-
-  /// Returns true if the unit enclosing `op` has a SIMD feature with splat
-  /// capability declared in the arch spec.
-  bool canSplat(mlir::Operation* op,
-                const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
-    auto kind = getUnitKind(op);
-    if (!kind) return false;
-    auto simd = resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(kind);
-    return simd && simd.canSplat();
-  }
-
-  /// Returns true if the unit enclosing `op` has a Store feature with a 2-byte
-  /// access_granularity entry for ct_local, meaning it supports extract stores.
-  bool canExtract(mlir::Operation* op,
-                  const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
-    auto kind = getUnitKind(op);
-    if (!kind) return false;
-    auto store =
-        resource_kinds.getFeature<mlir::ktdf_arch::feature::Store>(kind);
-    if (!store) return false;
-    auto space = mlir::cast<mlir::MemRefType>(
-                     mlir::cast<mlir::ktdf::DataTransferOp>(op)
-                         .getDestination()
-                         .getType())
-                     .getMemorySpace();
-    auto grans = store.getAccessGranularity(space);
-    if (!grans) return false;
-    auto word_bytes = store.getWordSize(space);
-    for (auto entry : grans)
-      if (entry.getSizeInWords() * word_bytes == 2) return true;
-    return false;
   }
 
   /// Returns the word size in bytes for the load unit accessing `space`.
@@ -561,17 +547,14 @@ class DataTransferLegality {
     return false;
   }
 
-  /// Classifies a single ktdf.data_transfer and returns a TransferStep.
-  /// FIFO sources are returned with all flags false; they are handled once
-  /// alignment_factor is known. Returns nullopt on hard failure (error already
-  /// emitted). When `inherited_strides` is non-empty it is forwarded to
-  /// checkMemRef.
-  std::optional<TransferStep> classifyTransferStep(
+  /// Returns whether `dt` is illegal (has a correctable, non-contiguous memref
+  /// operand), or nullopt on hard failure (error already emitted). When
+  /// `inherited_strides` is non-empty it is forwarded to checkMemRef.
+  std::optional<bool> classifyTransfer(
       mlir::ktdf::DataTransferOp dt,
       const mlir::ktdf_arch::ResourceKinds& resource_kinds,
       llvm::ArrayRef<int64_t> inherited_strides = {}) {
-    TransferStep ts{};
-    ts.transfer = dt;
+    bool is_illegal = false;
 
     // Check a memref operand; returns false on hard failure (error emitted).
     auto check_operand =
@@ -587,7 +570,7 @@ class DataTransferLegality {
       auto result =
           checkMemRef(dt, memref, *sizes, resource_kinds, inherited_strides);
       if (!result.has_value()) return false;
-      if (!*result) ts.is_illegal = true;
+      if (!*result) is_illegal = true;
       return true;
     };
 
@@ -599,17 +582,57 @@ class DataTransferLegality {
                                             dt.getStaticDestSizesArray()))
       return std::nullopt;
 
-    return ts;
+    return is_illegal;
+  }
+
+  /// Reports FIFO transfers whose unit cannot splat / extract. Read-only.
+  void validateFifoTransfers(
+      const PipelineAnalysis& pa,
+      const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+    for (const auto& sa : pa.stages) {
+      for (mlir::ktdf::DataTransferOp dt : sa.transfers) {
+        if (dt.isSourceMemRef() && dt.isDestFifo() &&
+            !canSplat(dt, resource_kinds)) {
+          dt->emitError(
+              PASS_NAME
+              ": memref→FIFO transfer requires splat but the enclosing "
+              "unit does not declare ktdf_arch.feature.simd { splat }");
+        } else if (dt.isSourceFifo() && dt.isDestMemRef() &&
+                   !canExtract(dt, resource_kinds)) {
+          dt->emitError(
+              PASS_NAME
+              ": FIFO→memref transfer requires (extract) store "
+              "but the enclosing unit does not declare a sub-element "
+              "access_granularity entry for ct_local");
+        }
+      }
+    }
+  }
+
+  /// Returns the innermost scf.for inside `stage`; when the stage wraps a
+  /// nested pipeline, the innermost loop that does not lie inside it.
+  mlir::scf::ForOp findStageLoop(mlir::ktdf::StageOp stage) {
+    mlir::ktdf::PipelineOp nested;
+    stage->walk<mlir::WalkOrder::PreOrder>([&](mlir::ktdf::PipelineOp p) {
+      nested = p;
+      return mlir::WalkResult::interrupt();
+    });
+    mlir::scf::ForOp loop;
+    stage->walk<mlir::WalkOrder::PreOrder>([&](mlir::scf::ForOp for_op) {
+      if (!nested || !nested->isAncestor(for_op)) loop = for_op;
+    });
+    return loop;
   }
 
   /// Analyses a single stage. If it contains a nested ktdf.pipeline, stores a
   /// stub in sa.nested_pipeline for analyzePipeline to fill in. Otherwise
-  /// classifies every ktdf.data_transfer into sa.transfers. Sets has_illegal if
-  /// any transfer is illegal; is_displaced/needs_splat are set later. When
-  /// `inherited_strides` is non-empty it is forwarded to classifyTransferStep.
+  /// records every ktdf.data_transfer in sa.transfers and sets `first_illegal`
+  /// to the first illegal one if still unset. When `inherited_strides` is
+  /// non-empty it is forwarded to classifyTransfer.
   StageAnalysis analyzeStage(
       mlir::ktdf::StageOp stage,
-      const mlir::ktdf_arch::ResourceKinds& resource_kinds, bool& has_illegal,
+      const mlir::ktdf_arch::ResourceKinds& resource_kinds,
+      mlir::ktdf::DataTransferOp& first_illegal,
       llvm::ArrayRef<int64_t> inherited_strides = {}) {
     StageAnalysis sa{};
     sa.stage = stage;
@@ -625,51 +648,26 @@ class DataTransferLegality {
       PipelineAnalysis stub{};
       stub.pipeline = nested_pipeline;
       sa.nested_pipeline = std::make_unique<PipelineAnalysis>(std::move(stub));
-      // Also find the innermost loop enclosing the nested pipeline — it needs
-      // to be collapsed to ub=1 just like leaf stage loops, so that the only
-      // column iteration is the loop inserted by insertLoopAroundPipeline.
-      stage->walk<mlir::WalkOrder::PreOrder>([&](mlir::scf::ForOp forOp) {
-        if (!nested_pipeline->isAncestor(forOp)) sa.innermost_loop = forOp;
-      });
       return sa;
     }
 
-    // Find the innermost scf.for enclosing the transfers in this stage.
-    // PreOrder visits outer-to-inner; no interrupt() means the last
-    // assignment wins, leaving innermost_loop as the innermost ForOp.
-    stage->walk<mlir::WalkOrder::PreOrder>(
-        [&](mlir::scf::ForOp forOp) { sa.innermost_loop = forOp; });
-
     // Leaf stage: collect every data_transfer op.
     stage->walk([&](mlir::ktdf::DataTransferOp dt) {
-      auto ts = classifyTransferStep(dt, resource_kinds, inherited_strides);
-      if (ts) {
-        if (ts->is_illegal) has_illegal = true;
-        sa.transfers.push_back(*ts);
-      }
+      auto is_illegal = classifyTransfer(dt, resource_kinds, inherited_strides);
+      if (!is_illegal) return;
+      if (*is_illegal && !first_illegal) first_illegal = dt;
+      sa.transfers.push_back(dt);
     });
 
     return sa;
   }
 };
 
-/// Prints a TransferStep prefixed by `indent`.
-static llvm::raw_ostream& printTransferStep(
-    llvm::raw_ostream& os, const DataTransferLegality::TransferStep& ts,
-    llvm::StringRef indent) {
-  os << indent << "TransferStep{\n";
-  os << indent << "  loc=";
-  if (ts.transfer)
-    os << ts.transfer->getLoc();
-  else
-    os << "<unset>";
-  os << "\n"
-     << indent << "  is_illegal=" << ts.is_illegal << "\n"
-     << indent << "  is_displaced=" << ts.is_displaced << "\n"
-     << indent << "  needs_splat=" << ts.needs_splat << "\n"
-     << indent << "  needs_extract=" << ts.needs_extract << "\n"
-     << indent << "}";
-  return os;
+/// Prints a DataTransferOp location prefixed by `indent`.
+static llvm::raw_ostream& printTransfer(llvm::raw_ostream& os,
+                                        mlir::ktdf::DataTransferOp dt,
+                                        llvm::StringRef indent) {
+  return os << indent << "transfer=" << dt->getLoc();
 }
 
 // Forward declaration; printStageAnalysis and printPipelineAnalysis are
@@ -687,10 +685,6 @@ static llvm::raw_ostream& printStageAnalysis(
     os << sa.stage->getLoc();
   else
     os << "<unset>";
-  if (sa.innermost_loop) {
-    os << "\n" << indent << "  innermost_loop=";
-    sa.innermost_loop->print(os, mlir::OpPrintingFlags().skipRegions());
-  }
   if (sa.nested_pipeline) {
     os << ", nested_pipeline=\n";
     printPipelineAnalysis(os, *sa.nested_pipeline, (indent + "  ").str());
@@ -699,7 +693,7 @@ static llvm::raw_ostream& printStageAnalysis(
   } else {
     os << ", transfers=[\n";
     std::string ts_indent = (indent + "    ").str();
-    for (const auto& ts : sa.transfers) printTransferStep(os, ts, ts_indent);
+    for (auto dt : sa.transfers) printTransfer(os, dt, ts_indent) << "\n";
     os << "\n" << indent << "]";
   }
   os << "}";
@@ -721,22 +715,15 @@ static llvm::raw_ostream& printPipelineAnalysis(
     os << "<unset>";
   }
   os << "\n";
-  os << indent << "  alignment_kind="
-     << (pa.alignment_kind == DataTransferLegality::AlignmentKind::Widen
-             ? "Widen"
-             : "Shrink")
-     << "\n";
-  os << indent << "  align_dim=" << pa.align_dim << "\n";
+  for (mlir::scf::ForOp loop : pa.enclosing_loops)
+    os << indent << "  enclosing_loop=" << loop->getLoc() << "\n";
   os << indent << "  alignment_factor=" << pa.alignment_factor << "\n";
   os << indent << "  stride_elems=" << pa.stride_elems << "\n";
-  if (pa.outer_permutation.empty()) {
-    os << indent << "  outer_permutation=<identity>\n";
+  if (pa.permutation.empty()) {
+    os << indent << "  permutation=<identity>\n";
   } else {
-    os << indent << "  outer_permutation=[";
-    for (int64_t i = 0; i < (int64_t)pa.outer_permutation.size(); ++i) {
-      if (i > 0) os << ", ";
-      os << pa.outer_permutation[i];
-    }
+    os << indent << "  permutation=[";
+    llvm::interleaveComma(pa.permutation, os);
     os << "]\n";
   }
   if (pa.allocs.empty()) {
@@ -778,17 +765,13 @@ static bool isPerCoreScratchpad(
   return memory_tree.isPerCoreScratchPadMemory(kind);
 }
 
-/// Widens any ct_local alloc backing a source or destination of `ts` at
-/// pa.align_dim by pa.alignment_factor. Non-ct_local sides are skipped.
-static void widenAlloc(const DataTransferLegality::TransferStep& ts,
+/// Widens any ct_local alloc backing a source or destination of `dt` on its
+/// second-to-last dim by pa.alignment_factor. Non-ct_local sides are skipped.
+static void widenAlloc(mlir::ktdf::DataTransferOp dt,
                        const DataTransferLegality::PipelineAnalysis& pa,
                        const scheduler::arch_view::MemoryTree& memory_tree,
                        mlir::OpBuilder& builder) {
   const int64_t alignment_factor = pa.alignment_factor;
-
-  // DataTransferOp is a pointer wrapper — copy it so we can call non-const
-  // accessors without needing to drop the const on the TransferStep.
-  mlir::ktdf::DataTransferOp dt = ts.transfer;
 
   // Tries to widen the alloc backing `val` if it is a ct_local memref owned
   // by this pipeline. Returns early silently for non-ct_local or foreign
@@ -813,7 +796,7 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     auto alloc =
         mlir::dyn_cast_or_null<mlir::memref::AllocOp>(base.getDefiningOp());
     if (!alloc) {
-      ts.transfer->emitError(
+      dt->emitError(
           "widenAlloc: ct_local operand has no backing AllocOp");
       return;
     }
@@ -826,12 +809,10 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     mlir::MemRefType orig_type = alloc.getType();
     llvm::SmallVector<int64_t> new_shape(orig_type.getShape());
 
-    // Convert offset-from-end to an absolute index into the alloc shape.
-    int64_t alloc_dim = (int64_t)orig_type.getRank() - 1 - pa.align_dim;
-    if (alloc_dim < 0 || alloc_dim >= (int64_t)orig_type.getRank()) {
-      ts.transfer->emitError("widenAlloc: align_dim ")
-          << alloc_dim << " is out of range for alloc rank "
-          << orig_type.getRank();
+    int64_t alloc_dim = (int64_t)orig_type.getRank() - 2;
+    if (alloc_dim < 0) {
+      dt->emitError("widenAlloc: alloc rank ")
+          << orig_type.getRank() << " has no second-to-last dim to widen";
       return;
     }
 
@@ -848,7 +829,7 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
         return;
 
       if (new_shape[0] % alignment_factor != 0) {
-        ts.transfer->emitError("widenAlloc: outermost dimension (")
+        dt->emitError("widenAlloc: outermost dimension (")
             << new_shape[0] << ") is not divisible by alignment factor "
             << alignment_factor;
         return;
@@ -859,7 +840,7 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     int64_t widened_dim = new_shape[alloc_dim] * alignment_factor;
     int64_t innermost_dim = new_shape[(int64_t)orig_type.getRank() - 1];
     if (innermost_dim > 0 && widened_dim % innermost_dim != 0) {
-      ts.transfer->emitError("widenAlloc: widened dimension (")
+      dt->emitError("widenAlloc: widened dimension (")
           << widened_dim << ") is not a multiple of innermost dimension ("
           << innermost_dim << ")";
       return;
@@ -892,16 +873,11 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
   try_widen(dt.getSource());
 }
 
-/// Reduces sa.innermost_loop upper bound by pa.alignment_factor after verifying
-/// that the loop's total_size operand is divisible by pa.alignment_factor.
-static mlir::LogicalResult adjustLoopBounds(
-    const DataTransferLegality::StageAnalysis& sa,
-    const DataTransferLegality::PipelineAnalysis& pa,
+/// Reduces the upper bound of `loop` by pa.alignment_factor after verifying
+/// that the loop's total_size operand is divisible by it.
+static mlir::LogicalResult adjustLoopBound(
+    mlir::scf::ForOp loop, const DataTransferLegality::PipelineAnalysis& pa,
     mlir::OpBuilder& builder) {
-  if (!sa.innermost_loop) return mlir::success();
-
-  mlir::scf::ForOp loop = sa.innermost_loop;
-
   // The upper bound is normally a ktdf.tiling.derive_size result (produced by
   // StageCoarseningPass). When the IR was not tiled it may instead be a bare
   // arith.constant.
@@ -954,7 +930,7 @@ static mlir::LogicalResult adjustLoopBounds(
            << "; tiling and alignment constraints are inconsistent";
   }
 
-  // Each widened transfer now covers alignment_factor times as much data per
+  // Each widened transfer covers alignment_factor times as much data per
   // iteration, so the loop only needs total_val / alignment_factor iterations.
   int64_t new_ub = total_val / pa.alignment_factor;
   builder.setInsertionPoint(loop);
@@ -969,26 +945,54 @@ static mlir::LogicalResult adjustLoopBounds(
   return mlir::success();
 }
 
-/// Replaces ts.transfer with a new DataTransferOp with pa.align_dim widened
+/// Adjusts every stage loop recorded on `pa` exactly once.
+static mlir::LogicalResult adjustLoopBounds(
+    const DataTransferLegality::PipelineAnalysis& pa,
+    mlir::OpBuilder& builder) {
+  for (mlir::scf::ForOp loop : pa.enclosing_loops)
+    if (mlir::failed(adjustLoopBound(loop, pa, builder)))
+      return mlir::failure();
+  return mlir::success();
+}
+
+/// Entries of `perm` that index the outer dims (all but the two innermost),
+/// in order; empty if there are no outer dims or they are already identity.
+static llvm::SmallVector<int64_t> outerPermutation(
+    llvm::ArrayRef<int64_t> perm) {
+  int64_t outer_rank = (int64_t)perm.size() - 2;
+  if (outer_rank <= 0) return {};
+  llvm::SmallVector<int64_t> outer;
+  for (int64_t dim : perm)
+    if (dim < outer_rank) outer.push_back(dim);
+  bool is_identity = llvm::all_of(llvm::enumerate(outer), [](auto p) {
+    return p.value() == static_cast<int64_t>(p.index());
+  });
+  if (is_identity) return {};
+  return outer;
+}
+
+/// Replaces `op` with a new DataTransferOp with the second-to-last dim
+/// widened by pa.alignment_factor.
 /// Any explicit StridedLayoutAttr on a global (non-ct_local) memref operand
 /// is stripped via a memref.cast to identity layout — the strided layout was
 /// used by the analysis to detect illegality but must not appear on the
 /// rewritten transfer.
 static void rewriteTransferShape(
-    const DataTransferLegality::TransferStep& ts,
+    mlir::ktdf::DataTransferOp op,
     const DataTransferLegality::PipelineAnalysis& pa,
     const scheduler::arch_view::MemoryTree& memory_tree,
     mlir::OpBuilder& builder) {
-  mlir::ktdf::DataTransferOp op = ts.transfer;
   mlir::MLIRContext* ctx = op->getContext();
 
-  // Convert offset-from-end to absolute indices for src and dst size vectors.
+  auto outer_perm = outerPermutation(pa.permutation);
+
+  // The widened dim is the second-to-last of each operand.
   auto new_src_sizes = op.getMixedSourceSizes();
   auto new_dst_sizes = op.getMixedDestSizes();
   int64_t src_rank = (int64_t)new_src_sizes.size();
   int64_t dst_rank = (int64_t)new_dst_sizes.size();
-  int64_t src_dim = src_rank - 1 - pa.align_dim;
-  int64_t dst_dim = dst_rank - 1 - pa.align_dim;
+  int64_t src_dim = src_rank - 2;
+  int64_t dst_dim = dst_rank - 2;
 
   auto get_scaled = [&](mlir::OpFoldResult ofr) -> mlir::OpFoldResult {
     int64_t existing =
@@ -1012,16 +1016,13 @@ static void rewriteTransferShape(
   auto new_src_indices = llvm::SmallVector<mlir::Value>(op.getSourceIndices());
   auto new_dst_indices = llvm::SmallVector<mlir::Value>(op.getDestIndices());
 
-  // Apply outer dimension permutation to source transfer indices if present on a global memref.
-  if (!pa.outer_permutation.empty() && op.isSourceMemRef() &&
-      !isPerCoreScratchpad(op.getSource(), memory_tree)) {
-    int64_t outer_rank = (int64_t)pa.outer_permutation.size();
-    auto orig_src_indices = op.getSourceIndices();
-    if (new_src_indices.size() >= static_cast<size_t>(outer_rank)) {
-      for (int64_t i = 0; i < outer_rank; ++i) {
-        new_src_indices[i] = orig_src_indices[pa.outer_permutation[i]];
-      }
-    }
+  // Permute the outer source indices when the source is a global memref.
+  if (!outer_perm.empty() && op.isSourceMemRef() &&
+      !isPerCoreScratchpad(op.getSource(), memory_tree) &&
+      new_src_indices.size() >= outer_perm.size()) {
+    llvm::SmallVector<mlir::Value> orig_indices(new_src_indices);
+    auto permuted = applyPermutation<mlir::Value>(outer_perm, orig_indices);
+    llvm::copy(permuted, new_src_indices.begin());
   }
 
   // Fix non-row-major strides on any global memref operand by
@@ -1064,7 +1065,7 @@ static void rewriteTransferShape(
 
     auto orig_strides = construct.getStaticStrides();
     bool needs_permute = false;
-    if (rank > 2 && !pa.outer_permutation.empty() && orig_strides.size() >= 2) {
+    if (rank > 2 && !outer_perm.empty() && orig_strides.size() >= 2) {
       for (size_t i = 0; i + 1 < orig_strides.size() - 2; ++i) {
         if (orig_strides[i] < orig_strides[i + 1]) {
           needs_permute = true;
@@ -1075,10 +1076,8 @@ static void rewriteTransferShape(
 
     llvm::SmallVector<int64_t> new_shape(shape.begin(), shape.end());
     if (needs_permute) {
-      int64_t outer_rank = (int64_t)pa.outer_permutation.size();
-      for (int64_t i = 0; i < outer_rank; ++i) {
-        new_shape[i] = shape[pa.outer_permutation[i]];
-      }
+      auto permuted = applyPermutation<int64_t>(outer_perm, shape);
+      llvm::copy(permuted, new_shape.begin());
     }
     llvm::SmallVector<int64_t> row_major(rank, 1);
     for (int64_t i = rank - 2; i >= 0; --i)
@@ -1152,22 +1151,21 @@ static void rewriteTransferShape(
   for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
     new_op->setDiscardableAttr(attr.getName(), attr.getValue());
 
-  LDBG(1) << "  rewriteTransferShape: scaled dim " << pa.align_dim
-          << " by factor " << pa.alignment_factor << ": " << new_op;
+  LDBG(1) << "  rewriteTransferShape: scaled second-to-last dim by factor "
+          << pa.alignment_factor << ": " << new_op;
   op.erase();
 }
 
-/// Replaces ts.transfer with a new DataTransferOp sized [1,1,1,1] with
+/// Replaces `op` with a new DataTransferOp sized [1,1,1,1] with
 /// transfer_mode set to `mode` ("splat") or empty for FIFO→memref.
 /// The two innermost indices on any ct_local memref operand are replaced with
 /// the row and column IVs from the nested scf.for loops inserted by
 /// insertLoopAroundPipeline, giving direct [0, 0, %row, %col] addressing.
 static void rewriteTransferShrink(
-    const DataTransferLegality::TransferStep& ts,
+    mlir::ktdf::DataTransferOp op,
     const DataTransferLegality::PipelineAnalysis& pa,
     const scheduler::arch_view::MemoryTree& memory_tree, llvm::StringRef mode,
     mlir::OpBuilder& builder) {
-  mlir::ktdf::DataTransferOp op = ts.transfer;
   mlir::MLIRContext* ctx = op->getContext();
 
   mlir::OpFoldResult one = mlir::IntegerAttr::get(mlir::IndexType::get(ctx), 1);
@@ -1284,8 +1282,8 @@ static void rewriteTransferShrink(
     new_op->setDiscardableAttr(mlir::StringAttr::get(ctx, "transfer_mode"),
                                mlir::StringAttr::get(ctx, mode));
 
-  LDBG(1) << "  rewriteTransferShrink(" << mode << "): shrunk dim "
-          << pa.align_dim << " to 1: " << new_op;
+  LDBG(1) << "  rewriteTransferShrink(" << mode
+          << "): alignment_factor=" << pa.alignment_factor << ": " << new_op;
   op.erase();
 }
 
@@ -1324,48 +1322,50 @@ static void insertLoopAroundPipeline(
           << bound << ") around nested pipeline at " << loc;
 }
 
-/// Applies corrective rewrites to the PipelineAnalysis tree: inserts a loop
-/// around nested pipelines, then for each leaf stage adjusts the loop bound
-/// and rewrites every transfer shape (illegal/displaced → widen; FIFO →
-/// splat shrink).
+/// Applies corrective rewrites to the PipelineAnalysis tree: adjusts the
+/// stage loop bounds once, inserts loops around nested pipelines, then for
+/// each leaf stage rewrites every transfer (factor > 1 → widen; otherwise
+/// FIFO transfers shrink to scalar splat / extract).
 static mlir::LogicalResult fixPipeline(
     DataTransferLegality::PipelineAnalysis& pa,
+    DataTransferLegality& legality,
+    const mlir::ktdf_arch::ResourceKinds& resource_kinds,
     const scheduler::arch_view::MemoryTree& memory_tree,
     mlir::OpBuilder& builder) {
   LDBG(1) << "  fixPipeline: pipeline at " << pa.pipeline.getLoc()
           << " alignment_factor=" << pa.alignment_factor
           << " stride_elems=" << pa.stride_elems;
 
-  for (DataTransferLegality::StageAnalysis& sa : pa.stages) {
-    // For a nested pipeline this collapses the enclosing tile loop to ub=1 so
-    // the only column iteration is the element loop inserted below.
-    if (mlir::failed(adjustLoopBounds(sa, pa, builder))) return mlir::failure();
+  if (mlir::failed(adjustLoopBounds(pa, builder))) return mlir::failure();
 
+  for (DataTransferLegality::StageAnalysis& sa : pa.stages) {
     if (sa.nested_pipeline) {
       insertLoopAroundPipeline(sa.nested_pipeline.get(), pa.stride_elems,
                                builder);
-      if (mlir::failed(fixPipeline(*sa.nested_pipeline, memory_tree, builder)))
+      if (mlir::failed(fixPipeline(*sa.nested_pipeline, legality,
+                                   resource_kinds, memory_tree, builder)))
         return mlir::failure();
       continue;
     }
 
-    for (DataTransferLegality::TransferStep& ts : sa.transfers) {
-      if (pa.alignment_kind == DataTransferLegality::AlignmentKind::Widen) {
-        // Outer pipeline: widen staging allocs and bulk transfer shapes
-        if (ts.is_illegal || ts.is_displaced) {
-          widenAlloc(ts, pa, memory_tree, builder);
-          rewriteTransferShape(ts, pa, memory_tree, builder);
-        }
-      } else {
-        // Nested / inner pipeline: shrink transfers to scalar access with IV
-        // indexing
-        if (ts.needs_splat) {
-          rewriteTransferShrink(ts, pa, memory_tree, "splat", builder);
-        } else if (ts.needs_extract) {
-          rewriteTransferShrink(ts, pa, memory_tree, "extract", builder);
-        } else if (ts.transfer.isSourceFifo() && ts.transfer.isDestMemRef()) {
-          rewriteTransferShrink(ts, pa, memory_tree, "", builder);
-        }
+    for (mlir::ktdf::DataTransferOp dt : sa.transfers) {
+      // Outer pipeline: the alignment factor is a pipeline invariant, so every
+      // transfer widens with the shared staging buffers.
+      if (pa.alignment_factor > 1) {
+        widenAlloc(dt, pa, memory_tree, builder);
+        rewriteTransferShape(dt, pa, memory_tree, builder);
+        continue;
+      }
+
+      // Nested / inner pipeline: shrink FIFO transfers to scalar access with
+      // IV indexing.
+      if (dt.isSourceMemRef() && dt.isDestFifo()) {
+        if (legality.canSplat(dt, resource_kinds))
+          rewriteTransferShrink(dt, pa, memory_tree, "splat", builder);
+      } else if (dt.isSourceFifo() && dt.isDestMemRef()) {
+        llvm::StringRef mode =
+            legality.canExtract(dt, resource_kinds) ? "extract" : "";
+        rewriteTransferShrink(dt, pa, memory_tree, mode, builder);
       }
     }
   }
@@ -1406,7 +1406,8 @@ struct DataTransferAlignmentPass
       LDBG(1) << pa;
       if (pa.alignment_factor == 0)
         continue;  // nothing to fix for this pipeline
-      if (mlir::failed(fixPipeline(pa, memory_tree, builder))) {
+      if (mlir::failed(fixPipeline(pa, legality_, resource_kinds, memory_tree,
+                                   builder))) {
         signalPassFailure();
         return;
       }
