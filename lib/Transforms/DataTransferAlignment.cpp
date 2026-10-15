@@ -880,17 +880,17 @@ static mlir::LogicalResult adjustLoopBounds(
   return mlir::success();
 }
 
-/// Entries of `perm` that index the outer dims (all but the two innermost),
-/// in order; empty if there are no outer dims or they are already identity.
-static llvm::SmallVector<int64_t> outerPermutation(
-    llvm::ArrayRef<int64_t> perm) {
-  int64_t outer_rank = (int64_t)perm.size() - 2;
-  if (outer_rank <= 0) return {};
-  llvm::SmallVector<int64_t> outer;
-  for (int64_t dim : perm)
-    if (dim < outer_rank) outer.push_back(dim);
-  if (isIdentity(outer)) return {};
-  return outer;
+/// `map` with its results reordered so result j is the old result perm[j].
+/// Used to turn logical coordinates into the coordinates of a view whose dims
+/// were permuted into memory order. Unchanged if `perm` is empty or does not
+/// match the result count.
+static mlir::AffineMap permuteMapResults(mlir::AffineMap map,
+                                         llvm::ArrayRef<int64_t> perm) {
+  if (perm.empty() || map.getNumResults() != perm.size()) return map;
+  llvm::SmallVector<mlir::AffineExpr> results;
+  for (int64_t src : perm) results.push_back(map.getResult(src));
+  return mlir::AffineMap::get(map.getNumDims(), map.getNumSymbols(), results,
+                              map.getContext());
 }
 
 /// Mutable operand state of a data_transfer, used to build its replacement.
@@ -950,29 +950,24 @@ static mlir::ktdp::ConstructMemoryViewOp findConstructMemoryView(
   return {};
 }
 
-/// True if any pair of adjacent outer strides (all but the two innermost) is
-/// not descending, i.e. the outer dims are stored permuted.
-static bool hasPermutedOuterStrides(llvm::ArrayRef<int64_t> strides) {
-  for (size_t i = 0; i + 3 < strides.size(); ++i)
-    if (strides[i] < strides[i + 1]) return true;
-  return false;
-}
-
-/// Shape of `construct` with its outer dims permuted by `outer_perm` when the
-/// outer strides show they are stored permuted.
+/// Physical shape of `construct`: its shape with all dims (inner ones too)
+/// permuted into descending-stride order, as laid out in memory. Unchanged if
+/// the strides are already descending.
 static llvm::SmallVector<int64_t> viewShape(
-    mlir::ktdp::ConstructMemoryViewOp construct,
-    llvm::ArrayRef<int64_t> outer_perm) {
+    mlir::ktdp::ConstructMemoryViewOp construct) {
   auto shape =
       mlir::cast<mlir::MemRefType>(construct.getResult().getType()).getShape();
-  llvm::SmallVector<int64_t> new_shape(shape.begin(), shape.end());
   auto strides = construct.getStaticStrides();
-  if (shape.size() > 2 && !outer_perm.empty() && strides.size() >= 2 &&
-      hasPermutedOuterStrides(strides)) {
-    auto permuted = applyPermutation<int64_t>(outer_perm, shape);
-    llvm::copy(permuted, new_shape.begin());
-  }
-  return new_shape;
+  if (strides.size() != shape.size() ||
+      llvm::any_of(strides, mlir::ShapedType::isDynamic))
+    return llvm::SmallVector<int64_t>(shape.begin(), shape.end());
+
+  llvm::SmallVector<int64_t> perm(strides.size());
+  std::iota(perm.begin(), perm.end(), 0);
+  std::stable_sort(perm.begin(), perm.end(), [&](int64_t a, int64_t b) {
+    return strides[a] > strides[b];
+  });
+  return applyPermutation<int64_t>(perm, shape);
 }
 
 static llvm::SmallVector<int64_t> rowMajorStrides(
@@ -1010,8 +1005,7 @@ static void propagateLayout(mlir::ktdp::ConstructMemoryViewOp construct) {
 /// natural row-major strides in place. The strided layout was only used by the
 /// analysis to detect illegality; it must not survive the rewrite.
 static void rewriteConstructStrides(
-    mlir::Value val, llvm::ArrayRef<int64_t> outer_perm,
-    const scheduler::arch_view::MemoryTree& memory_tree) {
+    mlir::Value val, const scheduler::arch_view::MemoryTree& memory_tree) {
   auto mrt = mlir::dyn_cast<mlir::MemRefType>(val.getType());
   if (!mrt || isPerCoreScratchpad(val, memory_tree) ||
       !mlir::isa<mlir::StridedLayoutAttr>(mrt.getLayout()))
@@ -1022,7 +1016,7 @@ static void rewriteConstructStrides(
   mlir::MLIRContext* ctx = construct->getContext();
   auto orig_type =
       mlir::cast<mlir::MemRefType>(construct.getResult().getType());
-  auto new_shape = viewShape(construct, outer_perm);
+  auto new_shape = viewShape(construct);
   auto row_major = rowMajorStrides(new_shape);
 
   LDBG(1) << "  rewriteConstructStrides: rewriting strides on "
@@ -1047,7 +1041,6 @@ static void rewriteTransferShape(
     const scheduler::arch_view::MemoryTree& memory_tree,
     mlir::OpBuilder& builder) {
   mlir::MLIRContext* ctx = op->getContext();
-  auto outer_perm = outerPermutation(pa.permutation);
 
   TransferOperands t(op);
 
@@ -1068,16 +1061,15 @@ static void rewriteTransferShape(
   scaleDim(t.src_sizes, src_wdim, pa.alignment_factor, ctx);
   scaleDim(t.dst_sizes, dst_wdim, pa.alignment_factor, ctx);
 
-  // Permute the outer source indices when the source is a global memref.
-  if (!outer_perm.empty() && src_is_global &&
-      t.src_indices.size() >= outer_perm.size()) {
-    llvm::SmallVector<mlir::Value> orig_indices(t.src_indices);
-    auto permuted = applyPermutation<mlir::Value>(outer_perm, orig_indices);
-    llvm::copy(permuted, t.src_indices.begin());
-  }
+  // A strided global source view is rewritten to memory order (see
+  // rewriteConstructStrides), so its coordinates must be permuted the same way.
+  if (src_strided)
+    t.src_map = permuteMapResults(
+        t.src_map, derivePermutation(mlir::cast<mlir::MemRefType>(
+                       op.getSource().getType())));
 
-  rewriteConstructStrides(op.getSource(), outer_perm, memory_tree);
-  rewriteConstructStrides(op.getDestination(), outer_perm, memory_tree);
+  rewriteConstructStrides(op.getSource(), memory_tree);
+  rewriteConstructStrides(op.getDestination(), memory_tree);
 
   auto new_op = replaceTransfer(op, t, builder);
   LDBG(1) << "  rewriteTransferShape: widened src dim " << src_wdim
