@@ -756,10 +756,22 @@ static void widenAlloc(mlir::ktdf::DataTransferOp dt,
     if (mlir::failed(new_shape)) return;
 
     builder.setInsertionPoint(alloc);
-    if (has_dynamic_sizes)
-      new_dynamic_sizes.back() =
+    if (has_dynamic_sizes) {
+      // Quick fix: the dim to collapse is the one whose tile was pinned to
+      // alignment_factor by fixReserveSize (a constant of that value), not
+      // necessarily the last one. Fall back to the last dynamic size.
+      size_t collapse_idx = new_dynamic_sizes.size() - 1;
+      for (size_t i = new_dynamic_sizes.size(); i-- > 0;) {
+        auto cst = new_dynamic_sizes[i].getDefiningOp<mlir::arith::ConstantIndexOp>();
+        if (cst && cst.value() == pa.alignment_factor) {
+          collapse_idx = i;
+          break;
+        }
+      }
+      new_dynamic_sizes[collapse_idx] =
           mlir::arith::ConstantIndexOp::create(builder, alloc.getLoc(), 1)
               .getResult();
+    }
 
     // Use the default identity layout - the affine maps on the data_transfer
     // ops encode all access patterns.
