@@ -58,6 +58,15 @@ static llvm::cl::opt<bool> DisableThisPass(
     llvm::cl::desc("Disable Parallelize Loops Across Instances pass"),
     llvm::cl::init(false));
 
+// Temporary workaround: treat every group as a single instance so no
+// ktdf.parallel is created. Flip the default to true to make this permanent
+// until the splitter checks tile-size feasibility (dynamic trip counts can end
+// up not divisible by num_instances, which fails in ParallelLowering).
+static llvm::cl::opt<bool> SingleInstance(
+    PASS_NAME "-single-instance",
+    llvm::cl::desc("Do not split loops across instances"),
+    llvm::cl::init(false));
+
 namespace scheduler {
 #define GEN_PASS_DEF_PARALLELIZELOOPSACROSSINSTANCESPASS
 #include "dataflow-scheduler/Transforms/Passes.h.inc"
@@ -244,7 +253,7 @@ std::optional<Candidate> findCandidate(
           << enclosing_group->getLoc();
   auto applicable_groups = getEquivalenceClass(enclosing_group);
   const auto num_instances = applicable_groups.size();
-  if (num_instances < 2) {
+  if (SingleInstance || num_instances < 2) {
     return std::nullopt;
   }
   LDBG(1) << " pipeline at " << pipeline->getLoc() << " has " << num_instances
