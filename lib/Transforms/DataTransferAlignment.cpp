@@ -239,8 +239,6 @@ class DataTransferLegality {
     // Now that innermost_size is known, pick the correct loop per stage.
     fixupStageLoops(pa);
 
-    if (mlir::failed(validateFifoTransfers(pa, resource_kinds))) return pa;
-
     // Nested pipelines see the outer non-contiguous stride and permutation.
     for (auto& sa : pa.stages) {
       if (!sa.nested_pipeline) continue;
@@ -565,35 +563,6 @@ class DataTransferLegality {
       return std::nullopt;
 
     return is_illegal;
-  }
-
-  /// Reports FIFO transfers whose unit cannot splat / extract. Read-only.
-  /// Returns failure() if any diagnostic was emitted so the caller can
-  /// propagate pass failure.
-  mlir::LogicalResult validateFifoTransfers(
-      const PipelineAnalysis& pa,
-      const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
-    mlir::LogicalResult result = mlir::success();
-    for (const auto& sa : pa.stages) {
-      for (mlir::ktdf::DataTransferOp dt : sa.transfers) {
-        if (dt.isSourceMemRef() && dt.isDestFifo() &&
-            !canSplat(dt, resource_kinds)) {
-          dt->emitError(
-              PASS_NAME
-              ": memref→FIFO transfer requires splat but the enclosing "
-              "unit does not declare ktdf_arch.feature.simd { splat }");
-          result = mlir::failure();
-        } else if (dt.isSourceFifo() && dt.isDestMemRef() &&
-                   !canExtract(dt, resource_kinds)) {
-          dt->emitError(PASS_NAME
-                        ": FIFO→memref transfer requires (extract) store "
-                        "but the enclosing unit does not declare a sub-element "
-                        "access_granularity entry for ct_local");
-          result = mlir::failure();
-        }
-      }
-    }
-    return result;
   }
 
   /// Returns all scf.for ops inside `stage` that do not lie inside a nested
