@@ -551,33 +551,28 @@ class DataTransferLegality {
 
   /// Returns all scf.for ops inside `stage` that do not lie inside a nested
   /// ktdf.pipeline, in walk order.
-  static llvm::SmallVector<mlir::scf::ForOp> collectStageLoops(
-      mlir::ktdf::StageOp stage) {
-    llvm::SmallVector<mlir::scf::ForOp> loops;
+  /// Returns the loop inside `stage` (excluding nested pipelines) whose
+  /// total_size equals `target_size`, or the last such loop as a fallback.
+  static mlir::scf::ForOp pickStageLoop(mlir::ktdf::StageOp stage,
+                                        int64_t target_size) {
+    mlir::scf::ForOp last, match;
     stage->walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation* op) {
-      // Don't descend into a nested pipeline (but do visit the stage itself).
       if (mlir::isa<mlir::ktdf::PipelineOp>(op) && op != stage.getOperation())
         return mlir::WalkResult::skip();
-      if (auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(op))
-        loops.push_back(for_op);
-      return mlir::WalkResult::advance();
-    });
-    return loops;
-  }
-
-  /// Returns the loop from `loops` whose total_size equals `target_size`,
-  /// or the last loop as a fallback.
-  static mlir::scf::ForOp pickLoopByTotalSize(
-      llvm::ArrayRef<mlir::scf::ForOp> loops, int64_t target_size) {
-    if (loops.empty()) return {};
-    for (mlir::scf::ForOp loop : loops) {
-      mlir::Value bound = loop.getUpperBound();
+      auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(op);
+      if (!for_op) return mlir::WalkResult::advance();
+      last = for_op;
+      mlir::Value bound = for_op.getUpperBound();
       auto derive = bound.getDefiningOp<mlir::ktdf::TilingDeriveSizeOp>();
       auto cst = (derive ? derive.getTotalSize() : bound)
                      .getDefiningOp<mlir::arith::ConstantIndexOp>();
-      if (cst && cst.value() == target_size) return loop;
-    }
-    return loops.back();
+      if (cst && cst.value() == target_size) {
+        match = for_op;
+        return mlir::WalkResult::interrupt();
+      }
+      return mlir::WalkResult::advance();
+    });
+    return match ? match : last;
   }
 
   /// Analyses a single stage. If it contains a nested ktdf.pipeline, stores a
@@ -625,8 +620,7 @@ class DataTransferLegality {
   static void fixupStageLoops(PipelineAnalysis& pa) {
     for (StageAnalysis& sa : pa.stages) {
       if (sa.nested_pipeline) continue;
-      auto loops = collectStageLoops(sa.stage);
-      sa.innermost_loop = pickLoopByTotalSize(loops, pa.innermost_size);
+      sa.innermost_loop = pickStageLoop(sa.stage, pa.innermost_size);
     }
   }
 };
