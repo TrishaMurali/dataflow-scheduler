@@ -75,24 +75,10 @@ static llvm::SmallVector<int64_t> invertPermutation(
   return inverse;
 }
 
-/// Size of the contiguous (unit-stride) dim of `memref`; failure if there is
-/// none or its size is dynamic. Size-1 dims are skipped: their stride is
-/// arbitrary.
-static mlir::FailureOr<int64_t> contiguousDimSize(mlir::MemRefType memref) {
-  llvm::SmallVector<int64_t> strides;
-  int64_t offset;
-  if (mlir::failed(memref.getStridesAndOffset(strides, offset)))
-    return mlir::failure();
-  for (auto [stride, size] : llvm::zip(strides, memref.getShape()))
-    if (stride == 1 && size != 1 && !mlir::ShapedType::isDynamic(size))
-      return size;
-  return mlir::failure();
-}
-
-/// Index of the contiguous (unit-stride) dim of `memref`; failure if there is
-/// none or its size is dynamic. Size-1 dims are skipped: their stride is
-/// arbitrary.
-static mlir::FailureOr<int64_t> contiguousDimIndex(mlir::MemRefType memref) {
+/// Index and size of the contiguous (unit-stride) dim of `memref`; failure if
+/// there is none or its size is dynamic. Size-1 dims are skipped
+static mlir::FailureOr<std::pair<int64_t, int64_t>> contiguousDim(
+    mlir::MemRefType memref) {
   llvm::SmallVector<int64_t> strides;
   int64_t offset;
   if (mlir::failed(memref.getStridesAndOffset(strides, offset)))
@@ -100,7 +86,7 @@ static mlir::FailureOr<int64_t> contiguousDimIndex(mlir::MemRefType memref) {
   for (auto [idx, p] : llvm::enumerate(llvm::zip(strides, memref.getShape()))) {
     auto [stride, size] = p;
     if (stride == 1 && size != 1 && !mlir::ShapedType::isDynamic(size))
-      return static_cast<int64_t>(idx);
+      return std::pair{static_cast<int64_t>(idx), size};
   }
   return mlir::failure();
 }
@@ -327,18 +313,16 @@ class DataTransferLegality {
     // Widen: the size of the memref's contiguous dim is the block to cover;
     // each iteration covers elems_per_iter, so the factor is
     // innermost_size / elems_per_iter.
-    auto contiguous_size = contiguousDimSize(strided_memref);
-    if (mlir::failed(contiguous_size)) return;
-    int64_t innermost_size = *contiguous_size;
+    auto cdim = contiguousDim(strided_memref);
+    if (mlir::failed(cdim)) return;
+    auto [c_idx, innermost_size] = *cdim;
 
     // Elements covered per iteration = transfer size at the contiguous dim.
     int64_t elems_per_iter = 1;
     auto sizes = use_dest ? dt.getStaticDestSizesArray()
                           : dt.getStaticSourceSizesArray();
-    auto c_idx = contiguousDimIndex(strided_memref);
-    if (sizes && !mlir::failed(c_idx) &&
-        static_cast<size_t>(*c_idx) < sizes->size())
-      elems_per_iter = std::max<int64_t>(1, (*sizes)[*c_idx]);
+    if (sizes && static_cast<size_t>(c_idx) < sizes->size())
+      elems_per_iter = std::max<int64_t>(1, (*sizes)[c_idx]);
 
     pa.innermost_size = innermost_size;
     pa.alignment_factor = innermost_size / elems_per_iter;
