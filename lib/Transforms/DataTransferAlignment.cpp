@@ -177,6 +177,8 @@ class DataTransferLegality {
     int64_t alignment_factor =
         0;  // factor to multiply the data transfer size by on the widened dim
     int64_t innermost_size = 0;  // size of the contiguous dim, in elements
+    mlir::Value contiguous_tile;  // tile size of the loop that indexes the
+                                  // contiguous dim; null when unknown
     llvm::SmallVector<int64_t> permutation;  // stride-derived index permutation
     llvm::SmallVector<int64_t>
         inv_permutation;                      // cached inverse of permutation
@@ -325,11 +327,34 @@ class DataTransferLegality {
       elems_per_iter = std::max<int64_t>(1, (*sizes)[c_idx]);
 
     pa.innermost_size = innermost_size;
+    pa.contiguous_tile = tileSizeOfDim(dt, use_dest, c_idx);
     pa.alignment_factor = innermost_size / elems_per_iter;
 
     pa.permutation = inherited_permutation.empty()
                          ? derivePipelinePermutation(pa, dt)
                          : llvm::to_vector(inherited_permutation);
+  }
+
+  /// Tile size of the tiled loop that indexes dim `dim` of the source (or
+  /// destination if `use_dest`) of `dt`, read from the linearize_index feeding
+  /// that dim. Null if the dim is not indexed by a tiled loop.
+  static mlir::Value tileSizeOfDim(mlir::ktdf::DataTransferOp dt,
+                                   bool use_dest, int64_t dim) {
+    mlir::AffineMap map = use_dest ? dt.getDestMapAttr().getValue()
+                                   : dt.getSourceMapAttr().getValue();
+    auto indices = use_dest ? dt.getDestIndices() : dt.getSourceIndices();
+    if (dim < 0 || static_cast<unsigned>(dim) >= map.getNumResults())
+      return {};
+    mlir::AffineExpr expr = map.getResult(dim);
+    for (unsigned d = 0; d < map.getNumDims() && d < indices.size(); ++d) {
+      if (!expr.isFunctionOfDim(d)) continue;
+      auto lin =
+          indices[d].getDefiningOp<mlir::ktdf::TilingLinearizeIndexOp>();
+      if (!lin || lin.getStrides().size() < 2) continue;
+      // Strides are outermost-first and end with the point loop's 1.
+      return lin.getStrides()[lin.getStrides().size() - 2];
+    }
+    return {};
   }
 
   /// Picks the memref operand carrying the stride: the source unless it is
@@ -549,30 +574,67 @@ class DataTransferLegality {
     return is_illegal;
   }
 
-  /// Returns all scf.for ops inside `stage` that do not lie inside a nested
-  /// ktdf.pipeline, in walk order.
-  /// Returns the loop inside `stage` (excluding nested pipelines) whose
-  /// total_size equals `target_size`, or the last such loop as a fallback.
+  /// Returns the total_size of `loop` as a positive constant, or 0 if not
+  /// statically known.
+  static int64_t loopTotalSize(mlir::scf::ForOp loop) {
+    mlir::Value bound = loop.getUpperBound();
+    auto derive = bound.getDefiningOp<mlir::ktdf::TilingDeriveSizeOp>();
+    auto cst = (derive ? derive.getTotalSize() : bound)
+                   .getDefiningOp<mlir::arith::ConstantIndexOp>();
+    return cst ? cst.value() : 0;
+  }
+
+  /// True if `loop` is the one to shrink: its derive_size uses `tile` as its
+  /// innermost tile size when `tile` is known (several loops can share a
+  /// total_size, only this one walks the contiguous dim), else its total_size
+  /// equals `target_size`.
+  static bool isTargetLoop(mlir::scf::ForOp loop, int64_t target_size,
+                           mlir::Value tile) {
+    if (tile) {
+      auto derive =
+          loop.getUpperBound().getDefiningOp<mlir::ktdf::TilingDeriveSizeOp>();
+      return derive && !derive.getTileSizes().empty() &&
+             derive.getTileSizes().back() == tile;
+    }
+    int64_t sz = loopTotalSize(loop);
+    return sz > 0 && sz == target_size;
+  }
+
+  /// Returns the loop inside `stage` (excluding nested pipelines) that
+  /// isTargetLoop selects. If none is found inside the stage, walks up the
+  /// parent chain from the enclosing pipeline looking for an outer scf.for
+  /// that matches. Returns null if no match exists anywhere. Returns null
+  /// immediately when `target_size` is 0.
   static mlir::scf::ForOp pickStageLoop(mlir::ktdf::StageOp stage,
-                                        int64_t target_size) {
-    mlir::scf::ForOp last, match;
+                                        int64_t target_size,
+                                        mlir::Value tile) {
+    if (target_size <= 0) return {};
+
+    // Search inside the stage first (excluding nested pipelines).
+    mlir::scf::ForOp match;
     stage->walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation* op) {
       if (mlir::isa<mlir::ktdf::PipelineOp>(op) && op != stage.getOperation())
         return mlir::WalkResult::skip();
       auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(op);
       if (!for_op) return mlir::WalkResult::advance();
-      last = for_op;
-      mlir::Value bound = for_op.getUpperBound();
-      auto derive = bound.getDefiningOp<mlir::ktdf::TilingDeriveSizeOp>();
-      auto cst = (derive ? derive.getTotalSize() : bound)
-                     .getDefiningOp<mlir::arith::ConstantIndexOp>();
-      if (cst && cst.value() == target_size) {
+      if (isTargetLoop(for_op, target_size, tile)) {
         match = for_op;
         return mlir::WalkResult::interrupt();
       }
       return mlir::WalkResult::advance();
     });
-    return match ? match : last;
+    if (match) return match;
+
+    // Not found inside the stage: walk up from the enclosing pipeline.
+    mlir::Operation* cursor = stage->getParentOp();  // ktdf.pipeline
+    if (cursor) cursor = cursor->getParentOp();       // first outer op
+    while (cursor) {
+      if (auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(cursor)) {
+        if (isTargetLoop(for_op, target_size, tile)) return for_op;
+      }
+      cursor = cursor->getParentOp();
+    }
+    return {};
   }
 
   /// Analyses a single stage. If it contains a nested ktdf.pipeline, stores a
@@ -620,7 +682,8 @@ class DataTransferLegality {
   static void fixupStageLoops(PipelineAnalysis& pa) {
     for (StageAnalysis& sa : pa.stages) {
       if (sa.nested_pipeline) continue;
-      sa.innermost_loop = pickStageLoop(sa.stage, pa.innermost_size);
+      sa.innermost_loop =
+          pickStageLoop(sa.stage, pa.innermost_size, pa.contiguous_tile);
     }
   }
 };
@@ -717,21 +780,20 @@ static void widenAlloc(mlir::ktdf::DataTransferOp dt,
 
     builder.setInsertionPoint(alloc);
     if (has_dynamic_sizes) {
-      // Quick fix: the dim to collapse is the one whose tile was pinned to
-      // alignment_factor by fixReserveSize (a constant of that value), not
-      // necessarily the last one. Fall back to the last dynamic size.
-      size_t collapse_idx = new_dynamic_sizes.size() - 1;
+      // The dim to collapse is the one whose tile was pinned to
+      // alignment_factor by fixReserveSize (a constant of that value). If the
+      // pinned loop lives outside the pipeline its tile is not an alloc size,
+      // and no dynamic size may be collapsed.
       for (size_t i = new_dynamic_sizes.size(); i-- > 0;) {
         auto cst =
             new_dynamic_sizes[i].getDefiningOp<mlir::arith::ConstantIndexOp>();
         if (cst && cst.value() == pa.alignment_factor) {
-          collapse_idx = i;
+          new_dynamic_sizes[i] =
+              mlir::arith::ConstantIndexOp::create(builder, alloc.getLoc(), 1)
+                  .getResult();
           break;
         }
       }
-      new_dynamic_sizes[collapse_idx] =
-          mlir::arith::ConstantIndexOp::create(builder, alloc.getLoc(), 1)
-              .getResult();
     }
 
     // Use the default identity layout - the affine maps on the data_transfer
@@ -831,12 +893,17 @@ static mlir::LogicalResult adjustLoopBound(
 }
 
 /// Adjusts every stage's innermost loop recorded on `pa` exactly once.
+/// Multiple stages may share the same outer loop (when it lives outside the
+/// pipeline); deduplicate so it is adjusted only on the first encounter.
 static mlir::LogicalResult adjustLoopBounds(
     const DataTransferLegality::PipelineAnalysis& pa,
     mlir::OpBuilder& builder) {
+  llvm::DenseSet<mlir::Operation*> seen;
   for (const DataTransferLegality::StageAnalysis& sa : pa.stages) {
-    if (!sa.innermost_loop) continue;
-    if (mlir::failed(adjustLoopBound(sa.innermost_loop, pa, builder)))
+    mlir::scf::ForOp loop = sa.innermost_loop;
+    if (!loop) continue;
+    if (!seen.insert(loop.getOperation()).second) continue;
+    if (mlir::failed(adjustLoopBound(loop, pa, builder)))
       return mlir::failure();
   }
   return mlir::success();
