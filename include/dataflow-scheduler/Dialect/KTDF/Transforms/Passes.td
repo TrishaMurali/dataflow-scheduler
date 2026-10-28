@@ -72,6 +72,43 @@ def StageCoarseningPass : Pass<"stage-coarsening", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::ktdf::KTDFDialect"];
 }
 
+def SimplifyPipelinePass : Pass<"simplify-pipeline", "mlir::func::FuncOp"> {
+  let summary = "Simplifies `ktdf.pipeline` operations";
+  let description = [{
+    Rewrites `ktdf.pipeline` operations and their stages into a simpler,
+    canonical form. In particular:
+
+    - Moves the `ktdf.private` op to the top of the pipeline.
+
+    - Orders stages in front of their consumers.
+
+      Stages are reordered such that every stage precedes the stages that
+      await its tokens. Stages that form a dependency cycle keep their relative
+      order, and stages that are already in front of their consumers are not
+      moved.
+
+    - Normalizes the dependency tokens.
+
+      Tokens repeated in the inputs or outputs of a stage are deduplicated, and
+      every stage with consumers outputs exactly one token that no other stage
+      outputs, which its consumers await. The dependency edges are preserved.
+      Tokens used by anything but the stages of the pipeline are left as is.
+
+    - With `reduce-dependencies`, reduces the dependency edges.
+
+      In addition to normalizing the tokens, every edge between two SCCs that
+      is implied by a path through another SCC is erased. Edges over tokens
+      used by anything but the stages of the pipeline are preserved, and don't
+      imply any other edge.
+  }];
+  let options = [
+    Option<"reduceDependencies", "reduce-dependencies", "bool",
+           /*default=*/"false",
+           "Erase dependency edges that are implied by other edges">
+  ];
+  let dependentDialects = ["mlir::ktdf::KTDFDialect"];
+}
+
 def SplitReductionInnerOuterDimPass : Pass<"split-reduction-inner-outer-dim", "mlir::ModuleOp"> {
   let summary = "Split the inner and outer dimensions of a reduction";
   let description = [{

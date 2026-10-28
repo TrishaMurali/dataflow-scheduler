@@ -45,6 +45,7 @@
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/PipelineBuilder.h"
+#include "dataflow-scheduler/Dialect/KTDF/Transforms/SimplifyPipeline.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Mapping.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
@@ -348,6 +349,7 @@ void KTIRPipelinePass::runOnOperation() {
   {
     mlir::RewritePatternSet patterns(&getContext());
     populateConvertToDataTransferPatterns(patterns);
+    mlir::ktdf::populateSimplifyPipelinePatterns(patterns);
     patterns.add<LowerViaMemory, EraseStageMapping>(patterns.getContext(),
                                                     mapping);
 
