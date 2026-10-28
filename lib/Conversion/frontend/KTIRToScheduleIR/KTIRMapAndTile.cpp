@@ -18,8 +18,10 @@
 
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/TypeSwitch.h>
 #include <llvm/Support/DebugLog.h>
 #include <llvm/Support/MathExtras.h>
+#include <mlir/Dialect/Arith/Utils/Utils.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/Linalg/Transforms/Transforms.h>
@@ -318,7 +320,7 @@ auto tile(mlir::RewriterBase& rewriter, mlir::linalg::LinalgOp& op,
   });
 }
 
-void bubbleOpExtractSlice(mlir::RewriterBase& rewriter,
+void bubbleUpExtractSlice(mlir::RewriterBase& rewriter,
                           mlir::tensor::ExtractSliceOp op,
                           const AttrMapping& mem_space_map) {
   while (auto via = op.getSource().getDefiningOp<mlir::ktdf::ViaOp>()) {
@@ -360,13 +362,112 @@ void bubbleOpExtractSlice(mlir::RewriterBase& rewriter,
          !mlir::isConstantIntValue(slice.getMixedSizes()[dim], 1);
 }
 
-struct BroadcastInputs
-    : mlir::OpInterfaceRewritePattern<mlir::linalg::LinalgOp> {
+[[nodiscard]] auto getReassociationIndices(
+    mlir::Operation* op,
+    llvm::SmallVectorImpl<mlir::ReassociationIndices>& groups,
+    bool& is_collapse) -> mlir::LogicalResult {
+  if (auto collapse = llvm::dyn_cast<mlir::tensor::CollapseShapeOp>(op);
+      collapse) {
+    groups = collapse.getReassociationIndices();
+    is_collapse = true;
+    return llvm::success();
+  }
+
+  if (auto expand = llvm::dyn_cast<mlir::tensor::ExpandShapeOp>(op); expand) {
+    groups = expand.getReassociationIndices();
+    is_collapse = false;
+    return llvm::success();
+  }
+
+  return llvm::failure();
+}
+
+/// Bubbles `tensor.extract_slice` up through reshaping operations.
+struct BubbleUpSliceThroughReshape
+    : mlir::OpRewritePattern<mlir::tensor::ExtractSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  auto matchAndRewrite(mlir::tensor::ExtractSliceOp slice,
+                       mlir::PatternRewriter& rewriter) const
+      -> llvm::LogicalResult override {
+    auto* reshape = slice.getSource().getDefiningOp();
+    bool is_collapse;
+    llvm::SmallVector<mlir::ReassociationIndices> groups;
+    // A reshape of static result has a static source, and one without groups
+    // is from or to rank 0, where a sliced dimension has nowhere to go.
+    const auto extents = slice.getSourceType().getShape();
+    if (!reshape ||
+        failed(getReassociationIndices(reshape, groups, is_collapse)) ||
+        groups.empty() || !slice.getSizes().empty() ||
+        !slice.getStrides().empty() ||
+        slice.getResultType().getRank() != slice.getSourceType().getRank() ||
+        !slice.getSourceType().hasStaticShape()) {
+      return rewriter.notifyMatchFailure(slice, "not a slice of a reshape");
+    }
+
+    auto sizes = llvm::to_vector(
+        llvm::cast<mlir::ShapedType>(reshape->getOperand(0).getType())
+            .getShape());
+    llvm::SmallVector<mlir::OpFoldResult> offsets(sizes.size(),
+                                                  rewriter.getIndexAttr(0));
+    llvm::SmallVector<int64_t> strides(sizes.size(), 1);
+    llvm::SmallVector<bool> sliced(sizes.size(), false);
+    for (auto [index, group] : llvm::enumerate(groups)) {
+      const mlir::ReassociationIndices single{static_cast<int64_t>(index)};
+      const auto& target = is_collapse ? group : single;
+      for (auto from : is_collapse ? single : group) {
+        const auto size = slice.getStaticSizes()[from];
+        const auto stride = slice.getStaticStrides()[from];
+        if (size == extents[from] && (stride == 1 || extents[from] == 1)) {
+          continue;
+        }
+        const auto to = llvm::find_if(llvm::reverse(target), [&](int64_t dim) {
+          return !sliced[dim] && sizes[dim] == extents[from];
+        });
+        if (to == target.rend()) {
+          return rewriter.notifyMatchFailure(slice, "unsupported reshape");
+        }
+        std::tie(offsets[*to], sizes[*to], strides[*to]) =
+            std::tuple(slice.getMixedOffsets()[from], size, stride);
+        sliced[*to] = true;
+      }
+    }
+
+    // Slice the source, then reshape with the same op unless it is shared.
+    const auto type = slice.getResultType();
+    if (!reshape->hasOneUse()) {
+      reshape = rewriter.clone(*reshape);
+    }
+    rewriter.modifyOpInPlace(slice, [&]() {
+      const auto [static_offsets, dynamic_offsets] =
+          mlir::decomposeMixedValues(offsets);
+      slice.getSourceMutable().assign(reshape->getOperand(0));
+      slice.getOffsetsMutable().assign(dynamic_offsets);
+      slice.setStaticOffsets(static_offsets);
+      slice.setStaticSizes(sizes);
+      slice.setStaticStrides(strides);
+      slice.getResult().setType(type.clone(sizes));
+    });
+    rewriter.replaceAllUsesWith(slice.getResult(), reshape->getResult(0));
+    rewriter.moveOpAfter(reshape, slice);
+    rewriter.modifyOpInPlace(reshape, [&]() {
+      reshape->setOperand(0, slice.getResult());
+      reshape->getResult(0).setType(type);
+      if (auto expanded =
+              llvm::dyn_cast<mlir::tensor::ExpandShapeOp>(reshape)) {
+        expanded.setStaticOutputShape(type.getShape());
+      }
+    });
+    return llvm::success();
+  }
+};
+
+struct BroadcastInputs : mlir::OpRewritePattern<mlir::linalg::GenericOp> {
   explicit BroadcastInputs(mlir::MLIRContext* context,
                            const AttrMapping& mem_space_map)
-      : OpInterfaceRewritePattern(context), mem_space_map_(mem_space_map) {}
+      : OpRewritePattern(context), mem_space_map_(mem_space_map) {}
 
-  auto matchAndRewrite(mlir::linalg::LinalgOp op,
+  auto matchAndRewrite(mlir::linalg::GenericOp op,
                        mlir::PatternRewriter& rewriter) const
       -> mlir::LogicalResult override {
     const auto throttle_attr =
@@ -381,13 +482,27 @@ struct BroadcastInputs
     rewriter.startOpModification(op);
     auto changed = false;
     for (auto* const input : op.getDpsInputOperands()) {
-      const auto type =
+      auto type =
           llvm::dyn_cast<mlir::RankedTensorType>(input->get().getType());
-      const auto bcast_dims =
-          op.getMatchingIndexingMap(input).getBroadcastDims();
-      if (!type || bcast_dims.empty() ||
-          bcast_dims.back() != type.getRank() - 1 ||
-          isBroadcast(input->get(), bcast_dims.back())) {
+      const auto map = op.getMatchingIndexingMap(input);
+      if (!type || map.getNumDims() == 0) {
+        continue;
+      }
+
+      // An operand whose map does not involve the innermost, vectorized loop is
+      // broadcast along a unit dimension that is added, unless its innermost
+      // dimension already is one. This is a rank-0 operand, or one whose
+      // trailing unit dimension was dropped.
+      auto bcast_dims = map.getBroadcastDims();
+      const auto add_unit_dim =
+          !map.isFunctionOfDim(map.getNumDims() - 1) &&
+          (bcast_dims.empty() || bcast_dims.back() != type.getRank() - 1);
+      if (add_unit_dim) {
+        bcast_dims.push_back(type.getRank());
+      }
+      const auto rank = type.getRank() + (add_unit_dim ? 1 : 0);
+      if (bcast_dims.empty() || bcast_dims.back() != rank - 1 ||
+          (!add_unit_dim && isBroadcast(input->get(), bcast_dims.back()))) {
         continue;
       }
 
@@ -413,6 +528,35 @@ struct BroadcastInputs
       if (fill == 1) {
         continue;
       }
+      // Already broadcast, possibly by a slice that was bubbled up past a
+      // reshape and is therefore not seen by `isBroadcast`.
+      if (!add_unit_dim && type.getDimSize(bcast_dims.back()) == fill) {
+        continue;
+      }
+
+      if (add_unit_dim) {
+        llvm::SmallVector<int64_t> shape(type.getShape());
+        shape.push_back(1);
+        llvm::SmallVector<mlir::ReassociationIndices> reassociation;
+        for (auto dim : llvm::seq<int64_t>(type.getRank())) {
+          reassociation.push_back({dim});
+        }
+        if (!reassociation.empty()) {
+          reassociation.back().push_back(type.getRank());
+        }
+        auto expand = mlir::tensor::ExpandShapeOp::create(
+            rewriter, op.getLoc(),
+            mlir::RankedTensorType::get(shape, type.getElementType()),
+            input->get(), reassociation);
+        input->set(expand);
+        type = expand.getResultType();
+
+        auto maps = op.getIndexingMapsArray();
+        auto& expanded = maps[input->getOperandNumber()];
+        expanded = expanded.insertResult(rewriter.getAffineConstantExpr(0),
+                                         expanded.getNumResults());
+        op.setIndexingMapsAttr(rewriter.getAffineMapArrayAttr(maps));
+      }
 
       auto sizes =
           mlir::tensor::getMixedSizes(rewriter, op.getLoc(), input->get());
@@ -427,7 +571,7 @@ struct BroadcastInputs
       auto broadcast = mlir::tensor::ExtractSliceOp::create(
           rewriter, op.getLoc(), input->get(), offsets, sizes, strides);
       input->set(broadcast);
-      bubbleOpExtractSlice(rewriter, broadcast, mem_space_map_);
+      bubbleUpExtractSlice(rewriter, broadcast, mem_space_map_);
       changed = true;
     }
 
@@ -522,6 +666,7 @@ void KTIRMapAndTilePass::runOnOperation() {
     populateKTDPTilingPatterns(patterns, mem_space_map);
     populateDataMovementCoalescingPatterns(patterns);
     patterns.add<BroadcastInputs>(patterns.getContext(), mem_space_map);
+    patterns.add<BubbleUpSliceThroughReshape>(patterns.getContext());
     mlir::tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
     mlir::tensor::populateFoldTensorEmptyPatterns(patterns);
     populateSimplifyLoopsPatterns(patterns);

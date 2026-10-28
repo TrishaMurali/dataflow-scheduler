@@ -29,6 +29,7 @@
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   convert-elementwise-to-linalg,
 // CHECK-NEXT:   linalg-morph-ops{category-to-generic=true generic-to-named=false named-to-category=false named-to-generic=true},
+// CHECK-NEXT:   simplify-linalg,
 // CHECK-NEXT:   fuse-linalg,
 // CHECK-NEXT:   ktir-map-and-tile,
 // CHECK-NEXT:   ktir-bufferize,

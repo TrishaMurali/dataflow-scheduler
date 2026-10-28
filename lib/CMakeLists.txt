@@ -28,6 +28,7 @@ set(mlir_dialect_libs
 )
 set(mlir_extension_libs
   MLIRArithValueBoundsOpInterfaceImpl
+  MLIRTensorInferTypeOpInterfaceImpl
 )
 set(mlir_conversion_libs)
 

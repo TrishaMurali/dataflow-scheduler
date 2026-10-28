@@ -40,6 +40,7 @@
 #include <mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h>
 #include <mlir/Dialect/SCF/Transforms/Passes.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
+#include <mlir/Dialect/Tensor/IR/TensorInferTypeOpInterfaceImpl.h>
 #include <mlir/IR/DialectRegistry.h>
 #include <mlir/Transforms/Passes.h>
 
@@ -149,6 +150,7 @@ void scheduler::registerAllExtensions(mlir::DialectRegistry& registry) {
   mlir::affine::registerValueBoundsOpInterfaceExternalModels(registry);
   mlir::arith::registerValueBoundsOpInterfaceExternalModels(registry);
   mlir::scf::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::tensor::registerInferTypeOpInterfaceExternalModels(registry);
 
   // Register our own extensions.
   registerExtensions(registry);

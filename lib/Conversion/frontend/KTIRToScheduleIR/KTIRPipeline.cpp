@@ -163,7 +163,7 @@ struct LowerViaMemory : mlir::OpRewritePattern<mlir::ktdf::ViaOp> {
     }
 
     auto read = via.getOperand().getDefiningOp<mlir::ktdf::ReadFromFifoOp>();
-    if (!read->hasOneUse()) {
+    if (!read || !read->hasOneUse()) {
       return rewriter.notifyMatchFailure(
           via, "expected to be single consumer of read");
     }

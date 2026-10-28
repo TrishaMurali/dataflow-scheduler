@@ -807,4 +807,44 @@ def IndirectAccessLoopMaterializationPass
   ];
 }
 
+def SimplifyLinalgPass : Pass<"simplify-linalg", "mlir::func::FuncOp"> {
+  let summary = "Simplifies `linalg` operations";
+  let description = [{
+    Rewrites `linalg.generic` and adjacent `tensor` operations to simplify the
+    computational demand for the device. In particular:
+
+    - Reduces the working set as much as possible.
+
+      By slicing the input and output operands, the working set of the `generic`
+      op is reduced as much as possible. These are expected to be folded into 
+      adjacent transfers, reducing the memory bandwidth and size of
+      intermediates.
+
+    - Normalizes to unit stride.
+
+      A `generic` that accesses an operand with greather-than-unit strides has
+      its operands sliced such that it works on unit stride. These are expected 
+      to be folded into adjacent transfers, reducing the memory bandwidth and 
+      size of intermediates, as well as exposing a dense computation.
+
+    - Promoting constant fills to `arith.constant dense<...>`.
+
+      Invariant inputs and yields are not hoisted out of the `generic`, so that
+      broadcasts stay visible to the data transfers that implement them.
+
+    - Demoting `out` to `in` operands.
+
+      Outputs that aren't being modified in the body are turned into inputs,
+      allowing further simplification.
+
+    - The `linalg` canonicalizations.
+  }];
+  let dependentDialects = [
+    "mlir::affine::AffineDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect"
+  ];
+}
+
 #endif // DATAFLOW_SCHEDULER_TRANSFORMS_PASSES_TD

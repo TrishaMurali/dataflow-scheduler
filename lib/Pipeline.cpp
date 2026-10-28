@@ -57,6 +57,7 @@ void scheduler::buildKTIRFrontendPipeline(
     nested.addPass(mlir::createConvertElementwiseToLinalgPass());
     nested.addPass(mlir::createLinalgMorphOpsPass(
         {.categoryToGeneric = true, .namedToGeneric = true}));
+    nested.addPass(createSimplifyLinalgPass());
     nested.addPass(createFuseLinalgPass());
     nested.addPass(createKTIRMapAndTilePass());
     nested.addPass(createKTIRBufferizePass());
