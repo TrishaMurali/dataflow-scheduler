@@ -12,12 +12,17 @@
 // CHECK:             ktdf.data_transfer from %{{.+}} to %{{.+}} size [2, 1, 64]
 // CHECK:           ktdf.stage
 // CHECK:             %[[RESULT:.+]]:2 = linalg.generic
-// CHECK-DAG:         ktdf.write_to_fifo %[[RESULT]]#0, %[[SLOT_0:[^ ]+]] :
-// CHECK-DAG:         ktdf.write_to_fifo %[[RESULT]]#1, %[[SLOT_1:[^ ]+]] :
+// The writes are in the order of the compute's results. The IR does not say so:
+// each transfer out of the FIFO is paired with a write by position once lowered,
+// and slots are used in the order they were allocated, so result #0 has to be
+// written first.
+// CHECK:             ktdf.write_to_fifo %[[RESULT]]#0, %[[SLOT_0:[^ ]+]] :
+// CHECK-NEXT:        ktdf.write_to_fifo %[[RESULT]]#1, %[[SLOT_1:[^ ]+]] :
 // CHECK:           } {applicable_units = ["SFU"]}
 // CHECK:           ktdf.stage
-// CHECK-DAG:         ktdf.data_transfer from %[[SLOT_0]] size [1, 64] to %[[OUT_0]][
-// CHECK-DAG:         ktdf.data_transfer from %[[SLOT_1]] size [1, 64] to %[[OUT_1]][
+// The transfers out are in the same order, one per write.
+// CHECK:             ktdf.data_transfer from %[[SLOT_0]] size [1, 64] to %[[OUT_0]][
+// CHECK:             ktdf.data_transfer from %[[SLOT_1]] size [1, 64] to %[[OUT_1]][
 // CHECK-NOT:     ktdp_lowering.store
 
 #map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>

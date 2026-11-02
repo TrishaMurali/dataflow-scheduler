@@ -474,14 +474,21 @@ auto KTIRPipelinePass::createPipeline(mlir::RewriterBase& rewriter,
 
   // Insert all the stores and their dependencies. Stores that fill an indirect
   // address buffer are left to be co-located with their indirect transfer.
+  // The builder prepends every op to its stage, so insert the stores in reverse
+  // program order to get program order in the stage. Stores to one memory space
+  // share a stage and are paired with their consumers by position.
+  llvm::SmallVector<mlir::Operation*> stores;
   block->walk([&](mlir::Operation* op) {
     if (auto store = llvm::dyn_cast<mlir::ktdp_lowering::StoreOp>(op);
         store && !ind_addr_bufs.contains(getRootView(store.getDest()))) {
-      builder.insert({op}, place, dominance);
+      stores.push_back(op);
     } else if (llvm::isa<mlir::ktdp_lowering::IndStoreOp>(op)) {
-      builder.insert({op}, place, dominance);
+      stores.push_back(op);
     }
   });
+  for (auto* const store : llvm::reverse(stores)) {
+    builder.insert({store}, place, dominance);
+  }
 
   // Move the fills of each indirect address buffer into the stage of the
   // indirect transfer that uses it, ahead of that transfer. The buffer's state
