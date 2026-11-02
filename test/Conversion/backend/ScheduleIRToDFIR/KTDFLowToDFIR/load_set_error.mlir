@@ -44,6 +44,7 @@
 // CHECK:     func.func private @"local-schedule-0"() attributes {grid = [2]} {
 // CHECK-NEXT:       %[[CONSTANT_12:.*]] = arith.constant 2816 : index
 // CHECK-NEXT:       %[[CONSTANT_13:.*]] = arith.constant 768 : index
+// CHECK-NEXT:       %[[CONSTANT_7:.*]] = arith.constant 2 : index
 // CHECK-NEXT:       %[[CONSTANT_0:.*]] = arith.constant 1664 : index
 // CHECK-NEXT:       %[[CONSTANT_1:.*]] = arith.constant 1152 : index
 // CHECK-NEXT:       %[[CONSTANT_2:.*]] = arith.constant 640 : index
@@ -51,7 +52,6 @@
 // CHECK-NEXT:       %[[CONSTANT_4:.*]] = arith.constant 64000 : index
 // CHECK-NEXT:       %[[CONSTANT_5:.*]] = arith.constant 113152 : index
 // CHECK-NEXT:       %[[CONSTANT_6:.*]] = arith.constant 113216 : index
-// CHECK-NEXT:       %[[CONSTANT_7:.*]] = arith.constant 2 : index
 // CHECK-NEXT:       %[[CONSTANT_8:.*]] = arith.constant 6 : index
 // CHECK-NEXT:       %[[CONSTANT_9:.*]] = arith.constant 32 : index
 // CHECK-NEXT:       %[[CONSTANT_10:.*]] = arith.constant 1 : index

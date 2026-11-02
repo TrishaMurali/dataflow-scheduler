@@ -31,10 +31,10 @@
 // tiling.derive_size lowers directly to the steady-state constant with no cmpi/select.
 // CHECK-LABEL:   func.func @tiling.derive_size_no_remainder(
 // CHECK-SAME:      %[[ARG0:.*]]: memref<10x200xindex>) {
+// CHECK-NEXT:     %[[CONSTANT_3:.*]] = arith.constant 32 : index
 // CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[CONSTANT_1:.*]] = arith.constant 128 : index
 // CHECK-NEXT:     %[[CONSTANT_2:.*]] = arith.constant 1 : index
-// CHECK-NEXT:     %[[CONSTANT_3:.*]] = arith.constant 32 : index
 // CHECK-NEXT:     scf.for %[[VAL_0:.*]] = %[[CONSTANT_0]] to %[[CONSTANT_1]] step %[[CONSTANT_2]] {
 // CHECK-NOT:        arith.cmpi
 // CHECK-NOT:        arith.select

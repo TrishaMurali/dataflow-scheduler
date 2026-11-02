@@ -73,8 +73,9 @@
 // CHECK-NEXT:   )
 // CHECK-NEXT:   broadcast-promotion
 // CHECK-NEXT:   double-buffering
-// CHECK-NEXT:   parallelize-loops-across-instances
 // CHECK-NEXT:   tile-size-selection
+// CHECK-NEXT:   canonicalize
+// CHECK-NEXT:   parallelize-loops-across-instances
 // CHECK-NEXT:   canonicalize
 // CHECK-NEXT:   affine-min-canonicalization
 // CHECK-NEXT:   subsume-linearize-index

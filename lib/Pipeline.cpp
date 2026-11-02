@@ -121,11 +121,13 @@ void scheduler::buildSchedulerOptimizationPipeline(
   }
   pm.addPass(mlir::ktdf::createBroadcastPromotionPass());
   pm.addPass(createDoubleBufferingPass(scheduler_ctx));
-  // Parallelizing before tile selection is beneficial because the tile size
-  // selection pass would now take parallel instances into account while
-  // determining tile sizes.
-  pm.addPass(createParallelizeLoopsAcrossInstancesPass(scheduler_ctx));
+  // Tile sizes are selected before parallelizing, as the loop to parallelize is
+  // chosen by its trip count, which is unknown until the tile sizes are. The
+  // canonicalizer then folds the now-constant tile bounds and removes the
+  // single-iteration loops, so they are not parallelized.
   pm.addPass(mlir::ktdf::createTileSizeSelectionPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(createParallelizeLoopsAcrossInstancesPass(scheduler_ctx));
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(createAffineMinCanonicalizationPass());
   pm.addPass(mlir::ktdf::createSubsumeLinearizeIndexPass());
