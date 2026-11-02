@@ -107,6 +107,16 @@ mlir::Value emitSubSimdSplatShuffle(mlir::OpBuilder& builder,
 mlir::Value emitSplatShuffle(mlir::OpBuilder& builder, mlir::Location loc,
                              mlir::Value src_vec, int64_t dst_elements);
 
+/// Create a vectorchain.shuffle that widens `src_vec` to a `dst_elements`-wide
+/// vector by filling the remainder with zeros, after `src_vec` when
+/// `pad_front` is false and before it otherwise.
+///
+/// `dst_elements` must be at least `src_vec`'s width; callers are expected to
+/// have validated (and diagnosed) that beforehand.
+mlir::Value emitZeroPadShuffle(mlir::OpBuilder& builder, mlir::Location loc,
+                               mlir::Value src_vec, int64_t dst_elements,
+                               bool pad_front);
+
 /// Return a layout-free `MemRefType` with the same shape and element type as
 /// the shaped type `type`, in `memory_space` (no memory space when null).
 /// Returns nullptr when `type` is not shaped or has no static shape.

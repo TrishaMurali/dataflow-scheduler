@@ -52,6 +52,7 @@
 // CHECK-NEXT:   fold-fifo-relay-stages
 // CHECK-NEXT:   path-expansion
 // CHECK-NEXT:   indirect-addr-buf-fill-legalization
+// CHECK-NEXT:   access-granularity-legalization
 // CHECK-NEXT:   scalar-broadcast-legalization
 // CHECK-NEXT:   splat-legalization
 // CHECK-NEXT:   normalize-scf-for-loops

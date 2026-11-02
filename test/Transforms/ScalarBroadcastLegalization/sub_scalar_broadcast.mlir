@@ -38,20 +38,20 @@
 // CHECK-NEXT:         }
 // CHECK-NEXT:         ktdf.stage depends_in(none) depends_out(%[[VAL_0:.*]]#6) {
 // CHECK-NEXT:           ktdf.data_transfer from %[[REINTERPRET_CAST_0]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]], %[[CONSTANT_0]], %[[CONSTANT_0]]] size [1, 1, 1, 64] to %[[VAL_0]]#0[0, 0, 0, 0] size [1, 1, 1, 64] : memref<12x1x64x64xf16, strided<[4096, 4096, 64, 1], offset: ?>, "DDR">, memref<1x1x1x64xf16, "L1">
-                         // The second MNILU transfer (broadcast operand) must be widened to [1, 1, 1, 64].
+                         // Widening to [1, 1, 1, 64] is done upstream by access-granularity-legalization.
 // CHECK-NEXT:           ktdf.data_transfer from %[[REINTERPRET_CAST_1]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]], %[[CONSTANT_0]], 0] size [1, 1, 1, 64] to %[[VAL_0]]#1[0, 0, 0, 0] size [1, 1, 1, 64] : memref<12x1x64x64xf16, strided<[4096, 4096, 64, 1], offset: ?>, "DDR">, memref<1x1x1x64xf16, "L1">
 // CHECK-NEXT:         } {applicable_units = ["MNILU"]}
 // CHECK-NEXT:         ktdf.stage depends_in(%[[VAL_1:.*]]#6) depends_out(%[[VAL_1]]#7) {
 // CHECK-NEXT:           ktdf.data_transfer from %[[VAL_1]]#0[0, 0, 0, 0] size [1, 1, 1, 64] to %[[VAL_1]]#3 size [64] : memref<1x1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
-                         // The second L1LU transfer must have transfer_mode = "splat", source size still [1, 1, 1, 1].
-// CHECK-NEXT:           ktdf.data_transfer from %[[VAL_1]]#1[0, 0, 0, 0] size [1, 1, 1, 1] to %[[VAL_1]]#4 size [64] {transfer_mode = "splat"} : memref<1x1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+                         // Splat mode and slot widening are done upstream; source size stays [1, 1, 1, 1].
+// CHECK-NEXT:           ktdf.data_transfer from %[[VAL_1]]#1[0, 0, 0, 0] size [1, 1, 1, 1] to %[[VAL_1]]#4 size [64] {transfer_mode = #ktdf.transfer_mode<splat>} : memref<1x1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK-NEXT:         } {applicable_units = ["L1LU"]}
 // CHECK-NEXT:         ktdf.stage depends_in(%[[VAL_2:.*]]#7) depends_out(%[[VAL_2]]#8) {
 // CHECK-NEXT:           %[[READ_FROM_FIFO_0:.*]] = ktdf.read_from_fifo %[[VAL_2]]#3 : <"L1LU" -> "SFU", 64xf16> -> tensor<1x1x1x64xf16>
-                         // The second read_from_fifo must return tensor<1x1x1x64xf16>.
+                         // This pass updates read_from_fifo type and replaces the broadcast map.
 // CHECK-NEXT:           %[[READ_FROM_FIFO_1:.*]] = ktdf.read_from_fifo %[[VAL_2]]#4 : <"L1LU" -> "SFU", 64xf16> -> tensor<1x1x1x64xf16>
 // CHECK-NEXT:           %[[EMPTY_0:.*]] = tensor.empty() : tensor<1x1x1x1x64xf16>
-                         // The linalg.generic second input map must NOT be the broadcast map (d0,d2,d3,0).
+                         // The linalg.generic second input map is replaced with the identity map.
 // CHECK-NEXT:           %[[GENERIC_0:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_0]], #[[$ATTR_1]]], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%[[READ_FROM_FIFO_0]], %[[READ_FROM_FIFO_1]] : tensor<1x1x1x64xf16>, tensor<1x1x1x64xf16>) outs(%[[EMPTY_0]] : tensor<1x1x1x1x64xf16>) {
 // CHECK-NEXT:           ^bb0(%[[VAL_3:.*]]: f16, %[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16):
 // CHECK-NEXT:             %[[SUBF_0:.*]] = arith.subf %[[VAL_3]], %[[VAL_4]] : f16
@@ -101,9 +101,9 @@ module {
     %reinterpret_cast_2 = memref.reinterpret_cast %memspacecast_2 to offset: [%c0], sizes: [12, 1, 1, 64, 64], strides: [4096, 4096, 4096, 64, 1] : memref<12x1x1x64x64xf16, "DDR"> to memref<12x1x1x64x64xf16, strided<[4096, 4096, 4096, 64, 1], offset: ?>, "DDR">
     
     ktdf.pipeline {
-      %3:10 = ktdf.private -> (memref<1x1x1x64xf16, "L1">, memref<1x1x1x1xf16, "L1">, memref<1x1x1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token) {
+      %3:10 = ktdf.private -> (memref<1x1x1x64xf16, "L1">, memref<1x1x1x64xf16, "L1">, memref<1x1x1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token) {
         %alloc = memref.alloc() : memref<1x1x1x64xf16, "L1">
-        %alloc_1 = memref.alloc() : memref<1x1x1x1xf16, "L1">
+        %alloc_1 = memref.alloc() : memref<1x1x1x64xf16, "L1">
         %alloc_2 = memref.alloc() : memref<1x1x1x1x64xf16, "L1">
         %4:2 = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
         %5 = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
@@ -111,15 +111,15 @@ module {
         %7 = ktdf.create_token : !ktdf.token
         %8 = ktdf.create_token : !ktdf.token
         %9 = ktdf.create_token : !ktdf.token
-        ktdf.private_yield %alloc, %alloc_1, %alloc_2, %4#0, %4#1, %5, %6, %7, %8, %9 : memref<1x1x1x64xf16, "L1">, memref<1x1x1x1xf16, "L1">, memref<1x1x1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token
+        ktdf.private_yield %alloc, %alloc_1, %alloc_2, %4#0, %4#1, %5, %6, %7, %8, %9 : memref<1x1x1x64xf16, "L1">, memref<1x1x1x64xf16, "L1">, memref<1x1x1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token
       }
       ktdf.stage depends_in(none) depends_out(%3#6) {
         ktdf.data_transfer from %reinterpret_cast[%c0, %c0, %c0, %c0] size [1, 1, 1, 64] to %3#0[0, 0, 0, 0] size [1, 1, 1, 64] : memref<12x1x64x64xf16, strided<[4096, 4096, 64, 1], offset: ?>, "DDR">, memref<1x1x1x64xf16, "L1">
-        ktdf.data_transfer from %reinterpret_cast_1[%c0, %c0, %c0, 0] size [1, 1, 1, 1] to %3#1[0, 0, 0, 0] size [1, 1, 1, 1] : memref<12x1x64x64xf16, strided<[4096, 4096, 64, 1], offset: ?>, "DDR">, memref<1x1x1x1xf16, "L1">
+        ktdf.data_transfer from %reinterpret_cast_1[%c0, %c0, %c0, 0] size [1, 1, 1, 64] to %3#1[0, 0, 0, 0] size [1, 1, 1, 64] : memref<12x1x64x64xf16, strided<[4096, 4096, 64, 1], offset: ?>, "DDR">, memref<1x1x1x64xf16, "L1">
       } {applicable_units = ["MNILU"]}
       ktdf.stage depends_in(%3#6) depends_out(%3#7) {
         ktdf.data_transfer from %3#0[0, 0, 0, 0] size [1, 1, 1, 64] to %3#3 size [64] : memref<1x1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
-        ktdf.data_transfer from %3#1[0, 0, 0, 0] size [1, 1, 1, 1] to %3#4 size [64] : memref<1x1x1x1xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+        ktdf.data_transfer from %3#1[0, 0, 0, 0] size [1, 1, 1, 1] to %3#4 size [64] {transfer_mode = #ktdf.transfer_mode<splat>} : memref<1x1x1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
       } {applicable_units = ["L1LU"]}
       ktdf.stage depends_in(%3#7) depends_out(%3#8) {
         %4 = ktdf.read_from_fifo %3#3 : <"L1LU" -> "SFU", 64xf16> -> tensor<1x1x1x64xf16>

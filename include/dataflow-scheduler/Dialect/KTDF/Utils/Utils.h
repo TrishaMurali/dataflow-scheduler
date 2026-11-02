@@ -32,6 +32,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LogicalResult.h"
 
@@ -57,22 +58,24 @@ auto isTransferTarget(Value memref, Operation* root_op) -> bool;
 auto findStageForUnit(uniform::QueryMapOp query_op,
                       ArrayRef<ktdf::StageOp> stages) -> StageOp;
 
-/// Mark `transfer` as a splat: the hardware fills the destination by
-/// replicating the source rather than by copying element for element.
-void markSplatTransfer(ktdf::DataTransferOp transfer);
-
-/// Whether `transfer` carries the splat mark `markSplatTransfer` sets.
-auto isSplatTransfer(ktdf::DataTransferOp transfer) -> bool;
-
-/// Whether `transfer` fills a destination wider than its source, either by
-/// replicating the source (splat) or by zero-filling the remainder (pad).
-auto isBroadcastTransfer(ktdf::DataTransferOp transfer) -> bool;
-
 /// Overwrite the innermost `static_source_sizes` entry of `transfer` with
 /// `size`.  Does nothing, and returns false, when `transfer` carries no static
 /// source sizes.
-auto setInnermostStaticSourceSize(ktdf::DataTransferOp transfer, int64_t size)
+auto setInnermostStaticSourceSize(RewriterBase& rewriter,
+                                  ktdf::DataTransferOp transfer, int64_t size)
     -> bool;
+
+/// Re-types the `memref.alloc` that `ktdf.private` result @p private_result
+/// hands out to @p shape . Returns false, and changes nothing, if the result
+/// does not come from a `memref.alloc`.
+auto resizePrivateBuffer(RewriterBase& rewriter, Value private_result,
+                         ArrayRef<int64_t> shape) -> bool;
+
+/// Re-types the slot that `ktdf.private` result @p private_result hands out to
+/// hold @p num_elements . Returns false, and changes nothing, if the result
+/// does not come from a `ktdf.fifo.allocate`.
+auto resizePrivateFifoSlot(RewriterBase& rewriter, Value private_result,
+                           int64_t num_elements) -> bool;
 
 /// Convert all uses of a tensor SSA value to memref semantics throughout the
 /// IR reachable from that tensor.

@@ -16,15 +16,22 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// SplatLegalization: legalize splat data_transfer loads to the arch's load
-// granularity, and name the shuffle that finishes the splat on the reads.
+// SplatLegalization: validate splat data_transfer loads against the load
+// unit's SIMD capabilities, widen the load to the arch's access granularity
+// when required, and annotate consuming read_from_fifo ops with the sub-SIMD
+// shuffle mode that closes the gap.
 //
-// A load unit that cannot splat a single element at its access granularity
-// loads the whole granule instead, which leaves one live element per sub-SIMD
-// group rather than one for the whole vector.  The pass records that on the
-// read as the splat mode that closes the gap, and stops there: the shuffle
-// itself is emitted by the lowering to DFIR, and where the buffer it works on
-// lives is the device's to say through its patterns.
+// Problem this pass addresses: A load unit that cannot splat a single element
+// at its access granularity loads the whole granule instead, which leaves one
+// live element per sub-SIMD group rather than one for the whole vector.
+//
+// This pass's responsibilities are:
+//   1. Validate that the load unit's SIMD feature declares splat capability.
+//   2. Widen the innermost static_source_sizes dimension to the hardware's
+//      access granularity when it exceeds the requested element count.
+//   3. Annotate each consuming ktdf.read_from_fifo with
+//      #ktdf.splat<first_subsimd_lane_to_each_subsimd> when widening occurred,
+//      naming the sub-SIMD broadcast shuffle the lowering to DFIR will emit.
 //
 //===----------------------------------------------------------------------===//
 
@@ -42,7 +49,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 
 #define PASS_NAME "splat-legalization"
@@ -78,21 +85,27 @@ scheduler::ResourceType resolveLoadUnitKind(mlir::Operation* op) {
       .value_or(scheduler::ResourceType{});
 }
 
+/// Validate that @p transfer's load unit declares splat capability.
+static mlir::LogicalResult validateSplatCapability(
+    mlir::ktdf::DataTransferOp transfer,
+    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+  const auto simd = resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(
+      resolveLoadUnitKind(transfer));
+  if (!simd || !simd.canSplat())
+    return transfer.emitError(
+        "splat data_transfer requires the load unit to declare "
+        "ktdf_arch.feature.simd = { splat, ... }");
+  return mlir::success();
+}
+
 /// Legalize `transfer`'s load to the arch's access granularity and name, on
 /// every read of it, the shuffle that finishes the splat.  A no-op when the
 /// granularity is no wider than the source, i.e. when the hardware can splat
 /// what was asked for as it stands.
 mlir::LogicalResult legalizeSplatTransfer(
-    mlir::ktdf::DataTransferOp transfer,
+    mlir::RewriterBase& rewriter, mlir::ktdf::DataTransferOp transfer,
     const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
   scheduler::ResourceType load_unit_kind = resolveLoadUnitKind(transfer);
-
-  auto simd_feature =
-      resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(load_unit_kind);
-  if (!simd_feature || !simd_feature.canSplat())
-    return transfer.emitError(
-        "splat data_transfer requires the load unit to declare "
-        "ktdf_arch.feature.simd = { splat, ... }");
 
   auto static_src_sizes = transfer.getStaticSourceSizesArray();
   if (!static_src_sizes || static_src_sizes->empty())
@@ -117,7 +130,7 @@ mlir::LogicalResult legalizeSplatTransfer(
 
   // The size operand carries the load width, so the lowering pass reads it
   // straight off the transfer and no extra attribute is needed for it.
-  mlir::ktdf::setInnermostStaticSourceSize(transfer, load_elements);
+  mlir::ktdf::setInnermostStaticSourceSize(rewriter, transfer, load_elements);
 
   // A legalized load leaves one live element per sub-SIMD group rather than
   // one for the whole vector.  Name the shuffle that closes that gap on every
@@ -127,7 +140,9 @@ mlir::LogicalResult legalizeSplatTransfer(
   for (mlir::Operation* user : fifo_slot.getUsers()) {
     auto read_op = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(user);
     if (read_op && read_op.getFifoSlot() == fifo_slot) {
-      read_op.setSplat(mlir::ktdf::SplatMode::FirstSubSimdLaneToEachSubSimd);
+      rewriter.modifyOpInPlace(read_op, [&] {
+        read_op.setSplat(mlir::ktdf::SplatMode::FirstSubSimdLaneToEachSubSimd);
+      });
     }
   }
   return mlir::success();
@@ -153,16 +168,22 @@ struct SplatLegalizationPass
     auto& resource_kinds =
         device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
 
-    mlir::WalkResult walk_result =
-        module_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
-          if (!transfer.isDestFifo() || !mlir::ktdf::isSplatTransfer(transfer))
-            return mlir::WalkResult::advance();
-          return mlir::failed(legalizeSplatTransfer(transfer, resource_kinds))
-                     ? mlir::WalkResult::interrupt()
-                     : mlir::WalkResult::advance();
-        });
+    llvm::SmallVector<mlir::ktdf::DataTransferOp> splats;
+    module_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
+      if (transfer.isDestFifo() &&
+          transfer.getTransferMode() == mlir::ktdf::TransferMode::Splat)
+        splats.push_back(transfer);
+    });
 
-    if (walk_result.wasInterrupted()) signalPassFailure();
+    mlir::IRRewriter rewriter(&getContext());
+    for (auto transfer : splats) {
+      if (mlir::failed(validateSplatCapability(transfer, resource_kinds)) ||
+          mlir::failed(
+              legalizeSplatTransfer(rewriter, transfer, resource_kinds))) {
+        signalPassFailure();
+        return;
+      }
+    }
   }
 };
 

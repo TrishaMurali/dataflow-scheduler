@@ -728,8 +728,10 @@ struct LowerLoadToFifo : mlir::OpRewritePattern<mlir::ktdf::WriteToFifoOp> {
 
     // Dimensions of stride zero broadcast a single loaded element.
     auto slice = getSlice(load);
+    bool is_splat = false;
     for (auto& range : slice) {
       if (mlir::isConstantIntValue(range.stride, 0)) {
+        is_splat |= !mlir::isConstantIntValue(range.size, 1);
         range.size = rewriter.getIndexAttr(1);
       }
     }
@@ -742,7 +744,9 @@ struct LowerLoadToFifo : mlir::OpRewritePattern<mlir::ktdf::WriteToFifoOp> {
     auto transfer = mlir::ktdf::DataTransferOp::create(
         rewriter, rewriter.getFusedLoc({load.getLoc(), write.getLoc()}), memref,
         source_map, source_offsets, source_sizes, write.getFifoSlot(), {}, {},
-        load.getMixedSizes());
+        load.getMixedSizes(),
+        is_splat ? mlir::ktdf::TransferMode::Splat
+                 : mlir::ktdf::TransferMode::Copy);
     transfer->setDiscardableAttrs(load->getRawDictionaryAttrs());
     rewriter.eraseOp(write);
     return llvm::success();

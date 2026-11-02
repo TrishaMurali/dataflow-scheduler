@@ -433,7 +433,7 @@ mlir::LogicalResult legalizeFillSite(const FillSite& site,
       builder, fill.getLoc(), buffer, buffer_subscript,
       /*source_indices=*/mlir::ValueRange{}, sizes, fill.getDestination(),
       fill.getDestMap().value_or(mlir::AffineMap()), fill.getDestIndices(),
-      fill.getMixedDestSizes());
+      fill.getMixedDestSizes(), fill.getTransferMode());
   staged_fill->setDiscardableAttrs(fill_attrs);
   llvm::SmallVector<mlir::Value> old_operands(fill->getOperands());
   fill.erase();

@@ -431,13 +431,11 @@ ktdf::DataTransferOp StageCoarseningBufferCloner::cloneDataTransfer(
 
   auto new_transfer = DataTransferOp::create(
       builder, transfer_op.getLoc(), src, new_src_map, new_src_indices,
-      src_sizes, dst, new_dst_map, new_dst_indices, dst_sizes);
+      src_sizes, dst, new_dst_map, new_dst_indices, dst_sizes,
+      transfer_op.getTransferMode());
 
-  // Copy any discardable attributes (e.g. transfer_mode="splat") from the
-  // original op that are not part of the structural builder arguments.
-  for (NamedAttribute attr : transfer_op->getDiscardableAttrs()) {
-    new_transfer->setDiscardableAttr(attr.getName(), attr.getValue());
-  }
+  // Copy what the structural builder arguments do not cover.
+  new_transfer->setDiscardableAttrs(transfer_op->getRawDictionaryAttrs());
 
   return new_transfer;
 }

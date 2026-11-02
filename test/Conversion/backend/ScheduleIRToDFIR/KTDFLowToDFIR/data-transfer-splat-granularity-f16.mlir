@@ -64,7 +64,7 @@ module {
           // granularity covers exactly 1 f16 element.
           ktdf.data_transfer from %alloc[%c0] size [1]
                              to %fifo#0 size [64]
-                             {transfer_mode = "splat"}
+                             {transfer_mode = #ktdf.transfer_mode<splat>}
               : memref<256xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
         } {loop_type = #ktdf.loop_type<parallel_loop>}
       }

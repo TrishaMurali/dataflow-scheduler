@@ -15,6 +15,7 @@ ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#
 // CHECK:         ktdf.pipeline {
 // CHECK:           ktdf.stage {{.+}} {
 // CHECK:             ktdf.data_transfer from %[[B]][0] size [1] to %{{.+}} size [64]
+// CHECK-SAME:          transfer_mode = #ktdf.transfer_mode<splat>
 // CHECK:           }
 // CHECK:         }
 func.func @broadcast(%a: memref<128xf16, "DDR">, %b: memref<1xf16, "DDR">, %out: memref<128xf16, "DDR">) attributes {grid = [1 : index]} {
@@ -42,6 +43,7 @@ func.func @broadcast(%a: memref<128xf16, "DDR">, %b: memref<1xf16, "DDR">, %out:
 // CHECK:         ktdf.pipeline {
 // CHECK:           ktdf.stage {{.+}} {
 // CHECK:             ktdf.data_transfer from %[[B]][0] size [1] to %[[SLOT:.+]] size [64]
+// CHECK-SAME:          transfer_mode = #ktdf.transfer_mode<splat>
 // CHECK:           }
 // CHECK:           ktdf.stage {{.+}} {
 // CHECK:             ktdf.data_transfer from %[[SLOT]] size [64] to %[[VIA:.+]][0] size [64]

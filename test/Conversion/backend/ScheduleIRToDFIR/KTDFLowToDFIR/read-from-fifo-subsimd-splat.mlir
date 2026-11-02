@@ -45,7 +45,7 @@ module {
     ktdf_lowering.execute_on %u_l1lu {
       %src = memref.alloc() : memref<1x2xf16, "L1">
       ktdf.data_transfer from %src[%c0, %c0] size [1, 2] to %fifo size [64]
-        {transfer_mode = "splat"}
+        {transfer_mode = #ktdf.transfer_mode<splat>}
         : memref<1x2xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
     }
 

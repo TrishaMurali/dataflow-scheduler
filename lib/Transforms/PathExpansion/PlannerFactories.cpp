@@ -234,6 +234,9 @@ TransferMaterializationInfo* TransferInfoFactory::createFromTemplate(
 
   auto transfer = std::make_unique<TransferMaterializationInfo>();
   transfer->template_op = template_op;
+  if (auto data_transfer =
+          mlir::dyn_cast<mlir::ktdf::DataTransferOp>(template_op))
+    transfer->transfer_mode = data_transfer.getTransferMode();
   transfer->hop = edge;
   transfer->source_resource = source_resource;
   transfer->dest_resource = dest_resource;

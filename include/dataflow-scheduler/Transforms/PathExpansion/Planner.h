@@ -136,6 +136,10 @@ struct TransferMaterializationInfo {
   ResourceType source_resource;
   ResourceType dest_resource;
 
+  // How the transfer fills its destination. Taken from the template op, then
+  // moved to the hop that widens the data if path expansion splits the flow.
+  mlir::ktdf::TransferMode transfer_mode = mlir::ktdf::TransferMode::Copy;
+
   // How the transfer reads its source and writes its destination.
   TransferSide source;
   TransferSide dest;

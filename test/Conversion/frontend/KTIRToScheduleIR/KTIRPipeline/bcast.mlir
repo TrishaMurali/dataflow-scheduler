@@ -34,7 +34,7 @@
 // CHECK-NEXT:              }
 // CHECK-NEXT:              ktdf.stage depends_in(none) depends_out(%[[PRIVATE]]#5) {
 // CHECK-NEXT:                ktdf.data_transfer from %[[REINTERP_0]][%[[IV0]], %[[IV2]], %[[IV3]], %[[IV4]]] size [1, 1, 1, 64] to %[[PRIVATE]]#6 size [1, 1, 1, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<12x1x64x64xf16, strided<[4096, 4096, 64, 1], offset: ?>, "DDR">, !ktdf.fifo.slot<"DDR" -> "SFU", 64xf16>
-// CHECK-NEXT:                ktdf.data_transfer from %[[REINTERP_1]][%[[IV0]], %[[IV2]], %[[IV3]], 0] size [1, 1, 1, 1] to %[[PRIVATE]]#4 size [1, 1, 1, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<12x1x64x64xf16, strided<[4096, 4096, 64, 1], offset: ?>, "DDR">, !ktdf.fifo.slot<"DDR" -> "L1", 64xf16>
+// CHECK-NEXT:                ktdf.data_transfer from %[[REINTERP_1]][%[[IV0]], %[[IV2]], %[[IV3]], 0] size [1, 1, 1, 1] to %[[PRIVATE]]#4 size [1, 1, 1, 64] {dataflow_scheduler.throttle = 64 : i64, transfer_mode = #ktdf.transfer_mode<splat>} : memref<12x1x64x64xf16, strided<[4096, 4096, 64, 1], offset: ?>, "DDR">, !ktdf.fifo.slot<"DDR" -> "L1", 64xf16>
 // CHECK-NEXT:              }
 // CHECK-NEXT:              ktdf.stage depends_in(%[[PRIVATE]]#5) depends_out(%[[PRIVATE]]#7) {
 // CHECK-NEXT:                ktdf.data_transfer from %[[PRIVATE]]#4 size [1, 1, 1, 64] to %[[PRIVATE]]#8[0, 0, 0, 0] size [1, 1, 1, 64] : !ktdf.fifo.slot<"DDR" -> "L1", 64xf16>, memref<1x1x1x64xf16, "L1">

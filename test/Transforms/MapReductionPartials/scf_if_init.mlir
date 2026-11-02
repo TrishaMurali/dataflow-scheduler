@@ -52,7 +52,7 @@
 // CHECK-NEXT:                 scf.for %[[VAL_5:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_6]] step %[[CONSTANT_5]] {
 // CHECK-NEXT:                   %[[SUBI_1:.*]] = arith.subi %[[VAL_3]], %[[CONSTANT_0]] : index
 // CHECK-NEXT:                   %[[DIVSI_1:.*]] = arith.divsi %[[SUBI_1]], %[[CONSTANT_1]] : index
-// CHECK-NEXT:                   ktdf.data_transfer from %[[VAL_2]]#0{{\[}}%[[DIVSI_1]], 0, 0, 0] size [1, 1, 256, 64] to %[[VAL_4]]#0 size [64] : memref<2x1x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+// CHECK-NEXT:                   ktdf.data_transfer from %[[VAL_2]]#0{{\[}}%[[DIVSI_1]], 0, %[[VAL_5]], 0] size [1, 1, 1, 64] to %[[VAL_4]]#0 size [64] : memref<2x1x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK-NEXT:                 }
 // CHECK-NEXT:               } {applicable_units = ["L1LU"]}
 // CHECK-NEXT:               ktdf.stage depends_in(%[[VAL_6:.*]]#2) depends_out(%[[VAL_6]]#3) {
@@ -180,7 +180,7 @@ module {
                 scf.for %arg1 = %c0_3 to %c256 step %c1_4 {
                   %4 = arith.subi %arg0, %c0 : index
                   %5 = arith.divsi %4, %c1 : index
-                  ktdf.data_transfer from %2#0[%5, 0, 0, 0] size [1, 1, 256, 64] to %3#0 size [64] : memref<2x1x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+                  ktdf.data_transfer from %2#0[%5, 0, %arg1, 0] size [1, 1, 1, 64] to %3#0 size [64] : memref<2x1x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
                 }
               } {applicable_units = ["L1LU"]}
               ktdf.stage depends_in(%3#2) depends_out(%3#3) {

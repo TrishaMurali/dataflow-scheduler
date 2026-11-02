@@ -782,6 +782,11 @@ struct DataFlow {
   StageNode* producer = nullptr;
   StageNode* consumer = nullptr;
 
+  // How the producer op fills the carrier: Copy unless it is a data transfer
+  // that splats or pads. Once the flow has hops, the mode belongs to the first
+  // transfer that writes a FIFO (see assignTransferMode).
+  mlir::ktdf::TransferMode transfer_mode = mlir::ktdf::TransferMode::Copy;
+
   RoutingGraph::Path path;
   // Last path index that is part of the producer.
   size_t producer_end = 0;
@@ -905,6 +910,8 @@ static std::vector<DataFlow> collectDataFlows(
       flow.consumer_op = reader;
       flow.producer = producer;
       flow.consumer = consumer;
+      if (auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op))
+        flow.transfer_mode = transfer.getTransferMode();
       outgoing.push_back(std::move(flow));
     });
 
@@ -1780,6 +1787,32 @@ static mlir::LogicalResult retypeFifosBetweenOriginalStages(
   return mlir::success();
 }
 
+/// Hand \p flow's transfer mode (splat or pad) to the transfer that now fills
+/// the destination the mode was meant for.
+///
+/// A splat or pad is the load from memory into a FIFO, so it belongs to the
+/// first of \p transfers, in data-flow order, that writes a FIFO. Everything
+/// before it only moves data between memories, at the width of the producer's
+/// memref side, and copies. The producer op's transfer, \p producer_transfer
+/// (may be null), starts out with the op's own mode and gives it up if it no
+/// longer writes a FIFO. Leaves the modes as planned if no transfer does.
+static void assignTransferMode(
+    const DataFlow& flow,
+    llvm::ArrayRef<TransferMaterializationInfo*> transfers,
+    TransferMaterializationInfo* producer_transfer) {
+  if (flow.transfer_mode == mlir::ktdf::TransferMode::Copy) return;
+
+  for (TransferMaterializationInfo* transfer : transfers) {
+    if (!transfer->dest.resource ||
+        transfer->dest.resource->kind != PrivateResourceSpec::Kind::kFifo)
+      continue;
+    if (producer_transfer && producer_transfer != transfer)
+      producer_transfer->transfer_mode = mlir::ktdf::TransferMode::Copy;
+    transfer->transfer_mode = flow.transfer_mode;
+    return;
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // Step 3: Populate Hop Stage Transfers
 //===----------------------------------------------------------------------===//
@@ -1800,6 +1833,8 @@ static mlir::LogicalResult retypeFifosBetweenOriginalStages(
 ///
 /// How it works: walk the flows in order. For each flow with hops, create the
 /// carriers of its inner boundaries, then one transfer for each hop stage.
+/// Finally, give the flow's transfer mode to the first transfer that writes a
+/// FIFO (see assignTransferMode).
 static mlir::LogicalResult populateHopStageTransfers(
     llvm::MutableArrayRef<DataFlow> flows, const RoutingGraph& arch_graph,
     PathExpansionPlan* plan, BoundaryFifos& fifos) {
@@ -1830,6 +1865,13 @@ static mlir::LogicalResult populateHopStageTransfers(
           spec, slot, context_op, builder);
     }
 
+    // The transfers that move the flow's data, in data-flow order, starting
+    // with the producer op's own transfer if it was adapted.
+    llvm::SmallVector<TransferMaterializationInfo*> flow_transfers;
+    TransferMaterializationInfo* producer_transfer =
+        findTransferForOp(plan->getStageInfo(flow.producer), flow.producer_op);
+    if (producer_transfer) flow_transfers.push_back(producer_transfer);
+
     for (size_t k = 0; k < flow.chain.size(); ++k) {
       const Carrier& source = flow.carriers[k];
       const Carrier& dest = flow.carriers[k + 1];
@@ -1851,6 +1893,7 @@ static mlir::LogicalResult populateHopStageTransfers(
                                                  dest_node.resource, source,
                                                  dest, builder.getContext());
       plan->getStageInfo(flow.chain[k]).transfers.push_back(transfer);
+      flow_transfers.push_back(transfer);
 
       LDBG(1) << "  Stage " << flow.chain[k]->getStageId()
               << ": created transfer " << source_node.resource << " -> "
@@ -1858,6 +1901,8 @@ static mlir::LogicalResult populateHopStageTransfers(
               << flow.producer->getStageId() << " to stage "
               << flow.consumer->getStageId() << "\n";
     }
+
+    assignTransferMode(flow, flow_transfers, producer_transfer);
   }
   return mlir::success();
 }

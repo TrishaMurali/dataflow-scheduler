@@ -652,12 +652,19 @@ struct LowerDataTransferPattern
     // For splat/pad transfers the source is smaller than the destination —
     // the hardware replicates or zero-pads to fill the vector. Skip the
     // equality check and use the destination size as the transfer width.
-    const bool is_broadcast_transfer =
-        mlir::ktdf::isBroadcastTransfer(data_transfer_op);
-    if (is_broadcast_transfer && src_total_elements > dst_total_elements) {
+    const auto transfer_mode = data_transfer_op.getTransferMode();
+    if (transfer_mode != mlir::ktdf::TransferMode::Copy &&
+        src_total_elements > dst_total_elements) {
       data_transfer_op.emitError(
           "source total elements must not exceed destination for "
           "splat/pad transfer");
+      return mlir::failure();
+    }
+    // Only a load into a FIFO can splat or pad.
+    if (transfer_mode != mlir::ktdf::TransferMode::Copy &&
+        transfer_type != DataTransferType::kLoadAndSend) {
+      data_transfer_op.emitError(
+          "splat/pad transfer must load from memory into a FIFO");
       return mlir::failure();
     }
 
@@ -716,7 +723,7 @@ struct LowerDataTransferPattern
         return lowerAsLoadAndSend(rewriter, data_transfer_op, src_memref,
                                   src_indices, src_static_sizes, num_dims,
                                   vector_type, src_map, dst_fifo_slot_type,
-                                  is_broadcast_transfer, src_total_elements);
+                                  transfer_mode, src_total_elements);
       }
 
       case DataTransferType::kReceiveAndStore: {
@@ -927,14 +934,15 @@ struct LowerDataTransferPattern
   /// `load_elements` is the number of source elements the load reads.  For a
   /// splat that is the arch-aligned load width SplatLegalizationPass legalized
   /// `src_static_sizes` to, and the load is broadcast from it to the
-  /// destination width.
+  /// destination width.  For a pad, the load is zero-filled to the destination
+  /// width, in front of it or behind it.
   mlir::LogicalResult lowerAsLoadAndSend(
       mlir::PatternRewriter& rewriter,
       mlir::ktdf::DataTransferOp data_transfer_op, mlir::Value src_memref,
       mlir::ValueRange src_indices, llvm::ArrayRef<int64_t> src_static_sizes,
       unsigned num_dims, mlir::VectorType vector_type, mlir::AffineMap src_map,
-      mlir::ktdf::FifoSlotType dst_fifo_slot_type, bool is_splat,
-      int64_t load_elements) const {
+      mlir::ktdf::FifoSlotType dst_fifo_slot_type,
+      mlir::ktdf::TransferMode transfer_mode, int64_t load_elements) const {
     // Find the enclosing program_unit (needed for the send destination
     // resolution below).
     auto program_unit =
@@ -944,6 +952,7 @@ struct LowerDataTransferPattern
       return mlir::failure();
     }
 
+    const bool is_splat = transfer_mode == mlir::ktdf::TransferMode::Splat;
     if (is_splat && vector_type.getNumElements() % load_elements != 0) {
       data_transfer_op.emitError(
           "dst_total_elements must be divisible by the effective splat "
@@ -951,7 +960,7 @@ struct LowerDataTransferPattern
       return mlir::failure();
     }
 
-    auto load_type = is_splat
+    auto load_type = transfer_mode != mlir::ktdf::TransferMode::Copy
                          ? mlir::VectorType::get({load_elements},
                                                  vector_type.getElementType())
                          : vector_type;
@@ -966,13 +975,23 @@ struct LowerDataTransferPattern
         rewriter, data_transfer_op.getLoc(), load_type, src_memref,
         /*dbgName=*/nullptr, src_map, src_indices, load_set, load_order);
 
-    // For splat: broadcast the granularity-sized load to full destination
-    // width.
+    // Widen the load to the full destination width.
     mlir::Value send_value = vector_load_op.getResult();
-    if (is_splat) {
-      send_value =
-          scheduler::emitSplatShuffle(rewriter, data_transfer_op.getLoc(),
-                                      send_value, vector_type.getNumElements());
+    switch (transfer_mode) {
+      case mlir::ktdf::TransferMode::Copy:
+        break;
+      case mlir::ktdf::TransferMode::Splat:
+        send_value = scheduler::emitSplatShuffle(
+            rewriter, data_transfer_op.getLoc(), send_value,
+            vector_type.getNumElements());
+        break;
+      case mlir::ktdf::TransferMode::ZeroPadBack:
+      case mlir::ktdf::TransferMode::ZeroPadFront:
+        send_value = scheduler::emitZeroPadShuffle(
+            rewriter, data_transfer_op.getLoc(), send_value,
+            vector_type.getNumElements(),
+            transfer_mode == mlir::ktdf::TransferMode::ZeroPadFront);
+        break;
     }
 
     // Resolve the destination unit from the FIFO dest attribute

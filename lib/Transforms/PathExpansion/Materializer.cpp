@@ -153,13 +153,13 @@ PathExpansionMaterializer::materializeSide(const TransferSide& side,
 
 void PathExpansionMaterializer::createDataTransfer(
     mlir::Location loc, MaterializedSide source, MaterializedSide dest,
-    mlir::Operation* template_op) {
+    mlir::Operation* template_op, mlir::ktdf::TransferMode transfer_mode) {
   mlir::AffineMap source_map =
       canonicalizeMapAndIndices(source.map, source.indices);
   mlir::AffineMap dest_map = canonicalizeMapAndIndices(dest.map, dest.indices);
   auto transfer = mlir::ktdf::DataTransferOp::create(
       builder_, loc, source.value, source_map, source.indices, source.sizes,
-      dest.value, dest_map, dest.indices, dest.sizes);
+      dest.value, dest_map, dest.indices, dest.sizes, transfer_mode);
   if (template_op)
     transfer->setDiscardableAttrs(template_op->getRawDictionaryAttrs());
 }
@@ -585,7 +585,7 @@ bool PathExpansionMaterializer::tryAdaptDataTransferOp(
       transfer_op.getLoc(),
       materializeSide(transfer_info->source, transfer_op.getSource()),
       materializeSide(transfer_info->dest, transfer_op.getDestination()),
-      transfer_info->template_op);
+      transfer_info->template_op, transfer_info->transfer_mode);
 
   return true;
 }
@@ -737,7 +737,7 @@ void PathExpansionMaterializer::emitSyntheticTransfer(
 
   createDataTransfer(loc, materializeSide(transfer_info.source, {}),
                      materializeSide(transfer_info.dest, {}),
-                     transfer_info.template_op);
+                     transfer_info.template_op, transfer_info.transfer_mode);
 }
 
 }  // namespace scheduler

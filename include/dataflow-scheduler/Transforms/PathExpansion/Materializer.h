@@ -102,10 +102,11 @@ class PathExpansionMaterializer {
   MaterializedSide materializeSide(const TransferSide& side,
                                    mlir::Value original_operand);
 
-  /// Create a data_transfer from \p source to \p dest, copying the
-  /// discardable attributes of \p template_op if it is set.
+  /// Create a data_transfer from \p source to \p dest in \p transfer_mode,
+  /// copying the discardable attributes of \p template_op if it is set.
   void createDataTransfer(mlir::Location loc, MaterializedSide source,
-                          MaterializedSide dest, mlir::Operation* template_op);
+                          MaterializedSide dest, mlir::Operation* template_op,
+                          mlir::ktdf::TransferMode transfer_mode);
 
   /// Materialize a loop node by creating an scf.for operation
   mlir::scf::ForOp materializeLoopNode(const LoopNode& loop_node);

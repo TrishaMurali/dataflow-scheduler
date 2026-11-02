@@ -80,45 +80,77 @@ auto isUsedInRegion(Value value, Region& region) -> bool {
 
 }  // namespace
 
-namespace {
-
-/// Name of the discardable attribute recording how a data transfer fills its
-/// destination, and the modes that widen it.
-constexpr StringLiteral kTransferModeAttrName = "transfer_mode";
-constexpr StringLiteral kSplatTransferMode = "splat";
-constexpr StringLiteral kPadTransferMode = "pad";
-
-StringRef getTransferMode(ktdf::DataTransferOp transfer) {
-  auto mode = llvm::dyn_cast_if_present<StringAttr>(
-      transfer->getDiscardableAttr(kTransferModeAttrName));
-  return mode ? mode.getValue() : StringRef();
-}
-
-}  // namespace
-
-void mlir::ktdf::markSplatTransfer(ktdf::DataTransferOp transfer) {
-  transfer->setDiscardableAttr(
-      kTransferModeAttrName,
-      StringAttr::get(transfer->getContext(), kSplatTransferMode));
-}
-
-auto mlir::ktdf::isSplatTransfer(ktdf::DataTransferOp transfer) -> bool {
-  return getTransferMode(transfer) == kSplatTransferMode;
-}
-
-auto mlir::ktdf::isBroadcastTransfer(ktdf::DataTransferOp transfer) -> bool {
-  StringRef mode = getTransferMode(transfer);
-  return mode == kSplatTransferMode || mode == kPadTransferMode;
-}
-
-auto mlir::ktdf::setInnermostStaticSourceSize(ktdf::DataTransferOp transfer,
+auto mlir::ktdf::setInnermostStaticSourceSize(RewriterBase& rewriter,
+                                              ktdf::DataTransferOp transfer,
                                               int64_t size) -> bool {
   auto sizes = transfer.getStaticSourceSizesArray();
   if (!sizes || sizes->empty()) return false;
 
   SmallVector<int64_t> new_sizes(*sizes);
   new_sizes.back() = size;
-  transfer.setStaticSourceSizes(ArrayRef<int64_t>(new_sizes));
+  rewriter.modifyOpInPlace(transfer, [&] {
+    transfer.setStaticSourceSizes(ArrayRef<int64_t>(new_sizes));
+  });
+  return true;
+}
+
+namespace {
+
+/// Returns the result of `ktdf.private` that @p private_result yields, or
+/// nullptr if it is not a result of one.
+auto getPrivateYielded(Value private_result) -> OpResult {
+  auto private_op = private_result.getDefiningOp<ktdf::PrivateOp>();
+  if (!private_op) return nullptr;
+  const auto index = cast<OpResult>(private_result).getResultNumber();
+  return dyn_cast<OpResult>(private_op.getYieldOp().getOperand(index));
+}
+
+}  // namespace
+
+auto mlir::ktdf::resizePrivateBuffer(RewriterBase& rewriter,
+                                     Value private_result,
+                                     ArrayRef<int64_t> shape) -> bool {
+  const auto yielded = getPrivateYielded(private_result);
+  auto alloc_op = yielded ? yielded.getDefiningOp<memref::AllocOp>() : nullptr;
+  if (!alloc_op) return false;
+
+  const auto type = alloc_op.getType();
+  if (type.getShape() == shape) return true;
+  const auto new_type =
+      MemRefType::get(shape, type.getElementType(), MemRefLayoutAttrInterface(),
+                      type.getMemorySpace());
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(alloc_op);
+  rewriter.replaceOpWithNewOp<memref::AllocOp>(alloc_op, new_type);
+  rewriter.modifyOpInPlace(private_result.getDefiningOp(),
+                           [&] { private_result.setType(new_type); });
+  return true;
+}
+
+auto mlir::ktdf::resizePrivateFifoSlot(RewriterBase& rewriter,
+                                       Value private_result,
+                                       int64_t num_elements) -> bool {
+  const auto yielded = getPrivateYielded(private_result);
+  auto alloc_op =
+      yielded ? yielded.getDefiningOp<ktdf::FifoAllocateOp>() : nullptr;
+  if (!alloc_op) return false;
+
+  const auto slot = cast<ktdf::FifoSlotType>(yielded.getType());
+  if (slot.getNumElements() == num_elements) return true;
+  const auto new_slot =
+      ktdf::FifoSlotType::get(slot.getContext(), slot.getSrc(), slot.getDest(),
+                              num_elements, slot.getElementType());
+
+  // Only the one result changes type; the others are handed on as they were.
+  SmallVector<Type> slots(alloc_op->getResultTypes());
+  slots[yielded.getResultNumber()] = new_slot;
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(alloc_op);
+  rewriter.replaceOpWithNewOp<ktdf::FifoAllocateOp>(alloc_op, slots,
+                                                    alloc_op.getOperands());
+  rewriter.modifyOpInPlace(private_result.getDefiningOp(),
+                           [&] { private_result.setType(new_slot); });
   return true;
 }
 

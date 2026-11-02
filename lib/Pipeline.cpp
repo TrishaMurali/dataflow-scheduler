@@ -94,6 +94,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // Path expansion materializes the stages and their units, which is what says
   // whether an indirect address buffer fill is on a memory its unit can read.
   pm.addPass(createIndirectAddrBufFillLegalizationPass());
+  pm.addPass(createAccessGranularityLegalizationPass());
   pm.addPass(createScalarBroadcastLegalizationPass());
   pm.addPass(createSplatLegalizationPass());
   pm.addPass(createNormalizeSCFForLoopsPass());

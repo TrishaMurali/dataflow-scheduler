@@ -82,7 +82,7 @@ module {
           // shuffle rep=16 instead of loading 1 element and rep=32.
           ktdf.data_transfer from %alloc[%c0] size [1]
                              to %fifo#0 size [32]
-                             {transfer_mode = "splat"}
+                             {transfer_mode = #ktdf.transfer_mode<splat>}
               : memref<256xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
         } {loop_type = #ktdf.loop_type<parallel_loop>}
       }

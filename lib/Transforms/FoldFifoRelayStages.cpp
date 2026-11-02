@@ -201,6 +201,22 @@ struct Anchor {
   return merged;
 }
 
+/// Returns the transfer mode of the transfer that composes @p in and @p out ,
+/// or std::nullopt if both change sizes.
+[[nodiscard]] auto mergeTransferMode(mlir::ktdf::DataTransferOp in,
+                                     mlir::ktdf::DataTransferOp out)
+    -> std::optional<mlir::ktdf::TransferMode> {
+  const auto in_mode = in.getTransferMode();
+  const auto out_mode = out.getTransferMode();
+  if (in_mode == mlir::ktdf::TransferMode::Copy) {
+    return out_mode;
+  }
+  if (out_mode == mlir::ktdf::TransferMode::Copy) {
+    return in_mode;
+  }
+  return std::nullopt;
+}
+
 /// Merges the applicable units of @p target and @p donor . Returns
 /// std::nullopt if both are set and do not intersect.
 [[nodiscard]] auto mergeUnits(mlir::ktdf::StageOp target,
@@ -282,6 +298,10 @@ struct Anchor {
                                                std::get<1>(sizes));
       })) {
     return reject("FIFO slot sizes do not match");
+  }
+
+  if (!mergeTransferMode(relay.in, relay.out)) {
+    return reject("both transfers change sizes");
   }
 
   auto attrs = mergeAttrs(relay.in, relay.out);
@@ -419,7 +439,8 @@ void foldRelay(mlir::RewriterBase& rewriter, Relay relay, bool into_producer,
       relay.in.getSourceIndices(), relay.in.getMixedSourceSizes(),
       relay.out.getDestination(),
       relay.out.getDestMap().value_or(mlir::AffineMap{}),
-      relay.out.getDestIndices(), relay.out.getMixedDestSizes());
+      relay.out.getDestIndices(), relay.out.getMixedDestSizes(),
+      *mergeTransferMode(relay.in, relay.out));
   transfer->setDiscardableAttrs(attrs.getDictionary(rewriter.getContext()));
   rewriter.eraseOp(relay.in);
   rewriter.eraseOp(relay.out);

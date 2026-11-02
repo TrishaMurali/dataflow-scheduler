@@ -247,6 +247,37 @@ mlir::Value emitSplatShuffle(mlir::OpBuilder& builder, mlir::Location loc,
                      dst_elements / lanes);
 }
 
+mlir::Value emitZeroPadShuffle(mlir::OpBuilder& builder, mlir::Location loc,
+                               mlir::Value src_vec, int64_t dst_elements,
+                               bool pad_front) {
+  auto vec_type = mlir::cast<mlir::VectorType>(src_vec.getType());
+  const int64_t lanes = vec_type.getNumElements();
+  assert(lanes <= dst_elements &&
+         "zero-pad destination width must not be below the source width");
+
+  // Index -1 selects the first pad operand, which is the zero.
+  llvm::SmallVector<mlir::Attribute> indices;
+  indices.reserve(dst_elements);
+  const auto pad = [&] {
+    indices.append(dst_elements - lanes, builder.getI32IntegerAttr(-1));
+  };
+  if (pad_front) pad();
+  for (int64_t i = 0; i < lanes; ++i)
+    indices.push_back(builder.getI32IntegerAttr(static_cast<int32_t>(i)));
+  if (!pad_front) pad();
+
+  const mlir::Type elem_type = vec_type.getElementType();
+  const mlir::Value zero = mlir::arith::ConstantOp::create(
+      builder, loc, elem_type, builder.getZeroAttr(elem_type));
+  auto result_type = mlir::VectorType::get({dst_elements}, elem_type);
+  return mlir::vectorchain::ShuffleOp::create(
+             builder, loc, result_type, src_vec,
+             /*variable=*/mlir::ValueRange{}, /*pad=*/mlir::ValueRange{zero},
+             /*mask=*/nullptr, /*dbgName=*/nullptr,
+             builder.getArrayAttr(indices), builder.getI32IntegerAttr(1))
+      .getOutput();
+}
+
 mlir::MemRefType memRefTypeFor(mlir::Type type, mlir::Attribute memory_space) {
   auto shaped = llvm::dyn_cast<mlir::ShapedType>(type);
   if (!shaped || !shaped.hasStaticShape()) return nullptr;

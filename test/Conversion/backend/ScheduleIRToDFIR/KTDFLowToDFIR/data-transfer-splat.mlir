@@ -1,6 +1,6 @@
 // RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(ktdflowering-to-dfir)" %s | FileCheck %s
 
-// Verify that ktdf.data_transfer with transfer_mode="splat" produces:
+// Verify that ktdf.data_transfer with a splat transfer mode produces:
 //   1. agen.vector_load with the SOURCE size vector (not dest size)
 //   2. vectorchain.shuffle to broadcast to dest size
 //   3. dataflow.send using the shuffle result (not the load result)
@@ -35,7 +35,7 @@ module {
           // Source size [1], dest size [64]: splat 1 element to 64
           ktdf.data_transfer from %alloc[%c0] size [1]
                              to %fifo#0 size [64]
-                             {transfer_mode = "splat"}
+                             {transfer_mode = #ktdf.transfer_mode<splat>}
               : memref<128xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
         } {loop_type = #ktdf.loop_type<parallel_loop>}
       }
