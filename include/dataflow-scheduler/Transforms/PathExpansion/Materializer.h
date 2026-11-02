@@ -76,12 +76,13 @@ class PathExpansionMaterializer {
   mlir::Operation* getMaterializedOp(const PipelineTreeNode& node) const;
 
  private:
-  /// Struct to hold materialized transfer parameters
-  struct MaterializedTransferParams {
-    llvm::SmallVector<mlir::Value> source_indices;
-    llvm::SmallVector<mlir::OpFoldResult> source_sizes;
-    llvm::SmallVector<mlir::Value> dest_indices;
-    llvm::SmallVector<mlir::OpFoldResult> dest_sizes;
+  /// One side of a transfer op to create: the value it reads or writes and
+  /// how it addresses it, all in terms of the new IR.
+  struct MaterializedSide {
+    mlir::Value value;
+    mlir::AffineMap map;
+    llvm::SmallVector<mlir::Value> indices;
+    llvm::SmallVector<mlir::OpFoldResult> sizes;
   };
 
   /// Helper to materialize a value by looking it up in the value map
@@ -95,9 +96,16 @@ class PathExpansionMaterializer {
   mlir::Value getPrivateResourceValue(const PrivateResourceSpec* spec,
                                       size_t slot_index);
 
-  /// Helper to materialize transfer parameters from TransferMaterializationInfo
-  MaterializedTransferParams materializeTransferParams(
-      const TransferMaterializationInfo& info);
+  /// Materialize one side of a planned transfer. The side uses its private
+  /// resource if it has one, and \p original_operand (an operand of the
+  /// template op, may be null) otherwise.
+  MaterializedSide materializeSide(const TransferSide& side,
+                                   mlir::Value original_operand);
+
+  /// Create a data_transfer from \p source to \p dest, copying the
+  /// discardable attributes of \p template_op if it is set.
+  void createDataTransfer(mlir::Location loc, MaterializedSide source,
+                          MaterializedSide dest, mlir::Operation* template_op);
 
   /// Materialize a loop node by creating an scf.for operation
   mlir::scf::ForOp materializeLoopNode(const LoopNode& loop_node);

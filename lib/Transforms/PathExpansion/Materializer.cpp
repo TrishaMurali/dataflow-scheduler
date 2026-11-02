@@ -127,6 +127,8 @@ mlir::OpFoldResult PathExpansionMaterializer::materializeOpFoldResult(
 
 mlir::Value PathExpansionMaterializer::getPrivateResourceValue(
     const PrivateResourceSpec* spec, size_t slot_index) {
+  if (spec->kind == PrivateResourceSpec::Kind::kExistingValue)
+    return materializeValue(spec->existing_value);
   const PrivateResourceAllocation* alloc =
       resource_factory_.getAllocation(spec);
   assert(alloc && "Private resource should have been allocated");
@@ -134,25 +136,32 @@ mlir::Value PathExpansionMaterializer::getPrivateResourceValue(
   return alloc->ssa_values[slot_index];
 }
 
-PathExpansionMaterializer::MaterializedTransferParams
-PathExpansionMaterializer::materializeTransferParams(
-    const TransferMaterializationInfo& info) {
-  MaterializedTransferParams params;
+PathExpansionMaterializer::MaterializedSide
+PathExpansionMaterializer::materializeSide(const TransferSide& side,
+                                           mlir::Value original_operand) {
+  MaterializedSide result;
+  result.value = side.resource
+                     ? getPrivateResourceValue(side.resource, side.slot_index)
+                     : materializeValue(original_operand);
+  result.map = side.map;
+  for (mlir::Value idx : side.indices)
+    result.indices.push_back(materializeValue(idx));
+  for (mlir::OpFoldResult size : side.sizes)
+    result.sizes.push_back(materializeOpFoldResult(size));
+  return result;
+}
 
-  for (mlir::Value idx : info.source_indices) {
-    params.source_indices.push_back(materializeValue(idx));
-  }
-  for (mlir::OpFoldResult size : info.source_sizes) {
-    params.source_sizes.push_back(materializeOpFoldResult(size));
-  }
-  for (mlir::Value idx : info.dest_indices) {
-    params.dest_indices.push_back(materializeValue(idx));
-  }
-  for (mlir::OpFoldResult size : info.dest_sizes) {
-    params.dest_sizes.push_back(materializeOpFoldResult(size));
-  }
-
-  return params;
+void PathExpansionMaterializer::createDataTransfer(
+    mlir::Location loc, MaterializedSide source, MaterializedSide dest,
+    mlir::Operation* template_op) {
+  mlir::AffineMap source_map =
+      canonicalizeMapAndIndices(source.map, source.indices);
+  mlir::AffineMap dest_map = canonicalizeMapAndIndices(dest.map, dest.indices);
+  auto transfer = mlir::ktdf::DataTransferOp::create(
+      builder_, loc, source.value, source_map, source.indices, source.sizes,
+      dest.value, dest_map, dest.indices, dest.sizes);
+  if (template_op)
+    transfer->setDiscardableAttrs(template_op->getRawDictionaryAttrs());
 }
 
 //===----------------------------------------------------------------------===//
@@ -572,34 +581,11 @@ bool PathExpansionMaterializer::tryAdaptDataTransferOp(
     const TransferMaterializationInfo* transfer_info) {
   if (!transfer_info) return false;
 
-  // Get source and destination using helper
-  mlir::Value source =
-      transfer_info->source_private_resource
-          ? getPrivateResourceValue(transfer_info->source_private_resource,
-                                    transfer_info->source_slot_index)
-          : materializeValue(transfer_op.getSource());
-
-  mlir::Value destination =
-      transfer_info->dest_private_resource
-          ? getPrivateResourceValue(transfer_info->dest_private_resource,
-                                    transfer_info->dest_slot_index)
-          : materializeValue(transfer_op.getDestination());
-
-  // Materialize transfer parameters using helper
-  auto params = materializeTransferParams(*transfer_info);
-
-  mlir::AffineMap source_map = canonicalizeMapAndIndices(
-      transfer_info->source_map, params.source_indices);
-  mlir::AffineMap dest_map =
-      canonicalizeMapAndIndices(transfer_info->dest_map, params.dest_indices);
-
-  // Create the adapted transfer operation
-  auto result = mlir::ktdf::DataTransferOp::create(
-      builder_, transfer_op.getLoc(), source, source_map, params.source_indices,
-      params.source_sizes, destination, dest_map, params.dest_indices,
-      params.dest_sizes);
-  result->setDiscardableAttrs(
-      transfer_info->template_op->getRawDictionaryAttrs());
+  createDataTransfer(
+      transfer_op.getLoc(),
+      materializeSide(transfer_info->source, transfer_op.getSource()),
+      materializeSide(transfer_info->dest, transfer_op.getDestination()),
+      transfer_info->template_op);
 
   return true;
 }
@@ -609,74 +595,31 @@ bool PathExpansionMaterializer::tryAdaptIndDataTransferOp(
     const TransferMaterializationInfo* transfer_info) {
   if (!transfer_info) return false;
 
-  bool is_gather = ind_transfer_op.isGather();
-  auto params = materializeTransferParams(*transfer_info);
-
   // Cloned-verbatim operands (common to both gather and scatter).
+  auto materializeIfSet = [&](mlir::Value value) {
+    return value ? materializeValue(value) : mlir::Value{};
+  };
   mlir::Value ind_src_memref =
-      ind_transfer_op.getIndSrcMemref()
-          ? materializeValue(ind_transfer_op.getIndSrcMemref())
-          : mlir::Value{};
+      materializeIfSet(ind_transfer_op.getIndSrcMemref());
   mlir::Value ind_src_index =
-      ind_transfer_op.getIndSrcIndex()
-          ? materializeValue(ind_transfer_op.getIndSrcIndex())
-          : mlir::Value{};
+      materializeIfSet(ind_transfer_op.getIndSrcIndex());
   mlir::Value ind_dst_memref =
-      ind_transfer_op.getIndDstMemref()
-          ? materializeValue(ind_transfer_op.getIndDstMemref())
-          : mlir::Value{};
+      materializeIfSet(ind_transfer_op.getIndDstMemref());
   mlir::Value ind_dst_index =
-      ind_transfer_op.getIndDstIndex()
-          ? materializeValue(ind_transfer_op.getIndDstIndex())
-          : mlir::Value{};
+      materializeIfSet(ind_transfer_op.getIndDstIndex());
 
-  mlir::Value new_dir_src, new_dir_dst;
-  mlir::AffineMap new_dir_src_map, new_dir_dst_map;
-  llvm::SmallVector<mlir::Value> new_dir_src_indices, new_dir_dst_indices;
-  llvm::SmallVector<mlir::OpFoldResult> new_dir_src_sizes, new_dir_dst_sizes;
-
-  if (is_gather) {
-    // dir_dst is the FIFO slot → replace with L1 staging buffer.
-    // dir_src (global memref) is cloned verbatim.
-    new_dir_src = materializeValue(ind_transfer_op.getDirSrc());
-    new_dir_src_map = ind_transfer_op.getDirSrcMapAttr()
-                          ? ind_transfer_op.getDirSrcMapAttr().getValue()
-                          : mlir::AffineMap();
-    for (mlir::Value v : ind_transfer_op.getDirSrcIndices())
-      new_dir_src_indices.push_back(materializeValue(v));
-    for (mlir::OpFoldResult s : ind_transfer_op.getMixedDirSrcSizes())
-      new_dir_src_sizes.push_back(materializeOpFoldResult(s));
-
-    new_dir_dst = getPrivateResourceValue(transfer_info->dest_private_resource,
-                                          transfer_info->dest_slot_index);
-    new_dir_dst_map = transfer_info->dest_map;
-    new_dir_dst_indices = params.dest_indices;
-    new_dir_dst_sizes = params.dest_sizes;
-  } else {
-    // dir_src is the FIFO slot → replace with L1 staging buffer.
-    // dir_dst (global memref) is cloned verbatim.
-    new_dir_src =
-        getPrivateResourceValue(transfer_info->source_private_resource,
-                                transfer_info->source_slot_index);
-    new_dir_src_map = transfer_info->source_map;
-    new_dir_src_indices = params.source_indices;
-    new_dir_src_sizes = params.source_sizes;
-
-    new_dir_dst = materializeValue(ind_transfer_op.getDirDst());
-    new_dir_dst_map = ind_transfer_op.getDirDstMapAttr()
-                          ? ind_transfer_op.getDirDstMapAttr().getValue()
-                          : mlir::AffineMap();
-    for (mlir::Value v : ind_transfer_op.getDirDstIndices())
-      new_dir_dst_indices.push_back(materializeValue(v));
-    for (mlir::OpFoldResult s : ind_transfer_op.getMixedDirDstSizes())
-      new_dir_dst_sizes.push_back(materializeOpFoldResult(s));
-  }
+  // The planner replaces the FIFO side (dir_dst of a gather, dir_src of a
+  // scatter) with a staging buffer and keeps the other side as it is.
+  MaterializedSide dir_src =
+      materializeSide(transfer_info->source, ind_transfer_op.getDirSrc());
+  MaterializedSide dir_dst =
+      materializeSide(transfer_info->dest, ind_transfer_op.getDirDst());
 
   auto result = mlir::ktdf::IndDataTransferOp::create(
       builder_, ind_transfer_op.getLoc(), ind_src_memref, ind_src_index,
-      new_dir_src, new_dir_src_map, new_dir_src_indices, new_dir_src_sizes,
-      ind_dst_memref, ind_dst_index, new_dir_dst, new_dir_dst_map,
-      new_dir_dst_indices, new_dir_dst_sizes);
+      dir_src.value, dir_src.map, dir_src.indices, dir_src.sizes,
+      ind_dst_memref, ind_dst_index, dir_dst.value, dir_dst.map,
+      dir_dst.indices, dir_dst.sizes);
   result->setDiscardableAttrs(
       transfer_info->template_op->getRawDictionaryAttrs());
 
@@ -688,11 +631,11 @@ bool PathExpansionMaterializer::tryAdaptReadFromFifoOp(
     const TransferMaterializationInfo* transfer_info) {
   if (!transfer_info) return false;
 
-  assert(transfer_info->source_private_resource &&
+  assert(transfer_info->source.resource &&
          "read_from_fifo should have source private resource");
 
   mlir::Value new_fifo_slot = getPrivateResourceValue(
-      transfer_info->source_private_resource, transfer_info->source_slot_index);
+      transfer_info->source.resource, transfer_info->source.slot_index);
 
   auto new_read = mlir::ktdf::ReadFromFifoOp::create(
       builder_, read_op.getLoc(), read_op.getResult().getType(), new_fifo_slot);
@@ -706,11 +649,11 @@ bool PathExpansionMaterializer::tryAdaptWriteToFifoOp(
     const TransferMaterializationInfo* transfer_info) {
   if (!transfer_info) return false;
 
-  assert(transfer_info->dest_private_resource &&
+  assert(transfer_info->dest.resource &&
          "write_to_fifo should have dest private resource");
 
   mlir::Value new_fifo_slot = getPrivateResourceValue(
-      transfer_info->dest_private_resource, transfer_info->dest_slot_index);
+      transfer_info->dest.resource, transfer_info->dest.slot_index);
 
   mlir::Value data = materializeValue(write_op.getData());
   mlir::ktdf::WriteToFifoOp::create(builder_, write_op.getLoc(), data,
@@ -787,31 +730,14 @@ void PathExpansionMaterializer::emitSyntheticTransfer(
                            ? transfer_info.template_op->getLoc()
                            : builder_.getUnknownLoc();
 
-  assert(transfer_info.source_private_resource &&
+  assert(transfer_info.source.resource &&
          "Synthetic transfer must have source private resource");
-  assert(transfer_info.dest_private_resource &&
+  assert(transfer_info.dest.resource &&
          "Synthetic transfer must have dest private resource");
 
-  mlir::Value source = getPrivateResourceValue(
-      transfer_info.source_private_resource, transfer_info.source_slot_index);
-  mlir::Value destination = getPrivateResourceValue(
-      transfer_info.dest_private_resource, transfer_info.dest_slot_index);
-
-  auto params = materializeTransferParams(transfer_info);
-
-  mlir::AffineMap source_map = canonicalizeMapAndIndices(
-      transfer_info.source_map, params.source_indices);
-  mlir::AffineMap dest_map =
-      canonicalizeMapAndIndices(transfer_info.dest_map, params.dest_indices);
-
-  auto transfer = mlir::ktdf::DataTransferOp::create(
-      builder_, loc, source, source_map, params.source_indices,
-      params.source_sizes, destination, dest_map, params.dest_indices,
-      params.dest_sizes);
-  if (transfer_info.template_op) {
-    transfer->setDiscardableAttrs(
-        transfer_info.template_op->getRawDictionaryAttrs());
-  }
+  createDataTransfer(loc, materializeSide(transfer_info.source, {}),
+                     materializeSide(transfer_info.dest, {}),
+                     transfer_info.template_op);
 }
 
 }  // namespace scheduler

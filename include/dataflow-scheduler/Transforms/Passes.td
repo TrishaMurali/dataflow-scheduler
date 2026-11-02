@@ -634,30 +634,57 @@ def HoistConstantStoragePass : Pass<"hoist-constant-storage", "mlir::func::FuncO
 
 def FoldFifoRelayStagesPass
     : Pass<"fold-fifo-relay-stages", "mlir::ModuleOp"> {
-  let summary = "Fold stages relaying memory to memory through FIFOs";
+  let summary = "Fold transfers relaying memory to memory through FIFOs";
   let description = [{
-    Folds a stage that transfers from memory into FIFO slots, and the stage
-    that transfers out of those slots into memory, into a single stage of
-    memory-to-memory transfers.
+    Folds a transfer from memory into a FIFO slot, and the transfer out of that
+    slot into memory, into a single memory-to-memory transfer. Each such relay
+    folds on its own, so the other transfers of its two stages may go to other
+    stages and between other memories.
 
     Path expansion can only split stages, never merge them, so it expects
     every transfer between two memories in one stage. If no unit can perform
     such a transfer, path expansion splits it again.
 
-    A pair of stages is folded when:
-    - Each holds nothing but transfers, the producer only into FIFO slots and
-      the consumer only out of them.
-    - Every slot is written once by the producer and read once by the
-      consumer, and has no other users.
-    - All slots connect the same pair of resources, all sources are in one
-      memory and all destinations in another.
-    - What goes into each slot is what comes out of it.
-    - The tokens the producer signals are only awaited by the consumer.
-    - The applicable units of the stages intersect, if both have any.
-    - No pair of transfers carries different throttles.
+    A relay can fold when:
+    - Its two stages hold nothing but transfers.
+    - Its slot is written once and read once, by different stages, and has no
+      other users.
+    - Its source and destination are in different memories.
+    - What goes into the slot is what comes out of it (ie fifo-side sizes must match).
+    - Its two transfers do not carry different throttles.
 
-    The folded stage takes the place of the consumer. It awaits the tokens of
-    the producer and those of the consumer that the producer did not signal.
+    The folded transfer goes into one of the two stages, the target, which
+    also awaits what the other stage awaits. The other stage loses its half of
+    the relay, and is erased if left empty. The stages that awaited an erased
+    stage await what it awaited instead.
+
+    Each transfer reads from one place and writes to another. For a memref,
+    the place is its memory. For a FIFO slot, it is the resource that the
+    slot's type names on the stage's side: the slot's source if the stage
+    writes into it, and its destination if the stage reads from it. For
+    example, a stage that writes into `!ktdf.fifo.slot<"MNILU" -> "L1LU", ...>`
+    writes to "MNILU".
+
+    The anchor of a stage is a place that all of its transfers read from, or
+    a place that all of them write to. A stage that reads from DDR and a
+    stage that writes to DDR have different anchors. If the transfers share
+    both the place they read from and the place they write to, a memory wins
+    over a FIFO. If both places are memories, or both are FIFOs, both are
+    anchors.
+
+    The fold must keep what path expansion expects:
+    - The dependencies stay free of cycles.
+    - Each of the two stages that still holds transfers has an anchor.
+    - A stage only gains an anchor that no other stage has.
+    - The stages that await the producer, other than the consumer, still see
+      the source read. The stages that await the consumer still see the
+      destination written.
+    - The applicable units of the stages intersect, if both have any.
+
+    The target is the stage whose fold leaves the other one empty if there is
+    one, then the producer, then the consumer. Afterwards, stages are reordered
+    so that each comes after the stages it awaits, and the dependency tokens
+    are normalized (see `simplify-pipeline`).
 
     Example:
     ```mlir
@@ -685,7 +712,7 @@ def FoldFifoRelayStagesPass
   ];
 
   let statistics = [
-    Statistic<"num_folded", "num-folded", "Number of folded stage pairs">,
+    Statistic<"num_folded", "num-folded", "Number of folded relays">,
   ];
 }
 

@@ -1,7 +1,7 @@
-// A stage that transfers from memory into FIFO slots and the stage that
-// transfers out of them into memory are folded into one stage of
-// memory-to-memory transfers, in place of the consumer. The slots and tokens
-// left without users are dropped.
+// A transfer from memory into a FIFO slot and the transfer out of it into
+// memory are folded into one memory-to-memory transfer. If both stages would
+// be left empty, it goes into the producer, and the emptied consumer is erased.
+// The slots and tokens left without users are dropped.
 
 // RUN: dataflow-scheduler-opt -fold-fifo-relay-stages %s | FileCheck %s
 
@@ -42,10 +42,10 @@ func.func @single_relay(%ddr: memref<1x64xf16, "DDR">) {
   return
 }
 
-// Several relays between the same memories fold together, in the order of the
-// consumer, onto the units both stages can run on. A slot sharing their
+// Several relays between the same memories fold into the producer, in its
+// order, onto the units both stages can run on. A slot sharing their
 // allocation that is not relayed stays, and the folded stage keeps the token
-// the consumer awaits from another stage.
+// the consumer awaits from another stage, so it moves after that stage.
 
 // CHECK-LABEL:   func.func @multiple_relays(
 // CHECK-SAME:        %[[A:[^:]*]]: memref<1x64xf16, "DDR">,
@@ -57,8 +57,8 @@ func.func @single_relay(%ddr: memref<1x64xf16, "DDR">) {
 // CHECK-NEXT:        ktdf.data_transfer from %[[C]]
 // CHECK-NEXT:      }
 // CHECK-NEXT:      ktdf.stage depends_in(%[[OTHER]]) depends_out(none) {
-// CHECK-NEXT:        ktdf.data_transfer from %[[B]][0, 0] size [1, 32] to %{{.*}}[0, 0] size [1, 32] {dataflow_scheduler.throttle = 32 : i64} : memref<1x32xf16, "DDR">, memref<1x32xf16, "L1">
 // CHECK-NEXT:        ktdf.data_transfer from %[[A]][0, 0] size [1, 64] to %{{.*}}[0, 0] size [1, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<1x64xf16, "DDR">, memref<1x64xf16, "L1">
+// CHECK-NEXT:        ktdf.data_transfer from %[[B]][0, 0] size [1, 32] to %{{.*}}[0, 0] size [1, 32] {dataflow_scheduler.throttle = 32 : i64} : memref<1x32xf16, "DDR">, memref<1x32xf16, "L1">
 // CHECK-NEXT:      } {applicable_units = ["MNILU"]}
 // CHECK-NEXT:      ktdf.stage depends_in(none) depends_out(none) {
 // CHECK-NEXT:        ktdf.data_transfer from %{{.*}} size [1, 16]

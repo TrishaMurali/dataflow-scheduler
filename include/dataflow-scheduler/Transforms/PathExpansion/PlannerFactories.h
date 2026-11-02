@@ -52,6 +52,7 @@ namespace scheduler {
 struct PrivateResourceSpec;
 struct PrivateResourceAllocation;
 struct TransferMaterializationInfo;
+struct TransferSide;
 
 //===----------------------------------------------------------------------===//
 // PrivateResourceFactory
@@ -83,6 +84,10 @@ class PrivateResourceFactory {
                                   mlir::Attribute fifo_dest,
                                   llvm::ArrayRef<int64_t> elements_per_slot,
                                   mlir::Type element_type);
+
+  /// Create a spec that stands for \p value, a memref of the original IR.
+  /// Nothing is allocated for it; the materializer uses the value itself.
+  PrivateResourceSpec* createExistingValue(mlir::Value value);
 
   /// Get all resource specs created by this factory
   /// @return Array reference to all owned specs
@@ -120,30 +125,11 @@ class PrivateResourceFactory {
 /// Owns all transfer info objects and provides factory methods
 class TransferInfoFactory {
  public:
-  /// Create transfer from template with intermediate buffer.
-  /// Used when adapting an existing transfer to work with an intermediate
-  /// memory resource. \p template_op must be a DataTransferOp or an
-  /// IndDataTransferOp.
-  /// @param template_op The original transfer operation to adapt
-  /// @param edge The architecture edge this transfer implements
-  /// @param intermediate_resource The intermediate memory resource
-  /// @param current_resource The current stage's resource
-  /// @param intermediate_is_source Whether intermediate is source or dest
-  /// @param buffer_spec The buffer spec for the intermediate resource
-  /// @param builder OpBuilder for creating attributes
-  /// @return Pointer to created transfer info (owned by factory)
-  TransferMaterializationInfo* createFromTemplateWithBuffer(
-      mlir::Operation* template_op,
-      const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
-      ResourceType intermediate_resource, ResourceType current_resource,
-      bool intermediate_is_source, const PrivateResourceSpec* buffer_spec,
-      mlir::OpBuilder& builder);
-
   /// Create transfer from template that preserves both sides of the template.
   /// Indices, sizes and maps are copied verbatim and no private resources are
   /// attached; callers set source/dest private resources afterwards for the
   /// side(s) they want to retarget (e.g. a FIFO slot whose type changes).
-  /// \p template_op must be a DataTransferOp.
+  /// \p template_op must be a DataTransferOp or an IndDataTransferOp.
   /// @param template_op The original transfer operation to adapt
   /// @param edge The architecture edge this transfer implements
   /// @param source_resource The source resource
@@ -153,6 +139,30 @@ class TransferInfoFactory {
       mlir::Operation* template_op,
       const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
       ResourceType source_resource, ResourceType dest_resource);
+
+  /// Make one side of \p transfer (its source if \p source_side) use slot
+  /// \p slot_index of \p spec. A buffer is addressed from index 0 with its
+  /// full shape. A FIFO that replaces a FIFO operand keeps the operand's
+  /// sizes; one that replaces a memref operand gets the slot's size.
+  /// \p transfer must have a DataTransferOp or IndDataTransferOp template.
+  void retargetSide(TransferMaterializationInfo* transfer, bool source_side,
+                    const PrivateResourceSpec* spec, size_t slot_index,
+                    mlir::OpBuilder& builder);
+
+  /// Work out how a transfer addresses slot \p slot_index of \p spec: zero
+  /// indices, the full shape and an identity map for a buffer; only the
+  /// slot's size for a FIFO. Zero indices are created as constants at the
+  /// start of the function containing \p context_op.
+  static TransferSide describePrivateSide(const PrivateResourceSpec* spec,
+                                          size_t slot_index,
+                                          mlir::Operation* context_op,
+                                          mlir::OpBuilder& builder);
+
+  /// Return how \p op, a DataTransferOp or IndDataTransferOp, addresses its
+  /// source (if \p source_side) or its destination: the op's own indices,
+  /// sizes and map. The returned side has no private resource.
+  static TransferSide describeTemplateSide(mlir::Operation* op,
+                                           bool source_side);
 
   /// Create transfer for FIFO operation
   /// Used when adapting FIFO read/write operations to work with path expansion
@@ -170,32 +180,18 @@ class TransferInfoFactory {
       ResourceType source_resource, ResourceType dest_resource,
       const PrivateResourceSpec* fifo_spec, size_t slot_index, bool is_read);
 
-  /// Create synthetic transfer for intermediate stage
-  /// Used when creating new transfer operations for intermediate stages
+  /// Create a transfer, with no template op, that moves data from \p source
+  /// to \p dest. Both sides must have a private resource. A side with no
+  /// sizes moves the whole buffer or FIFO slot, and a buffer side with no map
+  /// is addressed with the identity map.
   /// @param edge The architecture edge this transfer implements
   /// @param source_resource The source resource
   /// @param dest_resource The destination resource
-  /// @param source_spec The source private resource spec
-  /// @param source_slot_index The source slot index
-  /// @param source_indices The source indices
-  /// @param source_sizes The source sizes
-  /// @param source_map The source affine map (from neighboring transfer)
-  /// @param dest_spec The destination private resource spec
-  /// @param dest_slot_index The destination slot index
-  /// @param dest_indices The destination indices
-  /// @param dest_sizes The destination sizes
-  /// @param dest_map The destination affine map (from neighboring transfer)
-  /// @param context MLIR context for creating attributes
   /// @return Pointer to created transfer info (owned by factory)
   TransferMaterializationInfo* createSynthetic(
       const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
       ResourceType source_resource, ResourceType dest_resource,
-      const PrivateResourceSpec* source_spec, size_t source_slot_index,
-      llvm::ArrayRef<mlir::Value> source_indices,
-      llvm::ArrayRef<mlir::OpFoldResult> source_sizes,
-      mlir::AffineMap source_map, const PrivateResourceSpec* dest_spec,
-      size_t dest_slot_index, llvm::ArrayRef<mlir::Value> dest_indices,
-      llvm::ArrayRef<mlir::OpFoldResult> dest_sizes, mlir::AffineMap dest_map,
+      const TransferSide& source, const TransferSide& dest,
       mlir::MLIRContext* context);
 
  private:

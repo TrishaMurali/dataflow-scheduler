@@ -37,12 +37,14 @@ namespace scheduler {
 // Helper functions
 //===----------------------------------------------------------------------===//
 
-/// Helper to create an identity affine map for intermediate buffer accesses
-/// This is used when we need an affine map for a memref buffer but don't have
-/// one from a neighboring transfer (e.g., when the neighbor uses a FIFO)
-static mlir::AffineMap createAffineMapForIntermediateBuffer(
-    const PrivateResourceSpec* buffer, mlir::MLIRContext* context) {
-  return mlir::AffineMap::getMultiDimIdentityMap(buffer->shape.size(), context);
+/// Move \p object into \p owned and return a pointer to it. The factories use
+/// this to keep every object they create alive for as long as they live.
+template <typename T>
+static T* takeOwnership(llvm::SmallVectorImpl<std::unique_ptr<T>>& owned,
+                        std::unique_ptr<T> object) {
+  T* ptr = object.get();
+  owned.push_back(std::move(object));
+  return ptr;
 }
 
 /// Helper to create zero indices for an intermediate buffer
@@ -65,16 +67,16 @@ static void createIndicesForIntermediateBuffer(
   }
 }
 
-/// Helper to derive sizes from a private resource spec
-/// Used to populate source_sizes or dest_sizes when they're empty
+/// Append to \p sizes the size of the whole of \p spec: the shape of a buffer,
+/// or the capacity of slot \p slot_index of a FIFO. Does nothing if \p spec
+/// is null or stands for an existing value.
 static void deriveSizesFromResourceSpec(
     const PrivateResourceSpec* spec, size_t slot_index,
     mlir::MLIRContext* context,
     llvm::SmallVectorImpl<mlir::OpFoldResult>& sizes) {
   if (!spec) return;
 
-  mlir::OpBuilder builder(context);
-
+  mlir::Builder builder(context);
   if (spec->kind == PrivateResourceSpec::Kind::kFifo) {
     // For FIFO, use the specific slot's capacity
     assert(slot_index < spec->elements_per_slot.size() &&
@@ -102,9 +104,7 @@ PrivateResourceSpec* PrivateResourceFactory::createMemoryBuffer(
   spec->shape.assign(shape.begin(), shape.end());
   spec->element_type = element_type;
 
-  PrivateResourceSpec* ptr = spec.get();
-  specs_.push_back(std::move(spec));
-  return ptr;
+  return takeOwnership(specs_, std::move(spec));
 }
 
 PrivateResourceSpec* PrivateResourceFactory::createFifo(
@@ -118,9 +118,22 @@ PrivateResourceSpec* PrivateResourceFactory::createFifo(
                                  elements_per_slot.end());
   spec->element_type = element_type;
 
-  PrivateResourceSpec* ptr = spec.get();
-  specs_.push_back(std::move(spec));
-  return ptr;
+  return takeOwnership(specs_, std::move(spec));
+}
+
+PrivateResourceSpec* PrivateResourceFactory::createExistingValue(
+    mlir::Value value) {
+  auto memref_type = mlir::cast<mlir::MemRefType>(value.getType());
+  auto spec = std::make_unique<PrivateResourceSpec>();
+  spec->kind = PrivateResourceSpec::Kind::kExistingValue;
+  spec->existing_value = value;
+  spec->memory_resource =
+      llvm::cast<ResourceType>(memref_type.getMemorySpace());
+  spec->shape.assign(memref_type.getShape().begin(),
+                     memref_type.getShape().end());
+  spec->element_type = memref_type.getElementType();
+
+  return takeOwnership(specs_, std::move(spec));
 }
 
 void PrivateResourceFactory::registerAllocation(
@@ -140,132 +153,94 @@ const PrivateResourceAllocation* PrivateResourceFactory::getAllocation(
 // TransferInfoFactory Implementation
 //===----------------------------------------------------------------------===//
 
-namespace {
-/// Per-operand indexing and layout metadata extracted from a template
-/// DataTransferOp or IndDataTransferOp. Used when constructing multi-hop
-/// transfers where one endpoint is an intermediate staging buffer and the other
-/// endpoint preserves the original template's source or destination (FIFO or
-/// memref).
-struct TemplateTransferSides {
-  // Indices/sizes/map for the source side of the template op.
-  llvm::SmallVector<mlir::Value> src_indices;
-  llvm::SmallVector<mlir::OpFoldResult> src_sizes;
-  mlir::AffineMap src_map;
-  // Indices/sizes/map for the dest side of the template op.
-  llvm::SmallVector<mlir::Value> dst_indices;
-  llvm::SmallVector<mlir::OpFoldResult> dst_sizes;
-  mlir::AffineMap dst_map;
-};
-
-static TemplateTransferSides extractTemplateSides(mlir::Operation* op) {
-  TemplateTransferSides s;
+/// Return the source operand of \p op if \p source_side, else its destination
+/// operand, and how the op addresses it. \p op must be a DataTransferOp or an
+/// IndDataTransferOp; for an indirect transfer this is the direct operand,
+/// not the address operand.
+static std::pair<mlir::Value, TransferSide> getTemplateOperand(
+    mlir::Operation* op, bool source_side) {
+  auto mapOf = [](mlir::AffineMapAttr attr) {
+    return attr ? attr.getValue() : mlir::AffineMap();
+  };
+  mlir::Value value;
+  TransferSide side;
   if (auto dt = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op)) {
-    s.src_indices.append(dt.getSourceIndices().begin(),
-                         dt.getSourceIndices().end());
-    s.src_sizes = dt.getMixedSourceSizes();
-    s.src_map = dt.getSourceMapAttr() ? dt.getSourceMapAttr().getValue()
-                                      : mlir::AffineMap();
-    s.dst_indices.append(dt.getDestIndices().begin(),
-                         dt.getDestIndices().end());
-    s.dst_sizes = dt.getMixedDestSizes();
-    s.dst_map = dt.getDestMapAttr() ? dt.getDestMapAttr().getValue()
-                                    : mlir::AffineMap();
-  } else {
-    auto ind = mlir::cast<mlir::ktdf::IndDataTransferOp>(op);
-    s.src_indices.append(ind.getDirSrcIndices().begin(),
-                         ind.getDirSrcIndices().end());
-    s.src_sizes = ind.getMixedDirSrcSizes();
-    s.src_map = ind.getDirSrcMapAttr() ? ind.getDirSrcMapAttr().getValue()
-                                       : mlir::AffineMap();
-    s.dst_indices.append(ind.getDirDstIndices().begin(),
-                         ind.getDirDstIndices().end());
-    s.dst_sizes = ind.getMixedDirDstSizes();
-    s.dst_map = ind.getDirDstMapAttr() ? ind.getDirDstMapAttr().getValue()
-                                       : mlir::AffineMap();
+    mlir::OperandRange indices =
+        source_side ? dt.getSourceIndices() : dt.getDestIndices();
+    value = source_side ? dt.getSource() : dt.getDestination();
+    side.indices.assign(indices.begin(), indices.end());
+    side.sizes =
+        source_side ? dt.getMixedSourceSizes() : dt.getMixedDestSizes();
+    side.map = mapOf(source_side ? dt.getSourceMapAttr() : dt.getDestMapAttr());
+    return {value, std::move(side)};
   }
-  return s;
+  auto ind = mlir::cast<mlir::ktdf::IndDataTransferOp>(op);
+  mlir::OperandRange indices =
+      source_side ? ind.getDirSrcIndices() : ind.getDirDstIndices();
+  value = source_side ? ind.getDirSrc() : ind.getDirDst();
+  side.indices.assign(indices.begin(), indices.end());
+  side.sizes =
+      source_side ? ind.getMixedDirSrcSizes() : ind.getMixedDirDstSizes();
+  side.map =
+      mapOf(source_side ? ind.getDirSrcMapAttr() : ind.getDirDstMapAttr());
+  return {value, std::move(side)};
 }
-}  // namespace
 
-TransferMaterializationInfo* TransferInfoFactory::createFromTemplateWithBuffer(
-    mlir::Operation* template_op,
-    const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
-    ResourceType intermediate_resource, ResourceType current_resource,
-    bool intermediate_is_source, const PrivateResourceSpec* buffer_spec,
-    mlir::OpBuilder& builder) {
-  assert((mlir::isa<mlir::ktdf::DataTransferOp>(template_op) ||
-          mlir::isa<mlir::ktdf::IndDataTransferOp>(template_op)) &&
-         "template_op must be a DataTransferOp or IndDataTransferOp");
+TransferSide TransferInfoFactory::describeTemplateSide(mlir::Operation* op,
+                                                       bool source_side) {
+  return getTemplateOperand(op, source_side).second;
+}
 
-  auto sides = extractTemplateSides(template_op);
+TransferSide TransferInfoFactory::describePrivateSide(
+    const PrivateResourceSpec* spec, size_t slot_index,
+    mlir::Operation* context_op, mlir::OpBuilder& builder) {
+  TransferSide side;
+  side.resource = spec;
+  side.slot_index = slot_index;
+  deriveSizesFromResourceSpec(spec, slot_index, builder.getContext(),
+                              side.sizes);
+  if (spec->kind != PrivateResourceSpec::Kind::kMemoryBuffer) return side;
+  createIndicesForIntermediateBuffer(spec, context_op, builder, side.indices);
+  side.map = mlir::AffineMap::getMultiDimIdentityMap(spec->shape.size(),
+                                                     builder.getContext());
+  return side;
+}
 
-  auto transfer = std::make_unique<TransferMaterializationInfo>();
-  transfer->template_op = template_op;
-  transfer->hop = edge;
-  transfer->source_resource =
-      intermediate_is_source ? intermediate_resource : current_resource;
-  transfer->dest_resource =
-      intermediate_is_source ? current_resource : intermediate_resource;
-
-  if (intermediate_is_source) {
-    // Source is the intermediate buffer; dest side comes from the template.
-    transfer->source_private_resource = buffer_spec;
-    createIndicesForIntermediateBuffer(buffer_spec, template_op, builder,
-                                       transfer->source_indices);
-    deriveSizesFromResourceSpec(buffer_spec, 0, builder.getContext(),
-                                transfer->source_sizes);
-    transfer->source_map =
-        createAffineMapForIntermediateBuffer(buffer_spec, builder.getContext());
-    // Dest: copy indices, sizes, and map from template (may be memref or FIFO;
-    // map is null for FIFO, affine map for memref).
-    transfer->dest_indices = sides.dst_indices;
-    transfer->dest_sizes = sides.dst_sizes;
-    transfer->dest_map = sides.dst_map;
-  } else {
-    // Dest is the intermediate buffer; source side comes from the template.
-    transfer->dest_private_resource = buffer_spec;
-    // Source: copy indices, sizes, and map from template (may be memref or
-    // FIFO; map is null for FIFO, affine map for memref).
-    transfer->source_indices = sides.src_indices;
-    transfer->source_sizes = sides.src_sizes;
-    transfer->source_map = sides.src_map;
-    createIndicesForIntermediateBuffer(buffer_spec, template_op, builder,
-                                       transfer->dest_indices);
-    deriveSizesFromResourceSpec(buffer_spec, 0, builder.getContext(),
-                                transfer->dest_sizes);
-    transfer->dest_map =
-        createAffineMapForIntermediateBuffer(buffer_spec, builder.getContext());
+void TransferInfoFactory::retargetSide(TransferMaterializationInfo* transfer,
+                                       bool source_side,
+                                       const PrivateResourceSpec* spec,
+                                       size_t slot_index,
+                                       mlir::OpBuilder& builder) {
+  mlir::Operation* op = transfer->template_op;
+  mlir::Value operand = getTemplateOperand(op, source_side).first;
+  TransferSide& side = transfer->side(source_side);
+  // A FIFO operand replaced by another FIFO keeps its indices and sizes.
+  if (spec->kind == PrivateResourceSpec::Kind::kFifo &&
+      mlir::isa<mlir::ktdf::FifoSlotType>(operand.getType())) {
+    side.resource = spec;
+    side.slot_index = slot_index;
+    return;
   }
-
-  TransferMaterializationInfo* result = transfer.get();
-  transfers_.push_back(std::move(transfer));
-  return result;
+  side = describePrivateSide(spec, slot_index, op, builder);
 }
 
 TransferMaterializationInfo* TransferInfoFactory::createFromTemplate(
     mlir::Operation* template_op,
     const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
     ResourceType source_resource, ResourceType dest_resource) {
-  assert(mlir::isa<mlir::ktdf::DataTransferOp>(template_op) &&
-         "template_op must be a DataTransferOp");
-
-  auto sides = extractTemplateSides(template_op);
+  assert((mlir::isa<mlir::ktdf::DataTransferOp, mlir::ktdf::IndDataTransferOp>(
+             template_op)) &&
+         "template_op must be a DataTransferOp or IndDataTransferOp");
 
   auto transfer = std::make_unique<TransferMaterializationInfo>();
   transfer->template_op = template_op;
   transfer->hop = edge;
   transfer->source_resource = source_resource;
   transfer->dest_resource = dest_resource;
-  transfer->source_indices = sides.src_indices;
-  transfer->source_sizes = sides.src_sizes;
-  transfer->source_map = sides.src_map;
-  transfer->dest_indices = sides.dst_indices;
-  transfer->dest_sizes = sides.dst_sizes;
-  transfer->dest_map = sides.dst_map;
+  transfer->source = describeTemplateSide(template_op, /*source_side=*/true);
+  transfer->dest = describeTemplateSide(template_op, /*source_side=*/false);
 
-  TransferMaterializationInfo* result = transfer.get();
-  transfers_.push_back(std::move(transfer));
-  return result;
+  return takeOwnership(transfers_, std::move(transfer));
 }
 
 TransferMaterializationInfo* TransferInfoFactory::createFromFifoOp(
@@ -279,70 +254,42 @@ TransferMaterializationInfo* TransferInfoFactory::createFromFifoOp(
   transfer->source_resource = source_resource;
   transfer->dest_resource = dest_resource;
 
-  // Link the FIFO spec to the appropriate side
-  if (is_read) {
-    transfer->source_private_resource = fifo_spec;
-    transfer->source_slot_index = slot_index;
-    // Dest is memref, source is FIFO - no maps needed (will be set later when
-    // we have indices)
-  } else {
-    transfer->dest_private_resource = fifo_spec;
-    transfer->dest_slot_index = slot_index;
-    // Source is memref, dest is FIFO - no maps needed (will be set later when
-    // we have indices)
-  }
+  // The FIFO is the source of a read_from_fifo and the destination of a
+  // write_to_fifo. FIFO ops have no indices, sizes or maps, so those stay
+  // empty on both sides.
+  TransferSide& fifo_side = transfer->side(/*source_side=*/is_read);
+  fifo_side.resource = fifo_spec;
+  fifo_side.slot_index = slot_index;
 
-  // Note: FIFO operations don't have indices and sizes - they work with tensors
-  // The indices and sizes will remain empty for these operations
-  // Affine maps will be set to null (no subscripts for FIFO side)
-
-  TransferMaterializationInfo* result = transfer.get();
-  transfers_.push_back(std::move(transfer));
-  return result;
+  return takeOwnership(transfers_, std::move(transfer));
 }
 
 TransferMaterializationInfo* TransferInfoFactory::createSynthetic(
     const scheduler::arch_view::RoutingGraph::EdgeInfo& edge,
     ResourceType source_resource, ResourceType dest_resource,
-    const PrivateResourceSpec* source_spec, size_t source_slot_index,
-    llvm::ArrayRef<mlir::Value> source_indices,
-    llvm::ArrayRef<mlir::OpFoldResult> source_sizes, mlir::AffineMap source_map,
-    const PrivateResourceSpec* dest_spec, size_t dest_slot_index,
-    llvm::ArrayRef<mlir::Value> dest_indices,
-    llvm::ArrayRef<mlir::OpFoldResult> dest_sizes, mlir::AffineMap dest_map,
+    const TransferSide& source, const TransferSide& dest,
     mlir::MLIRContext* context) {
+  assert(source.resource && dest.resource &&
+         "Synthetic transfer must have private resources on both sides");
+
   auto transfer = std::make_unique<TransferMaterializationInfo>();
-  transfer->template_op = nullptr;  // Synthetic transfer, no template
   transfer->hop = edge;
   transfer->source_resource = source_resource;
   transfer->dest_resource = dest_resource;
-  transfer->source_private_resource = source_spec;
-  transfer->source_slot_index = source_slot_index;
-  transfer->source_indices.append(source_indices.begin(), source_indices.end());
-  transfer->source_sizes.append(source_sizes.begin(), source_sizes.end());
-  transfer->dest_private_resource = dest_spec;
-  transfer->dest_slot_index = dest_slot_index;
-  transfer->dest_indices.append(dest_indices.begin(), dest_indices.end());
-  transfer->dest_sizes.append(dest_sizes.begin(), dest_sizes.end());
+  transfer->source = source;
+  transfer->dest = dest;
 
-  // Derive sizes from resource specs if empty
-  if (transfer->dest_sizes.empty() && dest_spec) {
-    deriveSizesFromResourceSpec(dest_spec, dest_slot_index, context,
-                                transfer->dest_sizes);
+  // Fill in what a side leaves unset with the whole buffer or FIFO slot.
+  for (TransferSide* side : {&transfer->source, &transfer->dest}) {
+    if (side->sizes.empty())
+      deriveSizesFromResourceSpec(side->resource, side->slot_index, context,
+                                  side->sizes);
+    if (!side->map && side->resource->kind != PrivateResourceSpec::Kind::kFifo)
+      side->map = mlir::AffineMap::getMultiDimIdentityMap(
+          side->resource->shape.size(), context);
   }
 
-  if (transfer->source_sizes.empty() && source_spec) {
-    deriveSizesFromResourceSpec(source_spec, source_slot_index, context,
-                                transfer->source_sizes);
-  }
-
-  // Use the affine maps passed from neighboring transfers
-  transfer->source_map = source_map;
-  transfer->dest_map = dest_map;
-
-  TransferMaterializationInfo* result = transfer.get();
-  transfers_.push_back(std::move(transfer));
-  return result;
+  return takeOwnership(transfers_, std::move(transfer));
 }
 
 }  // namespace scheduler

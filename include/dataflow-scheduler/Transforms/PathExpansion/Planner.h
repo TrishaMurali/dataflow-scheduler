@@ -62,14 +62,18 @@ struct PrivateResourceAllocation;
 struct PrivateResourceSpec {
   enum class Kind {
     kUnknown,
-    kMemoryBuffer,  // Allocate a memref in the specified memory space
-    kFifo,          // Allocate a FIFO with the specified type
+    kMemoryBuffer,   // Allocate a memref in the specified memory space
+    kFifo,           // Allocate a FIFO with the specified type
+    kExistingValue,  // Use a value of the original IR, allocate nothing
   };
 
   Kind kind = Kind::kUnknown;
 
-  // For Memory Buffer:
+  // For Memory Buffer and Existing Value:
   ResourceType memory_resource;
+
+  // For Existing Value: the original value, mapped through the materializer.
+  mlir::Value existing_value;
 
   // For Fifo:
   mlir::Attribute fifo_src;
@@ -102,6 +106,23 @@ struct PrivateResourceAllocation {
 
 // Factory classes are declared in PlannerFactories.hpp
 
+/// One side of a transfer, its source or its destination: what it reads or
+/// writes and how it addresses it.
+struct TransferSide {
+  // The private resource this side uses. Null to keep the template op's
+  // operand.
+  const PrivateResourceSpec* resource = nullptr;
+  // For a FIFO: which slot to use. Always 0 for a memory buffer.
+  size_t slot_index = 0;
+  // Indices are Values materialized during code generation. Sizes may be
+  // static constants or dynamic SSA values.
+  llvm::SmallVector<mlir::Value> indices;
+  llvm::SmallVector<mlir::OpFoldResult> sizes;
+  // Subscript map. Copied from the template op for adapted stages, or an
+  // identity map for a buffer of a synthetic transfer. Null for a FIFO.
+  mlir::AffineMap map;
+};
+
 /// Information needed to materialize a transfer operation
 struct TransferMaterializationInfo {
   // Template to derive from (can be null for synthetic)
@@ -115,30 +136,14 @@ struct TransferMaterializationInfo {
   ResourceType source_resource;
   ResourceType dest_resource;
 
-  // Pointers to private resource specs for source/dest (nullptr if not a
-  // private resource)
-  const PrivateResourceSpec* source_private_resource = nullptr;
-  const PrivateResourceSpec* dest_private_resource = nullptr;
+  // How the transfer reads its source and writes its destination.
+  TransferSide source;
+  TransferSide dest;
 
-  // For FIFO resources: which slot index to use (0-based)
-  // For memory buffers: always 0 (single SSA value)
-  size_t source_slot_index = 0;
-  size_t dest_slot_index = 0;
-
-  // Indices and sizes for the transfer (captured from template or neighboring
-  // transfers) Indices are stored as Values that will be materialized during
-  // code generation Sizes are stored as OpFoldResult to support both static
-  // constants and dynamic SSA values
-  llvm::SmallVector<mlir::Value> source_indices;
-  llvm::SmallVector<mlir::OpFoldResult> source_sizes;
-  llvm::SmallVector<mlir::Value> dest_indices;
-  llvm::SmallVector<mlir::OpFoldResult> dest_sizes;
-
-  // Affine maps for source and destination subscripts
-  // These are copied from template transfer ops for adapted stages,
-  // or set to identity maps for synthetic intermediate transfers
-  mlir::AffineMap source_map;
-  mlir::AffineMap dest_map;
+  TransferSide& side(bool source_side) { return source_side ? source : dest; }
+  const TransferSide& side(bool source_side) const {
+    return source_side ? source : dest;
+  }
 
   void print(llvm::raw_ostream& os) const;
   void dump() const;
