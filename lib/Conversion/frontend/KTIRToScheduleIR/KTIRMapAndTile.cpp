@@ -462,6 +462,51 @@ struct BubbleUpSliceThroughReshape
   }
 };
 
+/// Index the innermost dimension of @p operand by the innermost loop rather
+/// than by the constant that addressed its single element.
+///
+/// The map carries that constant on entry because it is how the front end
+/// expresses a broadcast, and what finds the dimension to widen. It stops being
+/// accurate once the operand is widened by a stride-0 slice, which replicates
+/// that element across the dimension, so this is only to be called right after
+/// such a widening. The innermost loop must also be what the dimension spans: a
+/// parallel loop whose extent is the dimension's size, and that no other
+/// dimension of the operand is indexed by. Otherwise the constant is kept,
+/// which reads the same element.
+///
+/// @return Whether the indexing map changed.
+[[nodiscard]] auto legalizeBroadcastMap(mlir::linalg::GenericOp op,
+                                        mlir::OpOperand* operand) -> bool {
+  const auto type =
+      llvm::dyn_cast<mlir::RankedTensorType>(operand->get().getType());
+  const auto map = op.getMatchingIndexingMap(operand);
+  if (!type || map.getNumDims() == 0 || map.getNumResults() == 0 ||
+      map.getNumResults() != type.getRank() ||
+      !llvm::isa<mlir::AffineConstantExpr>(map.getResults().back())) {
+    return false;
+  }
+
+  const auto loop = map.getNumDims() - 1;
+  if (op.getIteratorTypesArray()[loop] != mlir::utils::IteratorType::parallel ||
+      op.getStaticLoopRanges()[loop] != type.getShape().back()) {
+    return false;
+  }
+  if (llvm::any_of(map.getResults().drop_back(), [&](mlir::AffineExpr expr) {
+        return expr.isFunctionOfDim(loop);
+      })) {
+    return false;
+  }
+
+  auto results = llvm::to_vector(map.getResults());
+  results.back() = mlir::getAffineDimExpr(loop, op.getContext());
+  auto maps = op.getIndexingMapsArray();
+  maps[operand->getOperandNumber()] = mlir::AffineMap::get(
+      map.getNumDims(), map.getNumSymbols(), results, op.getContext());
+  op.setIndexingMapsAttr(
+      mlir::Builder(op.getContext()).getAffineMapArrayAttr(maps));
+  return true;
+}
+
 struct BroadcastInputs : mlir::OpRewritePattern<mlir::linalg::GenericOp> {
   explicit BroadcastInputs(mlir::MLIRContext* context,
                            const AttrMapping& mem_space_map)
@@ -572,6 +617,7 @@ struct BroadcastInputs : mlir::OpRewritePattern<mlir::linalg::GenericOp> {
           rewriter, op.getLoc(), input->get(), offsets, sizes, strides);
       input->set(broadcast);
       bubbleUpExtractSlice(rewriter, broadcast, mem_space_map_);
+      std::ignore = legalizeBroadcastMap(op, input);
       changed = true;
     }
 

@@ -335,34 +335,6 @@ def AccessGranularityLegalizationPass
   let constructor = "::scheduler::createAccessGranularityLegalizationPass()";
 }
 
-// TODO(splat-and-access-granularity-legalization-plan): Retire this pass.
-// Memory-side transfer widening and hardware access granularity checking
-// (mustLegalizeLoad) have been moved to access-granularity-legalization.
-// The compute-side indexing map normalization and read_from_fifo type updates
-// that remain here should be folded into splat-legalization or direct
-// front-end lowering; once that is done this pass can be removed entirely.
-def ScalarBroadcastLegalizationPass
-    : Pass<"scalar-broadcast-legalization", "mlir::ModuleOp"> {
-  let summary = "Legalize scalar broadcast inputs to linalg.generic compute ops (deprecated)";
-  let description = [{
-    Detects linalg.generic operations in compute stages that have input
-    indexing maps with a constant in the vector dimension (scalar broadcast).
-    When the data path hardware cannot legally carry sub-vector transfers or
-    the compute unit does not support scalar broadcast semantics natively,
-    this pass legalizes the path by:
-      1. Widening memref-side transfers to the full vector granularity.
-      2. Marking the L1->FIFO transfer as a splat.
-      3. Updating read_from_fifo result type and linalg.generic indexing map
-         to use the full vector identity map.
-
-    Deprecated: memory-side transfer widening is being moved to
-    access-granularity-legalization. This pass will be retired once the
-    remaining compute-side responsibilities are folded into splat-legalization
-    or front-end lowering.
-  }];
-  let constructor = "::scheduler::createScalarBroadcastLegalizationPass()";
-}
-
 def IndirectAddrBufFillLegalizationPass
     : Pass<"indirect-addr-buf-fill-legalization", "mlir::ModuleOp"> {
   let summary = "Stage indirect address buffer fills through a reachable memory";

@@ -23,7 +23,6 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     OrderFifoSlotsByUse.cpp
     ParallelizeLoopsAcrossInstances.cpp
     PathExpansion.cpp
-    ScalarBroadcastLegalization.cpp
     SimplifyLinalg.cpp
     SplatLegalizationPass.cpp
     StripMineSCFForLoops.cpp

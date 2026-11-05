@@ -3,7 +3,6 @@
 // CHECK-DAG:   #[[MAP:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 // CHECK-DAG:   #[[MAP1:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>
 // CHECK-DAG:   #[[MAP2:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d2, d3, d4)>
-// CHECK-DAG:   #[[MAP3:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d2, d3, 0)>
 // CHECK-DAG:   #[[SET:.+]] = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 11 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 // CHECK-DAG:   #[[SET1:.+]] = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 + 11 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 >= 0, d3 >= 0, -d3 + 63 >= 0, d4 >= 0, -d4 + 63 >= 0)>
 
@@ -29,7 +28,7 @@
 // CHECK-DAG:             %[[LOAD_0:.+]] = ktdp_lowering.load %[[ACCTILE_0]][%[[IV0]], %[[IV2]], %[[IV3]], %[[IV4]]] [1, 1, 1, 64] [1, 1, 1, 1] {dataflow_scheduler.throttle = 64 : i64} : !ktdp.access_tile<12x1x64x64xindex> -> tensor<1x1x1x64xf16>
 // CHECK-DAG:             %[[LOAD_1:.+]] = ktdp_lowering.load %[[ACCTILE_1]][%[[IV0]], %[[IV2]], %[[IV3]], 0] [1, 1, 1, 64] [1, 1, 1, 0] {dataflow_scheduler.throttle = 64 : i64} : !ktdp.access_tile<12x1x64x64xindex> -> tensor<1x1x1x64xf16>
 // CHECK-DAG:             %[[VIA:.+]] = ktdf.via["L1"] %[[LOAD_1]] : tensor<1x1x1x64xf16>
-// CHECK:                 %[[GENERIC:.+]] = linalg.generic {indexing_maps = [#[[MAP2]], #[[MAP3]], #[[MAP1]]], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} 
+// CHECK:                 %[[GENERIC:.+]] = linalg.generic {indexing_maps = [#[[MAP2]], #[[MAP2]], #[[MAP1]]], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
 // CHECK-SAME:              ins(%[[LOAD_0]], %[[VIA]] : tensor<1x1x1x64xf16>, tensor<1x1x1x64xf16>)
 // CHECK-SAME:              attrs =  {dataflow_scheduler.throttle = 64 : i64, ktdf_arch.maps_to = "SFU"}
 // CHECK:                 ktdp_lowering.store %[[GENERIC]] into %[[ACCTILE_2]][%[[IV0]], %[[IV1]], %[[IV2]], %[[IV3]], %[[IV4]]] [1, 1, 1, 1, 64] [1, 1, 1, 1, 1] {dataflow_scheduler.throttle = 64 : i64} : tensor<1x1x1x1x64xf16> into !ktdp.access_tile<12x1x1x64x64xindex>

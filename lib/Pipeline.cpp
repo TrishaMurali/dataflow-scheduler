@@ -95,7 +95,6 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // whether an indirect address buffer fill is on a memory its unit can read.
   pm.addPass(createIndirectAddrBufFillLegalizationPass());
   pm.addPass(createAccessGranularityLegalizationPass());
-  pm.addPass(createScalarBroadcastLegalizationPass());
   pm.addPass(createSplatLegalizationPass());
   pm.addPass(createNormalizeSCFForLoopsPass());
   // Canonicalize to get rid of intervening code and single iteration loops
