@@ -58,8 +58,11 @@ auto isTransferTarget(Value memref, Operation* root_op) -> bool;
 auto findStageForUnit(uniform::QueryMapOp query_op,
                       ArrayRef<ktdf::StageOp> stages) -> StageOp;
 
-/// Whether `transfer` extracts a narrower slice out of a wider source, so the
-/// destination is smaller than the data received.
+/// Mark `transfer` as an extract: it takes a narrower slice out of a wider
+/// source, so the destination is smaller than the data received.
+void markExtractTransfer(ktdf::DataTransferOp transfer);
+
+/// Whether `transfer` carries the extract mark `markExtractTransfer` sets.
 auto isExtractTransfer(ktdf::DataTransferOp transfer) -> bool;
 
 /// Overwrite the innermost `static_source_sizes` entry of `transfer` with

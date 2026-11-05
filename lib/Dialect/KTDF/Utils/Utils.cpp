@@ -86,23 +86,17 @@ auto isUsedInRegion(Value value, Region& region) -> bool {
 
 }  // namespace
 
-namespace {
+/// Name of the discardable attribute marking a transfer that extracts a
+/// narrower slice from a wider FIFO slot.  `TransferMode` has no case for it.
+static constexpr StringLiteral kExtractTransferAttrName = "transfer_extract";
 
-/// Name of the discardable attribute recording how a data transfer fills its
-/// destination.
-constexpr StringLiteral kTransferModeAttrName = "transfer_mode";
-constexpr StringLiteral kExtractTransferMode = "extract";
-
-StringRef getTransferMode(ktdf::DataTransferOp transfer) {
-  auto mode = llvm::dyn_cast_if_present<StringAttr>(
-      transfer->getDiscardableAttr(kTransferModeAttrName));
-  return mode ? mode.getValue() : StringRef();
+void mlir::ktdf::markExtractTransfer(ktdf::DataTransferOp transfer) {
+  transfer->setDiscardableAttr(kExtractTransferAttrName,
+                               UnitAttr::get(transfer->getContext()));
 }
 
-}  // namespace
-
 auto mlir::ktdf::isExtractTransfer(ktdf::DataTransferOp transfer) -> bool {
-  return getTransferMode(transfer) == kExtractTransferMode;
+  return transfer->hasAttr(kExtractTransferAttrName);
 }
 
 auto mlir::ktdf::setInnermostStaticSourceSize(RewriterBase& rewriter,

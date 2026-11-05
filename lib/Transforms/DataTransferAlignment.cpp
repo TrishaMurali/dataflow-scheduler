@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <memory>
 #include <numeric>
+#include <optional>
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
@@ -941,13 +942,15 @@ struct TransferOperands {
 
 /// Replaces `op` with a transfer built from `t`, keeping its discardable
 /// attributes. Returns the new op.
-static mlir::ktdf::DataTransferOp replaceTransfer(mlir::ktdf::DataTransferOp op,
-                                                  const TransferOperands& t,
-                                                  mlir::OpBuilder& builder) {
+static mlir::ktdf::DataTransferOp replaceTransfer(
+    mlir::ktdf::DataTransferOp op, const TransferOperands& t,
+    mlir::OpBuilder& builder,
+    std::optional<mlir::ktdf::TransferMode> mode = std::nullopt) {
   builder.setInsertionPoint(op);
   auto new_op = mlir::ktdf::DataTransferOp::create(
       builder, op.getLoc(), op.getSource(), t.src_map, t.src_indices,
-      t.src_sizes, op.getDestination(), t.dst_map, t.dst_indices, t.dst_sizes);
+      t.src_sizes, op.getDestination(), t.dst_map, t.dst_indices, t.dst_sizes,
+      mode.value_or(op.getTransferMode()));
   for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
     new_op->setDiscardableAttr(attr.getName(), attr.getValue());
   op.erase();
@@ -1117,11 +1120,12 @@ static std::pair<mlir::Value, mlir::Value> findRowColIVs(mlir::Operation* op) {
   return {ivs[1], ivs[0]};
 }
 
-/// Replaces `op` with a new DataTransferOp sized [1,1,1,1] with
-/// transfer_mode set to `mode` ("splat" / "extract") or empty for plain
-/// FIFO→memref. The two innermost indices on any ct_local memref operand are
-/// replaced with the row and column IVs from the nested scf.for loops inserted
-/// by insertLoopAroundPipeline, giving direct [0, 0, %row, %col] addressing.
+/// Replaces `op` with a new DataTransferOp sized [1,1,1,1]. `mode` is "splat"
+/// (TransferMode::Splat), "extract" (marked with markExtractTransfer) or empty
+/// for plain FIFO→memref. The two innermost indices on any ct_local memref
+/// operand are replaced with the row and column IVs from the nested scf.for
+/// loops inserted by insertLoopAroundPipeline, giving direct [0, 0, %row, %col]
+/// addressing.
 static void rewriteTransferShrink(
     mlir::ktdf::DataTransferOp op,
     const DataTransferLegality::PipelineAnalysis& pa,
@@ -1171,10 +1175,11 @@ static void rewriteTransferShrink(
   apply_row_col(op.getSource(), t.src_map, t.src_indices, false);
   apply_row_col(op.getDestination(), t.dst_map, t.dst_indices, true);
 
-  auto new_op = replaceTransfer(op, t, builder);
-  if (!mode.empty())
-    new_op->setDiscardableAttr(mlir::StringAttr::get(ctx, "transfer_mode"),
-                               mlir::StringAttr::get(ctx, mode));
+  auto new_op = replaceTransfer(op, t, builder,
+                                mode == "splat"
+                                    ? mlir::ktdf::TransferMode::Splat
+                                    : op.getTransferMode());
+  if (mode == "extract") mlir::ktdf::markExtractTransfer(new_op);
 
   LDBG(1) << "  rewriteTransferShrink(" << mode
           << "): alignment_factor=" << pa.alignment_factor << ": " << new_op;
