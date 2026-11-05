@@ -38,9 +38,12 @@
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr
 // CHECK-SAME:        (%[[FOFFARG:.*]]: index)
-// CHECK:           %[[CBASE:.*]] = arith.constant 1000 : index
-// CHECK:           %[[FBASE:.*]] = arith.addi %[[CBASE]], %[[FOFFARG]]
-// CHECK:           %[[FSTRIDE:.*]] = arith.constant 64 : index
+// CHECK:           %[[CBASE:.*]] = arith.constant 1024 : index
+// CHECK:           %[[FBASE_ELEMS:.*]] = arith.addi %[[CBASE]], %[[FOFFARG]]
+// -- base and stride in 64-byte words: a runtime f16 count is divided by 32
+// CHECK:           %[[C32:.*]] = arith.constant 32 : index
+// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_ELEMS]], %[[C32]] : index
+// CHECK:           %[[FSTRIDE:.*]] = arith.constant 2 : index
 // CHECK:           linalg.generic
 // CHECK:             arith.index_castui %[[FBASE]] : index to i32
 // CHECK:             arith.index_castui %[[FSTRIDE]] : index to i32
@@ -53,9 +56,11 @@
 // CHECK-LABEL: module @local_schedule_0
 // CHECK:         func.func @local_schedule_0
 // CHECK:           %[[C0:.*]] = arith.constant 0 : index
+// CHECK:           %[[ABUFC0:.*]] = arith.constant 0 : index
 // CHECK:           %[[IABC0:.*]] = arith.constant 0 : index
 // CHECK:           %[[IAB:.*]] = ktdp_lowering.construct_memory_view %[[IABC0]], sizes: [2, 32], strides: [32, 1]
 // CHECK-SAME:        "IAB"
+// CHECK:           ktdp.construct_memory_view %[[ABUFC0]], sizes: [2, 32], strides: [32, 1]
 // CHECK:           %[[DATAC0:.*]] = arith.constant 0 : index
 // CHECK:           %[[DATA:.*]] = ktdp.construct_memory_view %[[DATAC0]], sizes: [64, 2, 64]
 // CHECK:           ktdp_lowering.construct_indirect_access_tile
@@ -73,7 +78,7 @@
 #set2 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 
 module {
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     // Orchestrator takes a byte offset to add to the base address.
@@ -86,16 +91,16 @@ module {
 
   module @local_schedule_0 {
     // The data tensor base address is computed as (c_base + %arg0) via arith.addi.
-    // materializeDependency must clone both arith.constant 1000 and arith.addi
+    // materializeDependency must clone both arith.constant 1024 and arith.addi
     // into the new function and into the orchestrator call site.
     func.func @local_schedule_0(%arg0: index) attributes {grid = [1]} {
       %c0     = arith.constant 0      : index
       %c100   = arith.constant 100    : index
-      %c1000  = arith.constant 1000   : index
+      %c1024  = arith.constant 1024   : index
       %c10000 = arith.constant 10000  : index
 
       // Computed base address: static part + runtime offset.
-      %data_base = arith.addi %c1000, %arg0 : index
+      %data_base = arith.addi %c1024, %arg0 : index
 
       // Index memref: constant base, static strides.
       %desc_0 = ktdp.construct_memory_view %c100, sizes: [2, 32], strides: [32, 1] {

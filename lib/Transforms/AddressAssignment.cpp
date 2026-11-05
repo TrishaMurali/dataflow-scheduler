@@ -42,6 +42,7 @@
 #include <mlir/Pass/Pass.h>
 
 #include <memory>
+#include <numeric>
 #include <optional>
 
 #include "dataflow-scheduler/Analysis/Mapping.h"
@@ -261,6 +262,8 @@ struct AllocationResult {
 
 /// Replace memref.alloc with unrealized_conversion_cast using the assigned
 /// address, and remove any corresponding memref.dealloc operations.
+/// @p assigned_address counts elements of the allocation's element type, as a
+/// memory view's offset does.
 void materializeAddressAssignment(AllocOp alloc, size_t assigned_address,
                                   mlir::OpBuilder& builder) {
   builder.setInsertionPoint(alloc);
@@ -388,9 +391,16 @@ struct AddressAssignmentPass
         llvm::cast<ResourceType>(memref_type.getMemorySpace());
     assert(memory_space_attr);
 
-    const auto alignment = alloc.getAlignment().valueOrOne();
+    // The tracker hands out byte addresses, but the address is materialized in
+    // elements, as a memory view's offset counts them. Aligning to an element
+    // as well as to what the allocation asks for makes that division exact.
+    // getSize() has already checked that the element type has a size.
+    const size_t element_bytes =
+        *tryGetSizeInBytes(memref_type.getElementType());
+    const size_t alignment =
+        std::lcm(alloc.getAlignment().valueOrOne().value(), element_bytes);
     auto address_result =
-        tracker.allocate(memory_space_attr, *maybe_size, alignment.value());
+        tracker.allocate(memory_space_attr, *maybe_size, alignment);
 
     if (!address_result) {
       llvm::Error err = address_result.takeError();
@@ -404,12 +414,14 @@ struct AddressAssignmentPass
       return llvm::failure();
     }
 
-    size_t assigned_address = *address_result;
+    assert(*address_result % element_bytes == 0 &&
+           "allocation must be element-aligned");
+    size_t assigned_address = *address_result / element_bytes;
 
-    LDBG(1) << "  Assigned address " << assigned_address
-            << " to allocation: " << alloc;
-    LDBG(1) << "    Size: " << *maybe_size
-            << " bytes, Alignment: " << alignment.value() << " bytes";
+    LDBG(1) << "  Assigned address " << assigned_address << " (byte "
+            << *address_result << ") to allocation: " << alloc;
+    LDBG(1) << "    Size: " << *maybe_size << " bytes, Alignment: " << alignment
+            << " bytes";
 
     // Materialize the address assignment in the IR
     materializeAddressAssignment(alloc, assigned_address, builder);

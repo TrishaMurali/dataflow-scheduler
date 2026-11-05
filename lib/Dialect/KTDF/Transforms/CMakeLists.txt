@@ -27,6 +27,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFTransforms
 
   LINK_LIBS PUBLIC
     DataflowScheduler::ArchViews
+    KTIR::SpyreOpDialect
     DataflowScheduler::KTDFAnalysis
     DataflowSchedulerDialects::KTDFDialect
     DataflowSchedulerDialects::KTDFTransforms

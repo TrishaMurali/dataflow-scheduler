@@ -27,8 +27,11 @@
 
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr
-// CHECK-SAME:        (%[[FSTRIDE:.*]]: index)
-// CHECK:           %[[FBASE:.*]] = arith.constant 1000 : index
+// CHECK-SAME:        (%[[FSTRIDE_ELEMS:.*]]: index)
+// -- base and stride in 64-byte words: a runtime f16 count is divided by 32
+// CHECK:           %[[FBASE:.*]] = arith.constant 32 : index
+// CHECK:           %[[C32:.*]] = arith.constant 32 : index
+// CHECK:           %[[FSTRIDE:.*]] = arith.divsi %[[FSTRIDE_ELEMS]], %[[C32]] : index
 // CHECK:           linalg.generic
 // CHECK:             arith.index_castui %[[FBASE]] : index to i32
 // CHECK:             arith.index_castui %[[FSTRIDE]] : index to i32
@@ -53,7 +56,7 @@
 #set2 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 
 module {
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     // Orchestrator receives (%base_addr: index, %row_stride: index).
@@ -71,7 +74,7 @@ module {
     func.func @local_schedule_0(%arg0: index, %arg1: index) attributes {grid = [1]} {
       %c0     = arith.constant 0      : index
       %c100   = arith.constant 100    : index
-      %c1000  = arith.constant 1000   : index
+      %c1024  = arith.constant 1024   : index
       %c10000 = arith.constant 10000  : index
 
       // Index memref: static strides.
@@ -83,7 +86,7 @@ module {
       // Data memref: stride[0] (the indirect dim D=0) is dynamic (%arg1).
       // The static_strides array has kDynamic at position 0; the other entries
       // are static (4096 at dim 1, 1 at dim 2).
-      %desc_1 = ktdp.construct_memory_view %c1000, sizes: [64, 2, 64], strides: [%arg1, 4096, 1] {
+      %desc_1 = ktdp.construct_memory_view %c1024, sizes: [64, 2, 64], strides: [%arg1, 4096, 1] {
         coordinate_set = #set1,
         memory_space = #ktdp.memory_space<global>
       } : memref<64x2x64xf16>

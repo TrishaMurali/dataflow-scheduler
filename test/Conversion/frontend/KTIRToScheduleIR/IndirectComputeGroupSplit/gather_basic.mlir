@@ -41,8 +41,9 @@
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr()
 // -- base and stride, cloned directly into the function body
-// CHECK:           %[[FBASE:.*]] = arith.constant 1000 : index
-// CHECK:           %[[FSTRIDE:.*]] = arith.constant 64 : index
+// -- base and stride in 64-byte words: 1024 and 64 f16 elements
+// CHECK:           %[[FBASE:.*]] = arith.constant 32 : index
+// CHECK:           %[[FSTRIDE:.*]] = arith.constant 2 : index
 // -- index memref CMV (desc_0 reconstructed)
 // CHECK:           ktdp.construct_memory_view {{.*}}, sizes: [2, 32], strides: [32, 1]
 // CHECK-SAME:        memory_space = #ktdp.memory_space<global>
@@ -107,7 +108,7 @@
 module {
   // Inline device declaration with indirect_address_buffer feature (entry_type = si32).
   // The pass reads the IAB entry type from this node to derive computeType = i32.
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     // Orchestrator child module (no sym_name → identified as orchestrator).
@@ -123,7 +124,7 @@ module {
     func.func @local_schedule_0() attributes {grid = [1]} {
       %c0    = arith.constant 0     : index
       %c100  = arith.constant 100   : index
-      %c1000 = arith.constant 1000  : index
+      %c1024 = arith.constant 1024  : index
       %c10000 = arith.constant 10000 : index
 
       // Index memref: 2×32 si32, base = %c100, stride[0] = 32, stride[1] = 1.
@@ -132,9 +133,9 @@ module {
         memory_space = #ktdp.memory_space<global>
       } : memref<2x32xsi32>
 
-      // Data (embedding) memref: 64×2×64 f16, base = %c1000.
+      // Data (embedding) memref: 64×2×64 f16, base = %c1024.
       // Indirect dimension D = 0 (stride[0] = 64 — the static stride for dim 0).
-      %desc_1 = ktdp.construct_memory_view %c1000, sizes: [64, 2, 64], strides: [64, 4096, 1] {
+      %desc_1 = ktdp.construct_memory_view %c1024, sizes: [64, 2, 64], strides: [64, 4096, 1] {
         coordinate_set = #set1,
         memory_space = #ktdp.memory_space<global>
       } : memref<64x2x64xf16>

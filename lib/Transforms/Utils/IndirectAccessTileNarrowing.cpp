@@ -358,6 +358,11 @@ mlir::LogicalResult pinSourceAccessTile(
     mlir::Block* scope_block, mlir::Value new_iv,
     llvm::SmallVectorImpl<mlir::Operation*>& pre_narrowed, mlir::Location loc,
     mlir::MLIRContext* ctx) {
+  // Loads may share one source access tile. Pinning replaces that tile for all
+  // of its users, so a later load sees the already-pinned tile; it must reuse
+  // that pinning rather than pin yet another dimension.
+  llvm::DenseMap<mlir::Operation*, PinnedAccessTile> pinned_by_new_at;
+
   for (mlir::Operation* user : current_op.getResult().getUsers()) {
     auto store = mlir::dyn_cast<mlir::ktdp::StoreOp>(user);
     if (!store || store->getBlock() != scope_block) continue;
@@ -375,9 +380,17 @@ mlir::LogicalResult pinSourceAccessTile(
             mlir::dyn_cast_if_present<mlir::ktdp::ConstructAccessTilesOp>(
                 src_load.getAccessTile().getDefiningOp());
         if (src_at) {
-          auto pinned = pinAndFoldAccessTile(src_at, new_iv, loc, ctx);
+          auto already_pinned = pinned_by_new_at.find(src_at.getOperation());
+          const bool reuse_pinned = already_pinned != pinned_by_new_at.end();
+          mlir::FailureOr<PinnedAccessTile> pinned =
+              reuse_pinned
+                  ? mlir::FailureOr<PinnedAccessTile>(already_pinned->second)
+                  : pinAndFoldAccessTile(src_at, new_iv, loc, ctx);
           if (mlir::failed(pinned)) return mlir::failure();
-          pre_narrowed.push_back(pinned->at.getOperation());
+          if (!reuse_pinned) {
+            pinned_by_new_at.try_emplace(pinned->at.getOperation(), *pinned);
+            pre_narrowed.push_back(pinned->at.getOperation());
+          }
 
           mlir::Type src_elem_type =
               mlir::cast<mlir::RankedTensorType>(src_load.getResult().getType())
@@ -412,8 +425,10 @@ mlir::LogicalResult pinSourceAccessTile(
           }
 
           src_load.erase();
-          src_at.getResult().replaceAllUsesWith(pinned->at.getResult());
-          src_at.erase();
+          if (!reuse_pinned) {
+            src_at.getResult().replaceAllUsesWith(pinned->at.getResult());
+            src_at.erase();
+          }
         }
         continue;
       }

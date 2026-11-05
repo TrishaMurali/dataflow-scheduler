@@ -440,6 +440,173 @@ ktdf::DataTransferOp StageCoarseningBufferCloner::cloneDataTransfer(
   return new_transfer;
 }
 
+ktdf::IndDataTransferOp StageCoarseningBufferCloner::cloneIndDataTransfer(
+    IndDataTransferOp transfer_op, OpBuilder& builder, IRMapping& value_map) {
+  // Get direct source and destination buffers
+  Value dir_src = transfer_op.getDirSrc();
+  Value dir_dst = transfer_op.getDirDst();
+
+  // Map to cloned values
+  if (value_map.contains(dir_src)) {
+    dir_src = value_map.lookup(dir_src);
+  }
+  if (value_map.contains(dir_dst)) {
+    dir_dst = value_map.lookup(dir_dst);
+  }
+
+  // Check if either direct buffer was expanded
+  const BufferExpansionInfo* src_info = nullptr;
+  const BufferExpansionInfo* dst_info = nullptr;
+
+  for (const BufferExpansionInfo* info : expansion_infos_) {
+    Value mapped_buffer = info->buffer;
+    if (value_map.contains(mapped_buffer)) {
+      mapped_buffer = value_map.lookup(mapped_buffer);
+    }
+    if (mapped_buffer == dir_src) {
+      src_info = info;
+    }
+    if (mapped_buffer == dir_dst) {
+      dst_info = info;
+    }
+  }
+
+  if (!src_info && !dst_info) {
+    // No expansion needed
+    return nullptr;
+  }
+
+  LDBG(1)
+      << "  Adjusting indirect data transfer indices for expanded buffer(s)";
+
+  // Build new index lists with loop IV values prepended
+  llvm::SmallVector<Value> new_dir_src_indices;
+  llvm::SmallVector<Value> new_dir_dst_indices;
+
+  // Lambda to compute normalized indices for expanded dimensions
+  auto computeExpandedIndices = [&](const BufferExpansionInfo* info,
+                                    llvm::SmallVector<Value>& indices) {
+    if (!info) return;
+
+    // Prepend loop IV values for expanded dimensions
+    // Need to compute normalized index: (iv - lower_bound) / step
+    for (size_t i = 0; i < info->loop_ivs.size(); ++i) {
+      Value loop_iv = info->loop_ivs[i];
+      Value lower_bound = info->loop_lower_bounds[i];
+      Value step = info->loop_steps[i];
+
+      // Map values if they've been cloned
+      if (value_map.contains(loop_iv)) {
+        loop_iv = value_map.lookup(loop_iv);
+      }
+      if (value_map.contains(lower_bound)) {
+        lower_bound = value_map.lookup(lower_bound);
+      }
+      if (value_map.contains(step)) {
+        step = value_map.lookup(step);
+      }
+
+      // Compute normalized index: (iv - lower_bound) / step
+      Location loc = transfer_op.getLoc();
+      Value offset =
+          arith::SubIOp::create(builder, loc, loop_iv, lower_bound).getResult();
+      Value normalized_idx =
+          arith::DivSIOp::create(builder, loc, offset, step).getResult();
+
+      indices.push_back(normalized_idx);
+    }
+  };
+
+  // Compute expanded indices for direct source
+  computeExpandedIndices(src_info, new_dir_src_indices);
+
+  // Add original direct source indices
+  for (Value idx : transfer_op.getDirSrcIndices()) {
+    Value mapped_idx = idx;
+    if (value_map.contains(idx)) {
+      mapped_idx = value_map.lookup(idx);
+    }
+    new_dir_src_indices.push_back(mapped_idx);
+  }
+
+  // Compute expanded indices for direct destination
+  computeExpandedIndices(dst_info, new_dir_dst_indices);
+
+  // Add original direct destination indices
+  for (Value idx : transfer_op.getDirDstIndices()) {
+    Value mapped_idx = idx;
+    if (value_map.contains(idx)) {
+      mapped_idx = value_map.lookup(idx);
+    }
+    new_dir_dst_indices.push_back(mapped_idx);
+  }
+
+  // Map indirect source/destination memrefs and indices if present
+  Value ind_src_memref = transfer_op.getIndSrcMemref();
+  if (ind_src_memref && value_map.contains(ind_src_memref)) {
+    ind_src_memref = value_map.lookup(ind_src_memref);
+  }
+  Value ind_src_index = transfer_op.getIndSrcIndex();
+  if (ind_src_index && value_map.contains(ind_src_index)) {
+    ind_src_index = value_map.lookup(ind_src_index);
+  }
+  Value ind_dst_memref = transfer_op.getIndDstMemref();
+  if (ind_dst_memref && value_map.contains(ind_dst_memref)) {
+    ind_dst_memref = value_map.lookup(ind_dst_memref);
+  }
+  Value ind_dst_index = transfer_op.getIndDstIndex();
+  if (ind_dst_index && value_map.contains(ind_dst_index)) {
+    ind_dst_index = value_map.lookup(ind_dst_index);
+  }
+
+  // Get the mixed sizes (OpFoldResult) from the original transfer
+  llvm::SmallVector<OpFoldResult> dir_src_sizes =
+      transfer_op.getMixedDirSrcSizes();
+  llvm::SmallVector<OpFoldResult> dir_dst_sizes =
+      transfer_op.getMixedDirDstSizes();
+
+  // Extend the dir_src/dir_dst affine maps with identity dims for the
+  // expansion-prepended indices, in lockstep with new_dir_src_indices /
+  // new_dir_dst_indices growth above.
+  unsigned src_prepend = src_info ? src_info->loop_ivs.size() : 0;
+  unsigned dst_prepend = dst_info ? dst_info->loop_ivs.size() : 0;
+  MLIRContext* ctx = transfer_op->getContext();
+
+  AffineMap new_dir_src_map;
+  if (isa<MemRefType>(dir_src.getType())) {
+    AffineMap orig = transfer_op.getDirSrcMapAttr()
+                         ? transfer_op.getDirSrcMapAttr().getValue()
+                         : builder.getMultiDimIdentityMap(
+                               transfer_op.getDirSrcIndices().size());
+    new_dir_src_map = prependIdentityDims(orig, src_prepend, ctx);
+  }
+  AffineMap new_dir_dst_map;
+  if (isa<MemRefType>(dir_dst.getType())) {
+    AffineMap orig = transfer_op.getDirDstMapAttr()
+                         ? transfer_op.getDirDstMapAttr().getValue()
+                         : builder.getMultiDimIdentityMap(
+                               transfer_op.getDirDstIndices().size());
+    new_dir_dst_map = prependIdentityDims(orig, dst_prepend, ctx);
+  }
+
+  // Prepend a size of 1 for each expansion dimension, matching the prepended
+  // indices above. Each expanded dimension transfers one tile slot at a time.
+  OpFoldResult one = IntegerAttr::get(IndexType::get(ctx), 1);
+  dir_src_sizes.insert(dir_src_sizes.begin(), src_prepend, one);
+  dir_dst_sizes.insert(dir_dst_sizes.begin(), dst_prepend, one);
+
+  auto new_transfer = IndDataTransferOp::create(
+      builder, transfer_op.getLoc(), ind_src_memref, ind_src_index, dir_src,
+      new_dir_src_map, new_dir_src_indices, dir_src_sizes, ind_dst_memref,
+      ind_dst_index, dir_dst, new_dir_dst_map, new_dir_dst_indices,
+      dir_dst_sizes);
+
+  // Copy what the structural builder arguments do not cover.
+  new_transfer->setDiscardableAttrs(transfer_op->getRawDictionaryAttrs());
+
+  return new_transfer;
+}
+
 //===----------------------------------------------------------------------===//
 // Buffer Expansion Analysis - Helper Functions
 //===----------------------------------------------------------------------===//
@@ -543,36 +710,51 @@ mlir::ktdf::analyzeLoopDependencies(llvm::ArrayRef<Value> candidate_buffers,
   for (Value buffer : candidate_buffers) {
     llvm::SmallVector<Value> dependent_ivs;
 
-    // Find all data transfer operations that use this buffer
-    pipeline.walk([&](ktdf::DataTransferOp transfer) {
-      // Check if this transfer uses the buffer
-      if (transfer.getSource() != buffer &&
-          transfer.getDestination() != buffer) {
-        return;
-      }
-
-      // Analyze the indices used in the transfer
-      // For source indices
-      for (Value idx : transfer.getSourceIndices()) {
-        // Check if this index depends on any candidate loop IV
-        for (Value loop_iv : candidate_loop_ivs) {
-          if (isValueDependentOn(idx, loop_iv)) {
-            // Add to dependent IVs if not already present
-            if (llvm::find(dependent_ivs, loop_iv) == dependent_ivs.end()) {
-              dependent_ivs.push_back(loop_iv);
-            }
+    auto checkIndexDependencies = [&](Value idx) {
+      for (Value loop_iv : candidate_loop_ivs) {
+        if (isValueDependentOn(idx, loop_iv)) {
+          if (llvm::find(dependent_ivs, loop_iv) == dependent_ivs.end()) {
+            dependent_ivs.push_back(loop_iv);
           }
         }
       }
+    };
 
-      // For destination indices
-      for (Value idx : transfer.getDestIndices()) {
-        for (Value loop_iv : candidate_loop_ivs) {
-          if (isValueDependentOn(idx, loop_iv)) {
-            if (llvm::find(dependent_ivs, loop_iv) == dependent_ivs.end()) {
-              dependent_ivs.push_back(loop_iv);
-            }
-          }
+    // Find all data transfer operations that use this buffer
+    pipeline.walk([&](Operation* op) {
+      if (auto transfer = dyn_cast<ktdf::DataTransferOp>(op)) {
+        if (transfer.getSource() != buffer &&
+            transfer.getDestination() != buffer) {
+          return;
+        }
+
+        // Analyze the indices used in the transfer
+        for (Value idx : transfer.getSourceIndices()) {
+          checkIndexDependencies(idx);
+        }
+        for (Value idx : transfer.getDestIndices()) {
+          checkIndexDependencies(idx);
+        }
+      } else if (auto ind_transfer = dyn_cast<ktdf::IndDataTransferOp>(op)) {
+        if (ind_transfer.getIndSrcMemref() != buffer &&
+            ind_transfer.getDirSrc() != buffer &&
+            ind_transfer.getIndDstMemref() != buffer &&
+            ind_transfer.getDirDst() != buffer) {
+          return;
+        }
+
+        // Analyze the indices used in the indirect transfer
+        if (Value idx = ind_transfer.getIndSrcIndex()) {
+          checkIndexDependencies(idx);
+        }
+        for (Value idx : ind_transfer.getDirSrcIndices()) {
+          checkIndexDependencies(idx);
+        }
+        if (Value idx = ind_transfer.getIndDstIndex()) {
+          checkIndexDependencies(idx);
+        }
+        for (Value idx : ind_transfer.getDirDstIndices()) {
+          checkIndexDependencies(idx);
         }
       }
     });
@@ -628,9 +810,9 @@ void mlir::ktdf::calculateExpansionInfo(
       // If other operations use a buffer that is a candidate for expansion,
       // we would likely require custom cloners for them as well.
       for (Operation* user : buffer.getUsers()) {
-        assert(isa<ktdf::DataTransferOp>(user) &&
+        assert((isa<ktdf::DataTransferOp, ktdf::IndDataTransferOp>(user)) &&
                "Expected all users of buffers marked for expansion to be "
-               "ktdf::DataTransferOp.");
+               "ktdf::DataTransferOp or ktdf::IndDataTransferOp.");
       }
 
       expansion_infos.push_back(std::move(info));

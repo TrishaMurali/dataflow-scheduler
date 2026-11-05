@@ -60,10 +60,16 @@ auto mlir::ktdf::isTransferTarget(Value memref, Operation* root_op) -> bool {
   }
 
   return root_op
-      ->walk([&](DataTransferOp transfer) {
-        // Check if memref is the destination
-        if (transfer.getDestination() == memref) {
-          return WalkResult::interrupt();
+      ->walk([&](Operation* op) {
+        if (auto transfer = dyn_cast<DataTransferOp>(op)) {
+          if (transfer.getDestination() == memref) {
+            return WalkResult::interrupt();
+          }
+        } else if (auto ind_transfer = dyn_cast<IndDataTransferOp>(op)) {
+          if (ind_transfer.getDirDst() == memref ||
+              ind_transfer.getIndDstMemref() == memref) {
+            return WalkResult::interrupt();
+          }
         }
         return WalkResult::advance();
       })

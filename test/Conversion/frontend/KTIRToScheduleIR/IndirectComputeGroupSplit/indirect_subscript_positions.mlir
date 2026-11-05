@@ -20,7 +20,7 @@
 #set2 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 
 module {
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     func.func @orchestrator() attributes {grid = [1]} {
@@ -51,14 +51,14 @@ module {
     func.func @zero_offset_and_bare() attributes {grid = [1]} {
       %c0     = arith.constant 0     : index
       %c100   = arith.constant 100   : index
-      %c1000  = arith.constant 1000  : index
+      %c1024  = arith.constant 1024  : index
       %c10000 = arith.constant 10000 : index
 
       %desc_0 = ktdp.construct_memory_view %c100, sizes: [2, 32], strides: [32, 1] {
         coordinate_set = #set,
         memory_space = #ktdp.memory_space<global>
       } : memref<2x32xsi32>
-      %desc_1 = ktdp.construct_memory_view %c1000, sizes: [64, 2, 64], strides: [64, 4096, 1] {
+      %desc_1 = ktdp.construct_memory_view %c1024, sizes: [64, 2, 64], strides: [64, 4096, 1] {
         coordinate_set = #set1,
         memory_space = #ktdp.memory_space<global>
       } : memref<64x2x64xf16>
@@ -101,14 +101,14 @@ module {
     func.func @constant_subscript() attributes {grid = [1]} {
       %c0     = arith.constant 0     : index
       %c100   = arith.constant 100   : index
-      %c1000  = arith.constant 1000  : index
+      %c1024  = arith.constant 1024  : index
       %c10000 = arith.constant 10000 : index
 
       %desc_0 = ktdp.construct_memory_view %c100, sizes: [2, 32], strides: [32, 1] {
         coordinate_set = #set,
         memory_space = #ktdp.memory_space<global>
       } : memref<2x32xsi32>
-      %desc_1 = ktdp.construct_memory_view %c1000, sizes: [64, 2, 64], strides: [64, 4096, 1] {
+      %desc_1 = ktdp.construct_memory_view %c1024, sizes: [64, 2, 64], strides: [64, 4096, 1] {
         coordinate_set = #set1,
         memory_space = #ktdp.memory_space<global>
       } : memref<64x2x64xf16>

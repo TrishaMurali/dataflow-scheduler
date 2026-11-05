@@ -33,10 +33,10 @@
 // CHECK-NEXT:           {
 // CHECK-NEXT:             agen.yield
 // CHECK-NEXT:           } : memref<32xindex>, memref<32xindex>
+// CHECK-NEXT:           %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
+// CHECK-NEXT:           %[[QUERY_MAP_1:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_1]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:           dataflow.sync_send %[[QUERY_MAP_1]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:         }
-// CHECK-NEXT:         %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
-// CHECK-NEXT:         %[[QUERY_MAP_1:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_1]], key:%[[VAL_0]]) : index
-// CHECK-NEXT:         dataflow.sync_send %[[QUERY_MAP_1]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:         agen.composite_indirect_load_and_store indirect_src:%[[GET_LOGICAL_MEMORY_VIEW_2]]{{\[}}%[[VAL_1]]] direct_src:%[[GET_LOGICAL_MEMORY_VIEW_1]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]]] direct_dst:%[[ALLOC_0]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]]]
 // CHECK-NEXT:          time_symbols(), load_iv(%[[VAL_3:.*]]:vector<64xf16>)
 // CHECK-NEXT:          {load_direct_time_addr_map = #[[$ATTR_2]], load_indirect_time_addr_map = #[[$ATTR_0]], load_order = #[[$ATTR_3]], load_set = #[[$ATTR_7]], store_direct_time_addr_map = #[[$ATTR_2]], store_indirect_time_addr_map = #[[$ATTR_4]], store_order = #[[$ATTR_3]], store_set = #[[$ATTR_7]], time_order = #[[$ATTR_0]], time_set = #[[$ATTR_5]]}
@@ -175,6 +175,18 @@
 // CHECK-NEXT:     }
 // CHECK-NEXT:     return
 // CHECK-NEXT:   }
+// CHECK-LABEL:   func.func @gather_iab_fill_through_cast_chain() attributes {grid = [2]} {
+// CHECK:           dataflow.program_unit
+// CHECK:             affine.for %[[IV:.*]] = 0 to 32 {
+// CHECK:               scf.if
+// CHECK:                 agen.composite_load_and_store
+// CHECK:                 %[[SELF_MAP:.*]] = uniform.def_immutable_mapping(
+// CHECK-NEXT:            %[[SELF_UNIT:.*]] = uniform.query_map(map:%[[SELF_MAP]]
+// CHECK-NEXT:            dataflow.sync_send %[[SELF_UNIT]] {wait_immediately_for_async_transfers = true} : index
+// CHECK-NEXT:          }
+// CHECK-NEXT:          agen.composite_indirect_load_and_store indirect_src:{{.*}}{{\[}}%[[IV]]]
+
+
 
 
 
@@ -466,6 +478,69 @@ module {
             dir_dst = %staging[%c0, %c0] size [1, 64]
             {dataflow_scheduler.throttle = 64 : i64}
             : memref<32xindex, "IAB">,
+              memref<64x64xf16, strided<[64, 1], offset: ?>, "DDR">,
+              none,
+              memref<1x64xf16, "L1">
+      }
+    }
+    return
+  }
+
+  // -------------------------------------------------------------------
+  // Gather where the IAB fill writes the IAB memory view directly while
+  // the ind_data_transfer reads it through a reinterpret_cast + memref.cast
+  // chain (as produced by bufferization).  The two are different SSA values
+  // that become different get_logical_memory_view ops on the same unit; the
+  // self-sync must still be emitted.
+  // -------------------------------------------------------------------
+  func.func @gather_iab_fill_through_cast_chain() attributes {grid = [2]} {
+    %mnilu0 = dataflow.get_unit {core = 0 : i32, name = "C0-MNILU", type = "MNILU"} : index
+    %mnilu1 = dataflow.get_unit {core = 1 : i32, name = "C1-MNILU", type = "MNILU"} : index
+    %tile_id = ktdp.get_compute_tile_id : index
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %map_mnilu = uniform.def_immutable_mapping([%c0 -> %mnilu0], [%c1 -> %mnilu1]) : index
+    %u_mnilu   = uniform.query_map(map:%map_mnilu, key:%tile_id) : index
+
+    %addr_buf_mv  = ktdp.construct_memory_view %c0, sizes: [32], strides: [1]
+                        {coordinate_set = #ddr_coord_1d, memory_space = #ktdp.memory_space<global>}
+                        : memref<32xindex>
+    %addr_buf_msc = memref.memory_space_cast %addr_buf_mv : memref<32xindex> to memref<32xindex, "DDR">
+    %addr_buf     = memref.reinterpret_cast %addr_buf_msc to offset: [%c0], sizes: [32], strides: [1]
+                        : memref<32xindex, "DDR"> to memref<32xindex, strided<[1], offset: ?>, "DDR">
+
+    %data_mv  = ktdp.construct_memory_view %c0, sizes: [64, 64], strides: [64, 1]
+                    {coordinate_set = #ddr_coord_2d, memory_space = #ktdp.memory_space<global>}
+                    : memref<64x64xf16>
+    %data_msc = memref.memory_space_cast %data_mv : memref<64x64xf16> to memref<64x64xf16, "DDR">
+    %data     = memref.reinterpret_cast %data_msc to offset: [%c0], sizes: [64, 64], strides: [64, 1]
+                    : memref<64x64xf16, "DDR"> to memref<64x64xf16, strided<[64, 1], offset: ?>, "DDR">
+
+    ktdf_lowering.execute_on %u_mnilu {
+      %iab     = ktdp_lowering.construct_memory_view %c0, sizes: [32], strides: [1]
+                     {coordinate_set = #iab_coord_1d, memory_space = "IAB"}
+                     : memref<32xindex, "IAB">
+      %iab_rc  = memref.reinterpret_cast %iab to offset: [0], sizes: [32], strides: [1]
+                     : memref<32xindex, "IAB"> to memref<32xindex, strided<[1]>, "IAB">
+      %iab_cast = memref.cast %iab_rc
+                     : memref<32xindex, strided<[1]>, "IAB"> to memref<32xindex, strided<[1], offset: ?>, "IAB">
+      %staging = memref.alloc() : memref<1x64xf16, "L1">
+      affine.for %iv = 0 to 32 {
+        %eq0 = arith.cmpi eq, %iv, %c0 : index
+        scf.if %eq0 {
+          ktdf.data_transfer
+              from %addr_buf[%c0] size [32]
+              to   %iab[%c0]      size [32]
+              {dataflow_scheduler.throttle = 1 : i64}
+              : memref<32xindex, strided<[1], offset: ?>, "DDR">, memref<32xindex, "IAB">
+        }
+        ktdf.ind_data_transfer
+            ind_src = %iab_cast[%iv]
+            dir_src = %data[%c0, %c0] size [1, 64]
+            ind_dst = none
+            dir_dst = %staging[%c0, %c0] size [1, 64]
+            {dataflow_scheduler.throttle = 64 : i64}
+            : memref<32xindex, strided<[1], offset: ?>, "IAB">,
               memref<64x64xf16, strided<[64, 1], offset: ?>, "DDR">,
               none,
               memref<1x64xf16, "L1">

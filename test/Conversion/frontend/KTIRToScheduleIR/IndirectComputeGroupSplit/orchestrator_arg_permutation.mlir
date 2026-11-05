@@ -39,9 +39,12 @@
 
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr
-// CHECK-SAME:        (%[[FBASE_ARG:.*]]: index, %[[FSTRIDE:.*]]: index)
+// CHECK-SAME:        (%[[FBASE_ARG:.*]]: index, %[[FSTRIDE_ELEMS:.*]]: index)
 // CHECK:           %[[C500:.*]] = arith.constant 500 : index
-// CHECK:           %[[FBASE:.*]] = arith.addi %[[FBASE_ARG]], %[[C500]] : index
+// CHECK:           %[[FBASE_ELEMS:.*]] = arith.addi %[[FBASE_ARG]], %[[C500]] : index
+// -- base and stride in 64-byte words: a runtime f16 count is divided by 32
+// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_ELEMS]], %{{.*}} : index
+// CHECK:           %[[FSTRIDE:.*]] = arith.divsi %[[FSTRIDE_ELEMS]], %{{.*}} : index
 // CHECK:           linalg.generic
 // CHECK:             arith.index_castui %[[FBASE]] : index to i32
 // CHECK:             arith.index_castui %[[FSTRIDE]] : index to i32
@@ -57,7 +60,7 @@
 #set2 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 
 module {
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     // (%count, %row_stride, %base_addr): neither the arity nor the order lines

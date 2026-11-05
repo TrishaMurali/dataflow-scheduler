@@ -18,6 +18,9 @@
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/QueryMapArithCollapse.h"
 
+#include <cstdint>
+#include <limits>
+
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -50,6 +53,13 @@ int64_t evalBinop(mlir::Operation* op, int64_t lhs, int64_t rhs) {
     return rhs == 0 ? 0
                     : static_cast<int64_t>(static_cast<uint64_t>(lhs) /
                                            static_cast<uint64_t>(rhs));
+  if (mlir::isa<mlir::arith::DivSIOp>(op)) {
+    // INT64_MIN / -1 overflows (UB in C++ and in arith.divsi); fold it to 0
+    // like the divide-by-zero case.
+    if (rhs == 0 || (lhs == std::numeric_limits<int64_t>::min() && rhs == -1))
+      return 0;
+    return lhs / rhs;
+  }
   if (mlir::isa<mlir::arith::RemUIOp>(op))
     return rhs == 0 ? 0
                     : static_cast<int64_t>(static_cast<uint64_t>(lhs) %
@@ -177,11 +187,13 @@ mlir::LogicalResult scheduler::collapseArithOverQueryMaps(
                FoldConstIntoQuery<mlir::arith::SubIOp>,
                FoldConstIntoQuery<mlir::arith::MulIOp>,
                FoldConstIntoQuery<mlir::arith::DivUIOp>,
+               FoldConstIntoQuery<mlir::arith::DivSIOp>,
                FoldConstIntoQuery<mlir::arith::RemUIOp>,
                MergeQueriesSameKey<mlir::arith::AddIOp>,
                MergeQueriesSameKey<mlir::arith::SubIOp>,
                MergeQueriesSameKey<mlir::arith::MulIOp>,
                MergeQueriesSameKey<mlir::arith::DivUIOp>,
+               MergeQueriesSameKey<mlir::arith::DivSIOp>,
                MergeQueriesSameKey<mlir::arith::RemUIOp>>(ctx);
   return mlir::applyPatternsGreedily(func, std::move(patterns));
 }

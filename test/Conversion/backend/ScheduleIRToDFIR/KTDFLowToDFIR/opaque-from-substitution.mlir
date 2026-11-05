@@ -15,9 +15,9 @@
 // RUN:   ktdflowering-to-dfir)" | FileCheck %s
 
 // CHECK-LABEL:   func.func @exp() attributes {grid = [2]} {
-// CHECK-NEXT:      %[[C64:.*]] = arith.constant 64 : index
-// CHECK-NEXT:      %[[C128:.*]] = arith.constant 128 : index
-// CHECK-NEXT:      %[[ZERO:.*]] = arith.constant 0 : index
+// CHECK-DAG:       %[[C64:.*]] = arith.constant 64 : index
+// CHECK-DAG:       %[[C128:.*]] = arith.constant 128 : index
+// CHECK-DAG:       %[[ZERO:.*]] = arith.constant 0 : index
 // CHECK:           %[[SFU0:.*]] = dataflow.get_unit {core = 0 : i32, name = "C0-SFU", type = "SFU"} : index
 // CHECK-NEXT:      %[[SFU1:.*]] = dataflow.get_unit {core = 1 : i32, name = "C1-SFU", type = "SFU"} : index
 // CHECK:           %[[REGS:.*]] = dataflow.get_unit {name = "sfu_reg", type = "sfu_reg"} : index

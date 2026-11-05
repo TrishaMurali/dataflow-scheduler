@@ -50,6 +50,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Transforms/Utils/PipelineTreeLegalizer.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/DebugLog.h"

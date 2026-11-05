@@ -11,7 +11,7 @@
 //
 // Expected structural invariants (§7.3):
 //   1. Orchestrator calls @local_schedule_0_idx_to_addr() before
-//      @local_schedule_0(). base (10000) and stride (64) are compile-time
+//      @local_schedule_0(). base (10240) and stride (64) are compile-time
 //      constants here, so idx_to_addr takes no arguments.
 //   2. @local_schedule_0_idx_to_addr module: index-to-address conversion for
 //      the scatter destination addresses (same structure as gather).
@@ -37,8 +37,9 @@
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr()
 // -- base and stride, cloned directly into the function body
-// CHECK:           %[[FBASE:.*]] = arith.constant 10000 : index
-// CHECK:           %[[FSTRIDE:.*]] = arith.constant 64 : index
+// -- base and stride in 64-byte words: 10240 and 64 f16 elements
+// CHECK:           %[[FBASE:.*]] = arith.constant 320 : index
+// CHECK:           %[[FSTRIDE:.*]] = arith.constant 2 : index
 // CHECK:           ktdp.construct_memory_view {{.*}}, sizes: [2, 32], strides: [32, 1]
 // CHECK-SAME:        memory_space = #ktdp.memory_space<global>
 // CHECK-SAME:        memref<2x32xsi32
@@ -89,7 +90,7 @@
 #set2 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 
 module {
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     // Orchestrator child module.
@@ -106,7 +107,7 @@ module {
       %c0     = arith.constant 0      : index
       %c100   = arith.constant 100    : index
       %c1000  = arith.constant 1000   : index
-      %c10000 = arith.constant 10000  : index
+      %c10240 = arith.constant 10240  : index
 
       // Index memref: 2×32 si32.
       %desc_idx = ktdp.construct_memory_view %c100, sizes: [2, 32], strides: [32, 1] {
@@ -120,9 +121,9 @@ module {
         memory_space = #ktdp.memory_space<global>
       } : memref<2x32x2x64xf16>
 
-      // Destination (scatter target) memref: 64×2×64 f16, base = %c10000.
+      // Destination (scatter target) memref: 64×2×64 f16, base = %c10240.
       // Indirect dimension D = 0 (stride[0] = 64 — the static stride for dim 0).
-      %desc_dst = ktdp.construct_memory_view %c10000, sizes: [64, 2, 64], strides: [64, 4096, 1] {
+      %desc_dst = ktdp.construct_memory_view %c10240, sizes: [64, 2, 64], strides: [64, 4096, 1] {
         coordinate_set = #set1,
         memory_space = #ktdp.memory_space<global>
       } : memref<64x2x64xf16>

@@ -69,7 +69,10 @@ def StageCoarseningPass : Pass<"stage-coarsening", "mlir::ModuleOp"> {
            /*default=*/"2",
            "Number of perfectly nested loops to consider for sinking">
   ];
-  let dependentDialects = ["mlir::ktdf::KTDFDialect"];
+  let dependentDialects = [
+    "mlir::ktdf::KTDFDialect",
+    "mlir::spyreop::SpyreOpDialect"
+  ];
 }
 
 def SimplifyPipelinePass : Pass<"simplify-pipeline", "mlir::func::FuncOp"> {

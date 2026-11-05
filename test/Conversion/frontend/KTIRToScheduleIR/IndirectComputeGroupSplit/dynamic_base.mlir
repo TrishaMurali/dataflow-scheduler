@@ -1,7 +1,7 @@
 // Verify the dynamic-base code path (§3.1): the $base CMV's offset is a
 // function argument rather than a compile-time constant.
 //
-// When %c1000 (the data tensor base address) is replaced by a function
+// When %c1024 (the data tensor base address) is replaced by a function
 // argument %arg0 : index, the orchestrator must:
 //   - carry that argument value forward into @local_schedule_0_idx_to_addr(%arg0)
 //   - use it verbatim as the sole call operand — no constant materialisation
@@ -32,8 +32,11 @@
 
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr
-// CHECK-SAME:        (%[[FBASE:.*]]: index)
-// CHECK:           %[[FSTRIDE:.*]] = arith.constant 64 : index
+// CHECK-SAME:        (%[[FBASE_ELEMS:.*]]: index)
+// -- base and stride in 64-byte words: a runtime f16 count is divided by 32
+// CHECK:           %[[C32:.*]] = arith.constant 32 : index
+// CHECK:           %[[FBASE:.*]] = arith.divsi %[[FBASE_ELEMS]], %[[C32]] : index
+// CHECK:           %[[FSTRIDE:.*]] = arith.constant 2 : index
 // CHECK:           linalg.generic
 // CHECK:             arith.index_castui %[[FBASE]] : index to i32
 // CHECK:             arith.index_castui %[[FSTRIDE]] : index to i32
@@ -59,7 +62,7 @@
 #set2 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 
 module {
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     // Orchestrator takes %arg0 as the dynamic base address for the data tensor.

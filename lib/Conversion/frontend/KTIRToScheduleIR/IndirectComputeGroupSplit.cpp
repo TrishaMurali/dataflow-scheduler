@@ -22,7 +22,8 @@
 /// child-module functions:
 ///
 ///   - @<name>_idx_to_addr resolves raw integer indices to flat absolute
-///     addresses and stores them into a global address buffer.
+///     addresses, in units of the words the indirect transfer addresses the
+///     data's memory space in, and stores them into a global address buffer.
 ///   - @<name> loads that buffer into the IAB and performs the actual
 ///     gather/scatter through ktdp_lowering.construct_indirect_access_tile.
 ///
@@ -44,6 +45,8 @@
 //===----------------------------------------------------------------------===//
 
 #include <cstddef>
+#include <cstdint>
+#include <numeric>
 #include <optional>
 #include <string>
 
@@ -257,7 +260,8 @@ static void collectBlockArgDependencies(Value val, IRMapping& mapper,
 //===----------------------------------------------------------------------===//
 
 /// Builds the ktdp.construct_memory_view spanning the whole address buffer,
-/// which lives in global memory at the byte address @p base_offset holds.
+/// which lives in global memory at the offset, in entries, @p base_offset
+/// holds.
 ///
 /// Nothing is threaded between the two halves of the split but that address, so
 /// each rebuilds this view for itself.  Both model it on @p idx_view: the
@@ -336,6 +340,18 @@ struct AddressBufferInfo {
   /// carries the indirect_address_buffer feature.  Used as the memref
   /// memory_space attribute for the IAB view.
   StringAttr iab_mem_space;
+  /// First IAB entry available to the scheduler, i.e. the first one past any
+  /// bytes the arch spec reserves.  The IAB view starts here.  Counted in
+  /// entries, as a memory view's offset is.
+  size_t iab_base;
+  /// Load and store units co-located with the IAB.  They perform the indirect
+  /// transfer, so their word size is the granularity the resolved addresses are
+  /// expressed in.  Null when the device declares no such unit.
+  ktdf_arch::Resource load_unit;
+  ktdf_arch::Resource store_unit;
+  /// The device's mem_space_mapping, from a ktdp memory space to the arch kind
+  /// the load/store features key their word sizes by.  Empty if absent.
+  DenseMap<Attribute, Attribute> mem_space_map;
 };
 
 /// The orchestrator-side state every candidate needs, likewise resolved once.
@@ -378,6 +394,11 @@ struct SplitCandidate {
   /// materializes the constant.  Leaving it folded is what keeps the analysis
   /// from mutating IR that a later check may still reject.
   OpFoldResult stride;
+  /// Byte size of the $base view's element type, and the size in bytes of the
+  /// word the indirect transfer addresses $base's memory space in.  Together
+  /// they convert `base_addr` and `stride` from elements to words.
+  int64_t elem_bytes;
+  int64_t word_size;
   /// The orchestrator's single call to `func`, or null when it makes none.
   func::CallOp call_site;
   /// $ind_addr_buf_dim_positions for the replacement lowering op.
@@ -501,10 +522,39 @@ static FailureOr<AddressBufferInfo> resolveAddressBufferInfo(
   LDBG(1) << "IAB entry type " << entry_type << ", address arithmetic in "
           << compute_type;
 
-  StringAttr iab_mem_space = cast<StringAttr>(iab_node->memory_resource);
-  return AddressBufferInfo{entry_type, compute_type,
-                           memory_tree.getRootOf(*iab_node).memory_resource,
-                           iab_mem_space};
+  AddressBufferInfo info;
+  info.entry_type = entry_type;
+  info.compute_type = compute_type;
+  info.global_resource = memory_tree.getRootOf(*iab_node).memory_resource;
+  info.iab_mem_space = cast<StringAttr>(iab_node->memory_resource);
+  // The arch spec reserves bytes, but a view's offset counts entries; a
+  // partially reserved entry is unusable, so round up.
+  info.iab_base = llvm::divideCeil(iab_node->reserved_in_bytes.value_or(0),
+                                   *tryGetSizeInBytes(compute_type));
+
+  // The units sharing an enclosing group kind with the IAB are the ones that
+  // read it to perform the indirect load or store.
+  auto iab_parents = resource_kinds[iab_node->memory_resource].getParentKinds();
+  auto find_colocated = [&](auto has_feature) -> ktdf_arch::Resource {
+    for (const ktdf_arch::ResourceKinds::Kind& kind : resource_kinds) {
+      if (!has_feature(kind.getExemplar())) continue;
+      for (ktdf_arch::KindAttr parent : kind.getParentKinds())
+        if (iab_parents.count(parent)) return kind.getExemplar();
+    }
+    return nullptr;
+  };
+  info.load_unit = find_colocated([](ktdf_arch::Resource unit) {
+    return static_cast<bool>(unit.getFeature<ktdf_arch::feature::Load>());
+  });
+  info.store_unit = find_colocated([](ktdf_arch::Resource unit) {
+    return static_cast<bool>(unit.getFeature<ktdf_arch::feature::Store>());
+  });
+
+  if (auto mapping =
+          device->getAttrOfType<ktdf_arch::MapAttr>("mem_space_mapping"))
+    info.mem_space_map.insert_range(mapping);
+
+  return info;
 }
 
 /// Locates the orchestrator module, its function and every call that function
@@ -631,6 +681,61 @@ static FailureOr<DenseI32ArrayAttr> deriveIndAddrBufDimPositions(
   return DenseI32ArrayAttr::get(ctx, iab_dim_positions);
 }
 
+/// Returns the size in bytes of the word the unit performing
+/// @p indirect_op's transfer addresses @p memory_space in: the IAB-co-located
+/// load unit's for a gather, the store unit's for a scatter.  A tile that is
+/// both loaded and stored needs the two to agree, since the address buffer
+/// holds a single address per index.
+static FailureOr<int64_t> resolveWordSize(
+    ktdp::ConstructIndirectAccessTilesOp indirect_op, Attribute memory_space,
+    const AddressBufferInfo& layout) {
+  bool is_load = false, is_store = false;
+  for (Operation* user : indirect_op.getResult().getUsers()) {
+    is_load |= isa<ktdp::LoadOp>(user);
+    is_store |= isa<ktdp::StoreOp>(user);
+  }
+  if (!is_load && !is_store)
+    return indirect_op->emitError(
+        PASS_NAME
+        ": indirect access tile is neither loaded nor stored; cannot "
+        "determine the address granularity of the indirect transfer");
+
+  if (auto mapped = layout.mem_space_map.lookup(memory_space))
+    memory_space = mapped;
+
+  std::optional<int64_t> word_size;
+  auto add = [&](ktdf_arch::LoadStoreAttr feature,
+                 StringRef what) -> LogicalResult {
+    if (!feature)
+      return indirect_op->emitError(PASS_NAME ": no ")
+             << what
+             << " unit co-located with the IAB; cannot determine the address "
+                "granularity of the indirect transfer";
+    auto size = static_cast<int64_t>(feature.getWordSize(memory_space));
+    if (word_size && *word_size != size)
+      return indirect_op->emitError(PASS_NAME
+                                    ": the IAB's load and store units address ")
+             << memory_space << " in different word sizes (" << *word_size
+             << " and " << size << " bytes)";
+    word_size = size;
+    return success();
+  };
+  // Resource's accessors are not const-qualified, hence the copies.
+  ktdf_arch::Resource load_unit = layout.load_unit;
+  ktdf_arch::Resource store_unit = layout.store_unit;
+  if (is_load &&
+      failed(add(load_unit ? load_unit.getFeature<ktdf_arch::feature::Load>()
+                           : ktdf_arch::feature::Load(),
+                 "load")))
+    return failure();
+  if (is_store &&
+      failed(add(store_unit ? store_unit.getFeature<ktdf_arch::feature::Store>()
+                            : ktdf_arch::feature::Store(),
+                 "store")))
+    return failure();
+  return *word_size;
+}
+
 /// Determines the argument list buildIdxToAddrModule() must give the
 /// generated function: the distinct block arguments of @p idx_view's
 /// enclosing function that @p idx_view's operands, @p base_addr and
@@ -747,6 +852,33 @@ static FailureOr<SplitCandidate> analyzeCandidate(
       getMixedValues(base_view.getStaticStrides(), base_view.getStrides(),
                      indirect_op.getContext())[candidate.indir_dim];
 
+  // spyreop.idx32toaddr produces addresses in the words the indirect transfer
+  // addresses $base's memory space in, so base and stride are converted from
+  // elements to words.  A compile-time constant that is not a whole number of
+  // words is a compile error; a runtime value is assumed to be one.
+  std::optional<unsigned> elem_bytes = tryGetSizeInBytes(
+      cast<MemRefType>(base_view.getResult().getType()).getElementType());
+  if (!elem_bytes)
+    return candidate.func->emitError(
+        PASS_NAME
+        ": cannot determine the byte size of the $base view's element type");
+  candidate.elem_bytes = *elem_bytes;
+  FailureOr<int64_t> word_size =
+      resolveWordSize(indirect_op, base_view.getMemorySpace(), layout);
+  if (failed(word_size)) return failure();
+  candidate.word_size = *word_size;
+  for (auto [value, what] :
+       {std::pair<OpFoldResult, StringRef>{candidate.base_addr, "base address"},
+        {candidate.stride, "stride"}}) {
+    std::optional<int64_t> elems = getConstantIntValue(value);
+    if (elems && (*elems * candidate.elem_bytes) % candidate.word_size != 0)
+      return candidate.func->emitError(PASS_NAME ": ")
+             << what << " of the indirect access (" << *elems << " elements, "
+             << *elems * candidate.elem_bytes
+             << " bytes) is not a multiple of the " << candidate.word_size
+             << "-byte word the indirect transfer addresses memory in";
+  }
+
   candidate.call_site = orchestrator.getCallSite(candidate.func.getNameAttr());
 
   // The last check reads attributes and operand chains without cloning
@@ -767,6 +899,30 @@ static FailureOr<SplitCandidate> analyzeCandidate(
 // Rewrite step 1: building @<name>_idx_to_addr
 //===----------------------------------------------------------------------===//
 
+/// Converts @p elems, a count of @p elem_bytes-byte elements, into words of
+/// @p word_size bytes at @p builder's insertion point.  The ratio is reduced
+/// first, so f16 elements in 128-byte words take a single division by 64.  A
+/// constant folds to a constant.
+static Value convertElementsToWords(OpBuilder& builder, Location loc,
+                                    Value elems, int64_t elem_bytes,
+                                    int64_t word_size) {
+  const int64_t gcd = std::gcd(elem_bytes, word_size);
+  const int64_t mul = elem_bytes / gcd, div = word_size / gcd;
+  if (mul == 1 && div == 1) return elems;
+
+  if (std::optional<int64_t> value = getConstantIntValue(elems))
+    return arith::ConstantIndexOp::create(builder, loc, *value * mul / div);
+
+  Value words = elems;
+  if (mul != 1)
+    words = arith::MulIOp::create(
+        builder, loc, words, arith::ConstantIndexOp::create(builder, loc, mul));
+  if (div != 1)
+    words = arith::DivSIOp::create(
+        builder, loc, words, arith::ConstantIndexOp::create(builder, loc, div));
+  return words;
+}
+
 /// Builds the @<name>_idx_to_addr child module and inserts it just before
 /// @p child_module in their common top-level module.
 ///
@@ -777,8 +933,12 @@ static FailureOr<SplitCandidate> analyzeCandidate(
 ///     dependency chains from those parameters, cloning everything else
 ///     (constants, arith ops, ...) in wholesale
 ///   - loads the raw integer indices through the resulting clone of @p idx_view
-///   - turns them into flat absolute addresses with spyreop.idx32toaddr
-///   - stores those addresses into the address buffer at @p addr_buf_base
+///   - converts the base and stride from @p elem_bytes-byte elements into
+///     @p word_size-byte words
+///   - turns the indices into flat absolute word addresses with
+///     spyreop.idx32toaddr
+///   - stores those addresses into the address buffer at @p addr_buf_base,
+///     an offset in entries into global memory
 ///
 /// Returns the function's final symbol name, which the caller must hand to
 /// updateOrchestrator() so the call site names the same symbol.
@@ -787,10 +947,13 @@ static FailureOr<SplitCandidate> analyzeCandidate(
 /// the same @p idx_view, @p base_addr and @p stride_value — that is what
 /// leaves this step no failure path.  @p top_sym_table is the top-level
 /// module's, so it stays valid for subsequent candidates.
-static std::string buildIdxToAddrModule(
-    ModuleOp child_module, SymbolTable& top_sym_table,
-    ktdp::ConstructMemoryViewOp idx_view, Value base_addr, Value stride_value,
-    ArrayRef<Value> forwarded_args, size_t addr_buf_base, Type compute_type) {
+static std::string buildIdxToAddrModule(ModuleOp child_module,
+                                        SymbolTable& top_sym_table,
+                                        ktdp::ConstructMemoryViewOp idx_view,
+                                        Value base_addr, Value stride_value,
+                                        ArrayRef<Value> forwarded_args,
+                                        size_t addr_buf_base, Type compute_type,
+                                        int64_t elem_bytes, int64_t word_size) {
   auto func = idx_view->getParentOfType<func::FuncOp>();
   assert(func && "idx_view must be enclosed in a FuncOp");
   auto top = child_module->getParentOfType<ModuleOp>();
@@ -864,8 +1027,15 @@ static std::string buildIdxToAddrModule(
   materializeChain(stride_value);
   for (Value operand : idx_view->getOperands()) materializeChain(operand);
 
-  Value arg_base = mapper.lookupOrDefault(base_addr);
-  Value arg_stride = mapper.lookupOrDefault(stride_value);
+  // The element-unit base and stride stay alive until the clone of idx_view
+  // below, which may share their constants through `mapper`; whichever of them
+  // the word conversion leaves unused is dropped once that clone exists.
+  Value elem_base = mapper.lookupOrDefault(base_addr);
+  Value elem_stride = mapper.lookupOrDefault(stride_value);
+  Value arg_base =
+      convertElementsToWords(builder, loc, elem_base, elem_bytes, word_size);
+  Value arg_stride =
+      convertElementsToWords(builder, loc, elem_stride, elem_bytes, word_size);
 
   auto idx_view_clone =
       cast<ktdp::ConstructMemoryViewOp>(builder.clone(*idx_view, mapper));
@@ -873,6 +1043,12 @@ static std::string buildIdxToAddrModule(
       cast<MemRefType>(idx_view_clone.getResult().getType()).getShape();
   unsigned idx_rank = idx_shape.size();
   IntegerSet coordinate_set = idx_view_clone.getCoordinateSetAttr().getValue();
+
+  for (Value elems : {elem_base, elem_stride}) {
+    Operation* def = elems.getDefiningOp();
+    if (def && isa<arith::ConstantOp>(def) && def->use_empty()) def->erase();
+    if (elem_base == elem_stride) break;
+  }
 
   Value addr_buf_base_const = arith::ConstantIndexOp::create(
       builder, loc, static_cast<int64_t>(addr_buf_base));
@@ -889,7 +1065,8 @@ static std::string buildIdxToAddrModule(
   Value idx_tensor =
       ktdp::LoadOp::create(builder, loc, idx_tile, compute_type).getResult();
 
-  // addr = base + idx * stride, element-wise over the whole index tensor.
+  // addr = base + idx * stride, in words, element-wise over the whole index
+  // tensor.
   auto addr_tensor_type = RankedTensorType::get(idx_shape, compute_type);
   Value init = tensor::EmptyOp::create(builder, loc, addr_tensor_type,
                                        /*dynamicSizes=*/ValueRange{});
@@ -955,13 +1132,17 @@ static std::string buildIdxToAddrModule(
 ///     folded into every address by @<name>_idx_to_addr
 ///   - replace @p indirect_op with ktdp_lowering.construct_indirect_access_tile
 ///
+/// @p addr_buf_base is the address buffer's offset in global memory, and
+/// @p iab_base the IAB's first available entry; both count entries, but they
+/// live in different memories, so they are independent.
+///
 /// @p ind_addr_buf_dim_positions comes from deriveIndAddrBufDimPositions();
 /// deriving it up front is what leaves this step no failure path.
 static void rewriteGatherScatterModule(
     ktdp::ConstructIndirectAccessTilesOp indirect_op,
     ktdp::ConstructMemoryViewOp idx_view, size_t addr_buf_base,
     unsigned indir_dim, Type compute_type, StringAttr iab_mem_space,
-    DenseI32ArrayAttr ind_addr_buf_dim_positions) {
+    size_t iab_base, DenseI32ArrayAttr ind_addr_buf_dim_positions) {
   auto func = indirect_op->getParentOfType<func::FuncOp>();
   assert(func && "indirect_op must be enclosed in a FuncOp");
   MLIRContext* ctx = func.getContext();
@@ -983,6 +1164,8 @@ static void rewriteGatherScatterModule(
   OpBuilder builder(indirect_op);
   Value addr_buf_base_const = arith::ConstantIndexOp::create(
       builder, loc, static_cast<int64_t>(addr_buf_base));
+  Value iab_base_const = arith::ConstantIndexOp::create(
+      builder, loc, static_cast<int64_t>(iab_base));
 
   // The IAB view over the address buffer.  This uses
   // ktdp_lowering.construct_memory_view rather than the ktdp one because "IAB"
@@ -993,7 +1176,7 @@ static void rewriteGatherScatterModule(
       builder, loc,
       /*resultType=*/
       MemRefType::get(idx_shape, compute_type, nullptr, iab_mem_space),
-      /*offset=*/addr_buf_base_const,
+      /*offset=*/iab_base_const,
       /*sizes=*/ValueRange{},
       /*strides=*/ValueRange{},
       /*static_sizes=*/idx_view.getStaticSizes(),
@@ -1196,7 +1379,14 @@ static LogicalResult splitCandidate(const SplitCandidate& candidate,
            << reason;
   }
   LDBG(1) << "allocated " << size_bytes << " bytes for @" << func.getName()
-          << "'s address buffer at " << *addr_buf_base;
+          << "'s address buffer at byte " << *addr_buf_base;
+
+  // The tracker hands out byte addresses, but the address buffer's views take
+  // their offset in entries.  The allocation was aligned to an entry, so this
+  // divides exactly.
+  assert(*addr_buf_base % entry_bytes == 0 &&
+         "address buffer must be entry-aligned");
+  const size_t addr_buf_offset = *addr_buf_base / entry_bytes;
 
   // Extract or materialize the stride. candidate.stride may be either a Value
   // (already computed at runtime) or an Attribute (compile-time constant).
@@ -1217,12 +1407,13 @@ static LogicalResult splitCandidate(const SplitCandidate& candidate,
 
   std::string idx_to_addr_func_name = buildIdxToAddrModule(
       candidate.module, top_sym_table, candidate.idx_view, candidate.base_addr,
-      stride, candidate.forwarded_args, *addr_buf_base, addr_info.compute_type);
+      stride, candidate.forwarded_args, addr_buf_offset, addr_info.compute_type,
+      candidate.elem_bytes, candidate.word_size);
 
-  rewriteGatherScatterModule(candidate.indirect_op, candidate.idx_view,
-                             *addr_buf_base, candidate.indir_dim,
-                             addr_info.compute_type, addr_info.iab_mem_space,
-                             candidate.ind_addr_buf_dim_positions);
+  rewriteGatherScatterModule(
+      candidate.indirect_op, candidate.idx_view, addr_buf_offset,
+      candidate.indir_dim, addr_info.compute_type, addr_info.iab_mem_space,
+      addr_info.iab_base, candidate.ind_addr_buf_dim_positions);
 
   if (candidate.call_site)
     updateOrchestrator(*orchestrator.symbol_table, candidate.call_site, func,

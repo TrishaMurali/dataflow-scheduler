@@ -84,11 +84,21 @@ void StageCoarseningMaterializer::cloneStageBody(StageOp orig_stage) {
   Block* orig_body = orig_stage.getBody();
   for (Operation& op : *orig_body) {
     if (op.hasTrait<OpTrait::IsTerminator>()) continue;
-    // Check if this is a DataTransferOp and we have a clone handler
+    // Check if this is a DataTransferOp or IndDataTransferOp and we have a
+    // clone handler
     if (auto transfer_op = dyn_cast<ktdf::DataTransferOp>(&op)) {
       if (buffer_cloner_) {
         Operation* new_op = buffer_cloner_->cloneDataTransfer(
             transfer_op, builder_, value_map_);
+        if (new_op) {
+          // Cloner created a replacement operation, skip default cloning
+          continue;
+        }
+      }
+    } else if (auto ind_transfer_op = dyn_cast<ktdf::IndDataTransferOp>(&op)) {
+      if (buffer_cloner_) {
+        Operation* new_op = buffer_cloner_->cloneIndDataTransfer(
+            ind_transfer_op, builder_, value_map_);
         if (new_op) {
           // Cloner created a replacement operation, skip default cloning
           continue;

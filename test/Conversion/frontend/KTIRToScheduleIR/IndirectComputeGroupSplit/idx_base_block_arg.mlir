@@ -4,7 +4,7 @@
 // generated idx_to_addr function — idx_view's chain is unioned with
 // base/stride's chain, not treated specially.
 //
-// The data base (1000) and stride (64) here are compile-time constants, so
+// The data base (1024) and stride (64) here are compile-time constants, so
 // they are cloned directly into the function body; only the index memref's
 // %arg0 dependency is forwarded.
 //
@@ -27,8 +27,9 @@
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr
 // CHECK-SAME:        (%[[FIDXBASE:.*]]: index)
-// CHECK:           %[[FBASE:.*]] = arith.constant 1000 : index
-// CHECK:           %[[FSTRIDE:.*]] = arith.constant 64 : index
+// -- base and stride in 64-byte words: 1024 and 64 f16 elements
+// CHECK:           %[[FBASE:.*]] = arith.constant 32 : index
+// CHECK:           %[[FSTRIDE:.*]] = arith.constant 2 : index
 // CHECK:           ktdp.construct_memory_view %[[FIDXBASE]], sizes: [2, 32], strides: [32, 1]
 // CHECK:           linalg.generic
 // CHECK:             arith.index_castui %[[FBASE]] : index to i32
@@ -51,7 +52,7 @@
 #set2 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 
 module {
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     func.func @orchestrator(%arg0: index) attributes {grid = [1]} {
@@ -65,7 +66,7 @@ module {
     // The index memref's base address is %arg0 rather than a constant.
     func.func @local_schedule_0(%arg0: index) attributes {grid = [1]} {
       %c0     = arith.constant 0     : index
-      %c1000  = arith.constant 1000  : index
+      %c1024  = arith.constant 1024  : index
       %c10000 = arith.constant 10000 : index
 
       // Index memref: base = %arg0 (a function argument).
@@ -74,8 +75,8 @@ module {
         memory_space = #ktdp.memory_space<global>
       } : memref<2x32xsi32>
 
-      // Data memref: base = %c1000, indirect dimension D = 0.
-      %desc_1 = ktdp.construct_memory_view %c1000, sizes: [64, 2, 64], strides: [64, 4096, 1] {
+      // Data memref: base = %c1024, indirect dimension D = 0.
+      %desc_1 = ktdp.construct_memory_view %c1024, sizes: [64, 2, 64], strides: [64, 4096, 1] {
         coordinate_set = #set1,
         memory_space = #ktdp.memory_space<global>
       } : memref<64x2x64xf16>

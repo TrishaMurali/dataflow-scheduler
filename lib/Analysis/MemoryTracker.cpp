@@ -89,7 +89,7 @@ llvm::Expected<size_t> MemoryTracker::allocate(ResourceType memory_resource,
         "Allocation of %zu bytes (aligned to %zu) exceeds %s capacity "
         "(%zu bytes of capacity, %zu bytes already allocated)",
         size_in_bytes, alignment, resourceToString(memory_resource).c_str(),
-        capacity_it->second, current_address);
+        capacity_it->second, current_address - reserved_[memory_resource]);
   }
 
   // Update the next address

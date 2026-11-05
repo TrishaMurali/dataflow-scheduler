@@ -5,7 +5,7 @@
 // top-level symbol table (each idx_to_addr module must get its own name), the
 // orchestrator's symbol table (each needs its own forward declaration), the
 // orchestrator call-site map, and the memory tracker (each address buffer must
-// get its own address — 2x32 i32 entries = 256 bytes apart).
+// get its own address — 2x32 i32 entries = 64 entries, or 256 bytes, apart).
 //
 // RUN: dataflow-scheduler-opt --indirect-compute-group-split %s | FileCheck %s
 
@@ -20,14 +20,14 @@
 // CHECK:       func.func private @local_schedule_1_idx_to_addr()
 
 // Each group gets its own address buffer: the first at offset 0, the second one
-// 2*32*4 = 256 bytes further along.
+// 2*32 = 64 entries (256 bytes) further along.  View offsets count entries.
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         %[[BUF0:.*]] = arith.constant 0 : index
 // CHECK:         ktdp.construct_memory_view %[[BUF0]], sizes: [2, 32]
 // CHECK-SAME:      memref<2x32xi32
 
 // CHECK-LABEL: module @local_schedule_1_idx_to_addr
-// CHECK:         %[[BUF1:.*]] = arith.constant 256 : index
+// CHECK:         %[[BUF1:.*]] = arith.constant 64 : index
 // CHECK:         ktdp.construct_memory_view %[[BUF1]], sizes: [2, 32]
 // CHECK-SAME:      memref<2x32xi32
 
@@ -41,7 +41,7 @@
 #set2 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 1 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 
 module {
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     func.func @orchestrator() attributes {grid = [1]} {
@@ -57,14 +57,14 @@ module {
     func.func @local_schedule_0() attributes {grid = [1]} {
       %c0     = arith.constant 0     : index
       %c100   = arith.constant 100   : index
-      %c1000  = arith.constant 1000  : index
+      %c1024  = arith.constant 1024  : index
       %c10000 = arith.constant 10000 : index
 
       %desc_0 = ktdp.construct_memory_view %c100, sizes: [2, 32], strides: [32, 1] {
         coordinate_set = #set,
         memory_space = #ktdp.memory_space<global>
       } : memref<2x32xsi32>
-      %desc_1 = ktdp.construct_memory_view %c1000, sizes: [64, 2, 64], strides: [64, 4096, 1] {
+      %desc_1 = ktdp.construct_memory_view %c1024, sizes: [64, 2, 64], strides: [64, 4096, 1] {
         coordinate_set = #set1,
         memory_space = #ktdp.memory_space<global>
       } : memref<64x2x64xf16>
@@ -92,14 +92,14 @@ module {
     func.func @local_schedule_1() attributes {grid = [1]} {
       %c0     = arith.constant 0     : index
       %c200   = arith.constant 200   : index
-      %c2000  = arith.constant 2000  : index
+      %c2048  = arith.constant 2048  : index
       %c20000 = arith.constant 20000 : index
 
       %desc_0 = ktdp.construct_memory_view %c200, sizes: [2, 32], strides: [32, 1] {
         coordinate_set = #set,
         memory_space = #ktdp.memory_space<global>
       } : memref<2x32xsi32>
-      %desc_1 = ktdp.construct_memory_view %c2000, sizes: [64, 2, 64], strides: [64, 4096, 1] {
+      %desc_1 = ktdp.construct_memory_view %c2048, sizes: [64, 2, 64], strides: [64, 4096, 1] {
         coordinate_set = #set1,
         memory_space = #ktdp.memory_space<global>
       } : memref<64x2x64xf16>

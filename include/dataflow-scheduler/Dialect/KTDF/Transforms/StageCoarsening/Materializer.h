@@ -77,6 +77,22 @@ class BufferCloner {
   virtual ktdf::DataTransferOp cloneDataTransfer(
       ktdf::DataTransferOp orig_transfer, OpBuilder& builder,
       IRMapping& value_map) = 0;
+
+  /// Called when materializing an indirect data transfer operation.
+  /// The cloner can return a custom indirect transfer operation or nullptr to
+  /// use default cloning behavior.
+  ///
+  /// \param orig_transfer The original indirect data transfer operation
+  /// \param builder The builder positioned where the new transfer should be
+  /// created
+  /// \param value_map The current value mapping for SSA values
+  /// \return A new indirect data transfer operation, or nullptr to use default
+  /// behavior
+  virtual ktdf::IndDataTransferOp cloneIndDataTransfer(
+      ktdf::IndDataTransferOp orig_transfer, OpBuilder& builder,
+      IRMapping& value_map) {
+    return nullptr;
+  }
 };
 
 //===----------------------------------------------------------------------===//

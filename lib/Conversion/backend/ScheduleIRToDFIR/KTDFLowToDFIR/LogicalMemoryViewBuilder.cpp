@@ -605,7 +605,6 @@ mlir::LogicalResult replaceSourceBCasts(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
     llvm::DenseMap<mlir::Value, mlir::Value>& replacements,
-    const scheduler::arch_view::MemoryTree& memory_tree,
     mlir::OpBuilder& builder) {
   auto* ctx = pu.getContext();
 
@@ -651,28 +650,9 @@ mlir::LogicalResult replaceSourceBCasts(
 
     builder.setInsertionPoint(ucc);
 
-    // Address assignment works in bytes, while a register file is addressed in
-    // elements by the compute unit that reads it. Left in bytes, a register
-    // lands element_bytes registers further along than it should; a memory
-    // transfers reach keeps its bytes.
+    // Address assignment materializes the address in elements, which is what
+    // the view's start address counts.
     mlir::Value addr = ucc.getInputs()[0];
-    const auto element_bytes = *tryGetSizeInBytes(result_type.getElementType());
-    if (element_bytes > 1 &&
-        memory_tree.isBelowScratchPad(llvm::cast<ResourceType>(*ms))) {
-      mlir::IntegerAttr addr_bits;
-      if (auto* const addr_def = addr.getDefiningOp();
-          addr_def && mlir::m_Constant(&addr_bits).match(addr_def) &&
-          addr_bits.getType().isIndex()) {
-        addr = mlir::arith::ConstantIndexOp::create(
-            builder, ucc.getLoc(),
-            addr_bits.getValue().getZExtValue() / element_bytes);
-      } else {
-        auto divisor = mlir::arith::ConstantIndexOp::create(
-            builder, ucc.getLoc(), element_bytes);
-        addr =
-            mlir::arith::DivUIOp::create(builder, ucc.getLoc(), addr, divisor);
-      }
-    }
 
     auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
         builder, ucc.getLoc(), plain_type, from_unit, addr,
@@ -842,8 +822,8 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
       return mlir::failure();
 
     // Phase 3c: Source B casts.
-    if (mlir::failed(replaceSourceBCasts(pu, resolved_units, replacements,
-                                         memory_tree, builder)))
+    if (mlir::failed(
+            replaceSourceBCasts(pu, resolved_units, replacements, builder)))
       return mlir::failure();
 
     // Phase 3d: RAUW + type propagation.

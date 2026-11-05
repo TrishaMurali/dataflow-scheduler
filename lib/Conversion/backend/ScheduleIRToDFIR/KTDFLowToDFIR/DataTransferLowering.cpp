@@ -241,6 +241,17 @@ mlir::AffineMap foldStepIntoSubscripts(mlir::MLIRContext* context,
 ///   agen.composite_load_and_store ... <Indirect load/store>
 /// }
 ///
+/// When the fill is guarded by an scf.if that does not also enclose
+/// `indirect_transfer`, the self-sync only has to run when the fill does, so it
+/// is emitted at the end of the fill's block instead. E.g.
+/// scf.for {
+///   scf.if {
+///     agen.composite_load_and_store ... <IAB fill>
+///     <self-sync here>
+///   }
+///   agen.composite_indirect_load_and_store ...
+/// }
+///
 /// `fill_op` must be non-null; callers must only call this when a fill exists.
 /// The fill's ancestor blocks are collected once (O(depth)) and used as an
 /// O(1) membership test while walking up from `indirect_transfer` to find the
@@ -268,6 +279,12 @@ static void emitSelfSyncIndirect(
     cursor = cursor->getParentOp();
   }
 
+  // A guarded fill: sync right after it, inside the guard.
+  auto guard_if = mlir::dyn_cast<mlir::scf::IfOp>(fill_op->getParentOp());
+  if (guard_if && !guard_if->isAncestor(indirect_transfer)) {
+    insertion_op = fill_op->getBlock()->getTerminator();
+  }
+
   llvm::SmallVector<mlir::Value, 4> self_units(program_unit.getUnits().begin(),
                                                program_unit.getUnits().end());
   mlir::OpBuilder::InsertionGuard guard(rewriter);
@@ -278,6 +295,46 @@ static void emitSelfSyncIndirect(
       rewriter, loc, self_unit,
       /*dbgName=*/nullptr,
       /*wait_immediately_for_async_transfers=*/rewriter.getBoolAttr(true));
+}
+
+/// The ktdf.data_transfer that fills `iab_memref`, or null if there is none.
+///
+/// The fill and the indirect transfer need not name the IAB by the same SSA
+/// value: the logical memory view builder gives the IAB's reinterpret_cast /
+/// memref.cast chain (used by the indirect transfer) and its direct users (the
+/// fill) a view each. Both are views of the same IAB unit, so look through
+/// every view of `iab_memref`'s unit. This may match a fill of a different
+/// region of the unit, which only makes the self-sync more conservative.
+mlir::Operation* findIabFill(mlir::Value iab_memref) {
+  auto find_fill_of = [](mlir::Value view) -> mlir::Operation* {
+    for (mlir::Operation* user : view.getUsers()) {
+      auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(user);
+      if (transfer && transfer.getDestination() == view) {
+        return user;
+      }
+    }
+    return nullptr;
+  };
+  if (mlir::Operation* fill = find_fill_of(iab_memref)) {
+    return fill;
+  }
+
+  auto iab_view =
+      iab_memref.getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();
+  if (!iab_view) {
+    return nullptr;
+  }
+  for (mlir::Operation* sibling : iab_view.getFromUnit().getUsers()) {
+    auto other =
+        mlir::dyn_cast<mlir::dataflow::GetLogicalMemoryViewOp>(sibling);
+    if (!other || other == iab_view) {
+      continue;
+    }
+    if (mlir::Operation* fill = find_fill_of(other.getData())) {
+      return fill;
+    }
+  }
+  return nullptr;
 }
 
 /// Pattern to lower ktdf.ind_data_transfer to
@@ -532,15 +589,7 @@ struct LowerIndDataTransferPattern
     {
       mlir::Value iab_memref =
           is_gather ? op.getIndSrcMemref() : op.getIndDstMemref();
-      mlir::Operation* fill_op = nullptr;
-      for (mlir::Operation* user : iab_memref.getUsers()) {
-        if (auto dt = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(user)) {
-          if (dt.getDestination() == iab_memref) {
-            fill_op = user;
-            break;
-          }
-        }
-      }
+      mlir::Operation* fill_op = findIabFill(iab_memref);
       if (fill_op)
         emitSelfSyncIndirect(rewriter, loc, op, fill_op, program_unit,
                              components_);

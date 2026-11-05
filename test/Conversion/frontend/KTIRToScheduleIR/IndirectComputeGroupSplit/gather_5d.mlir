@@ -38,8 +38,9 @@
 // CHECK-LABEL: module @local_schedule_0_idx_to_addr
 // CHECK:         func.func @local_schedule_0_idx_to_addr()
 // -- base and stride constants
-// CHECK:           %[[FBASE:.*]] = arith.constant 2000 : index
-// CHECK:           %[[FSTRIDE:.*]] = arith.constant 512 : index
+// -- base and stride in 64-byte words: 2048 and 512 f16 elements
+// CHECK:           %[[FBASE:.*]] = arith.constant 64 : index
+// CHECK:           %[[FSTRIDE:.*]] = arith.constant 16 : index
 // -- 5D index memref CMV
 // CHECK:           ktdp.construct_memory_view {{.*}}, sizes: [2, 4, 3, 2, 8], strides: [192, 48, 16, 8, 1]
 // CHECK-SAME:        memory_space = #ktdp.memory_space<global>
@@ -114,7 +115,7 @@
    d6 >= 0, -d6 + 31 >= 0)>
 
 module {
-  ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
   module {
     // Orchestrator child module (no sym_name).
@@ -130,7 +131,7 @@ module {
     func.func @local_schedule_0() attributes {grid = [1]} {
       %c0    = arith.constant 0     : index
       %c100  = arith.constant 100   : index
-      %c2000 = arith.constant 2000  : index
+      %c2048 = arith.constant 2048  : index
       %c20000 = arith.constant 20000 : index
 
       // Index memref: 2×4×3×2×8 si32
@@ -144,7 +145,7 @@ module {
       // Data memref: 128×16×32 f16
       // Indirect dimension D = 0 (stride[0] = 512)
       // Static strides: [512, 32, 1]
-      %data_desc = ktdp.construct_memory_view %c2000,
+      %data_desc = ktdp.construct_memory_view %c2048,
         sizes: [128, 16, 32], strides: [512, 32, 1] {
         coordinate_set = #set_3d_data,
         memory_space = #ktdp.memory_space<global>

@@ -294,6 +294,10 @@ def AddressAssignmentPass : Pass<"address-assignment", "mlir::ModuleOp"> {
     This pass collects all memref.alloc operations in the module and groups
     them by memory space (L1, DDR), analyses their sizes and assigns addresses.
 
+    Capacity and reservation are tracked in bytes, but the address an
+    allocation is replaced with counts elements of its element type, matching
+    the offset of `ktdp.construct_memory_view`. Each allocation is aligned to
+    at least one element so the conversion is exact.
   }];
 
   let constructor = "::scheduler::createAddressAssignmentPass()";

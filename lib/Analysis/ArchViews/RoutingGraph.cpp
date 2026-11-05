@@ -50,6 +50,11 @@ struct DeviceInitContext {
   // Value: Size in bytes
   llvm::DenseMap<RoutingGraph::NodeId, size_t> node_sizes;
 
+  // Collects memory node reserved bytes to apply after traversal
+  // Key: NodeId of memory node
+  // Value: Reserved bytes
+  llvm::DenseMap<RoutingGraph::NodeId, size_t> node_reserved;
+
   explicit DeviceInitContext(RoutingGraph& g) : graph(g) {}
 };
 
@@ -68,6 +73,7 @@ void processMemoryOp(mlir::ktdf_arch::MemoryOp mem_op, DeviceInitContext& ctx) {
       ctx.node_sizes[node_id] = int_attr.getValue().getSExtValue();
     }
   }
+  ctx.node_reserved[node_id] = mem_op.getFirstAvailableAddress();
 }
 
 // Process an execution unit operation
@@ -224,7 +230,7 @@ void RoutingGraph::initialize() {
   // Apply node sizes collected during traversal
   for (const auto& [node_id, size] : ctx.node_sizes) {
     nodes_[node_id].total_capacity_in_bytes = size;
-    nodes_[node_id].total_reserved_in_bytes = 0;
+    nodes_[node_id].total_reserved_in_bytes = ctx.node_reserved.lookup(node_id);
   }
 }
 

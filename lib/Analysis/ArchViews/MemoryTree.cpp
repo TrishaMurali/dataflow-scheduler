@@ -56,14 +56,11 @@ void MemoryTree::initialize() {
         assert(kind && "Memory operation must have a kind attribute");
 
         std::optional<size_t> capacity;
-        std::optional<size_t> reserved;
-
-        if (auto size_attr = mem_op.getSizeAttr()) {
-          if (auto int_attr = mlir::dyn_cast<mlir::IntegerAttr>(size_attr)) {
-            capacity = int_attr.getValue().getSExtValue();
-            reserved = 0;
-          }
+        if (auto size = mem_op.getSize()) {
+          capacity = size->getSExtValue();
         }
+        // Bytes at the start of the memory the scheduler must not use.
+        std::optional<size_t> reserved = mem_op.getFirstAvailableAddress();
 
         NodeId node_id = addNode(kind, capacity, reserved);
         value_to_node[mem_op.getResult()] = node_id;
