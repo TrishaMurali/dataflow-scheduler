@@ -86,19 +86,6 @@ auto isUsedInRegion(Value value, Region& region) -> bool {
 
 }  // namespace
 
-/// Name of the discardable attribute marking a transfer that extracts a
-/// narrower slice from a wider FIFO slot.  `TransferMode` has no case for it.
-static constexpr StringLiteral kExtractTransferAttrName = "transfer_extract";
-
-void mlir::ktdf::markExtractTransfer(ktdf::DataTransferOp transfer) {
-  transfer->setDiscardableAttr(kExtractTransferAttrName,
-                               UnitAttr::get(transfer->getContext()));
-}
-
-auto mlir::ktdf::isExtractTransfer(ktdf::DataTransferOp transfer) -> bool {
-  return transfer->hasAttr(kExtractTransferAttrName);
-}
-
 auto mlir::ktdf::setInnermostStaticSourceSize(RewriterBase& rewriter,
                                               ktdf::DataTransferOp transfer,
                                               int64_t size) -> bool {

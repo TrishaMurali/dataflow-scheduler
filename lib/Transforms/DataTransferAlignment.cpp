@@ -36,6 +36,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
+#include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
@@ -1121,7 +1122,7 @@ static std::pair<mlir::Value, mlir::Value> findRowColIVs(mlir::Operation* op) {
 }
 
 /// Replaces `op` with a new DataTransferOp sized [1,1,1,1]. `mode` is "splat"
-/// (TransferMode::Splat), "extract" (marked with markExtractTransfer) or empty
+/// (TransferMode::Splat), "extract" (TransferMode::Extract) or empty
 /// for plain FIFO→memref. The two innermost indices on any ct_local memref
 /// operand are replaced with the row and column IVs from the nested scf.for
 /// loops inserted by insertLoopAroundPipeline, giving direct [0, 0, %row, %col]
@@ -1178,8 +1179,9 @@ static void rewriteTransferShrink(
   auto new_op = replaceTransfer(op, t, builder,
                                 mode == "splat"
                                     ? mlir::ktdf::TransferMode::Splat
+                                : mode == "extract"
+                                    ? mlir::ktdf::TransferMode::Extract
                                     : op.getTransferMode());
-  if (mode == "extract") mlir::ktdf::markExtractTransfer(new_op);
 
   LDBG(1) << "  rewriteTransferShrink(" << mode
           << "): alignment_factor=" << pa.alignment_factor << ": " << new_op;

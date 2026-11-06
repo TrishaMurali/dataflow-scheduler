@@ -26,9 +26,9 @@
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
-#include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Mapping.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
+#include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
@@ -701,9 +701,11 @@ struct LowerDataTransferPattern
     // For splat/pad transfers the source is smaller than the destination —
     // the hardware replicates or zero-pads to fill the vector. Skip the
     // equality check and use the destination size as the transfer width.
+    // An extract is the reverse: the destination is the narrower slice.
     const auto transfer_mode = data_transfer_op.getTransferMode();
-    const bool is_extract = mlir::ktdf::isExtractTransfer(data_transfer_op);
-    if (transfer_mode != mlir::ktdf::TransferMode::Copy &&
+    const bool is_extract =
+        transfer_mode == mlir::ktdf::TransferMode::Extract;
+    if (!is_extract && transfer_mode != mlir::ktdf::TransferMode::Copy &&
         src_total_elements > dst_total_elements) {
       data_transfer_op.emitError(
           "source total elements must not exceed destination for "
@@ -711,10 +713,18 @@ struct LowerDataTransferPattern
       return mlir::failure();
     }
     // Only a load into a FIFO can splat or pad.
-    if (transfer_mode != mlir::ktdf::TransferMode::Copy &&
+    if (!is_extract && transfer_mode != mlir::ktdf::TransferMode::Copy &&
         transfer_type != DataTransferType::kLoadAndSend) {
       data_transfer_op.emitError(
           "splat/pad transfer must load from memory into a FIFO");
+      return mlir::failure();
+    }
+    // Only a receive from a FIFO can extract.
+    if (is_extract && (transfer_type != DataTransferType::kReceiveAndStore ||
+                       dst_total_elements > src_total_elements)) {
+      data_transfer_op.emitError(
+          "extract transfer must receive from a FIFO into a memref no "
+          "larger than the FIFO slot");
       return mlir::failure();
     }
 
@@ -1036,6 +1046,8 @@ struct LowerDataTransferPattern
             rewriter, data_transfer_op.getLoc(), send_value,
             vector_type.getNumElements());
         break;
+      case mlir::ktdf::TransferMode::Extract:
+        llvm_unreachable("extract is rejected for load-and-send above");
       case mlir::ktdf::TransferMode::ZeroPadBack:
       case mlir::ktdf::TransferMode::ZeroPadFront:
         send_value = scheduler::emitZeroPadShuffle(

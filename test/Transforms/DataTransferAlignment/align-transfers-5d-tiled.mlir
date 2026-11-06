@@ -26,7 +26,7 @@
 // CHECK:                  }
 // CHECK:                  ktdf.stage
 // CHECK:                  ktdf.stage {{.*}} {
-// CHECK:                    ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[%[[ARG8]], %[[ARG9]], %{{.*}}, %{{.*}}, %{{.*}}, %[[ARG11]], %[[ARG10]]] size [1, 1, 1, 1, 1, 1, 1] {transfer_extract}
+// CHECK:                    ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[%[[ARG8]], %[[ARG9]], %{{.*}}, %{{.*}}, %{{.*}}, %[[ARG11]], %[[ARG10]]] size [1, 1, 1, 1, 1, 1, 1] {transfer_mode = #ktdf.transfer_mode<extract>}
 // CHECK:                  }
 // CHECK:                }
 // CHECK:              }
