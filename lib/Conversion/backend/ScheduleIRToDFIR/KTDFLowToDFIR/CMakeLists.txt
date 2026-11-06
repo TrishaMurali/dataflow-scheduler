@@ -24,6 +24,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
 
   LINK_LIBS PUBLIC
     KTIR::KtdpDialect
+    KTIR::SpyreOpDialect
     DataflowSchedulerDialects::AgenDialect
     DataflowScheduler::ConversionUtils
     DataflowSchedulerDialects::DataflowDialect

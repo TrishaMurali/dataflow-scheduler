@@ -33,6 +33,7 @@
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
+#include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -234,6 +235,9 @@ struct LowerLinalgGenericPattern
                 rewriter.moveOpBefore(op, generic_op);
                 return mlir::success();
               })
+              .Case<mlir::spyreop::Identity>([&](mlir::spyreop::Identity op) {
+                return lowerIdentity(op, rewriter, identity_map);
+              })
               .Case<mlir::memref::StoreOp>([&](mlir::memref::StoreOp op) {
                 return lowerMemRefStore(op, rewriter);
               })
@@ -355,6 +359,9 @@ struct LowerLinalgGenericPattern
               })
               .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
                 return lowerSelectOp(op, rewriter);
+              })
+              .Case<mlir::spyreop::Identity>([&](mlir::spyreop::Identity op) {
+                return lowerIdentity(op, rewriter, identity_map);
               })
               .Case<mlir::memref::StoreOp>([&](mlir::memref::StoreOp op) {
                 return lowerMemRefStore(op, rewriter);
@@ -504,6 +511,33 @@ struct LowerLinalgGenericPattern
     return RegisterAccess{mlir::AffineMap::getMultiDimIdentityMap(rank, ctx),
                           buildIntegerSetFromSizes(ctx, type.getShape()),
                           mlir::AffineMap::getMultiDimIdentityMap(rank, ctx)};
+  }
+
+  /// Lowers spyreop.identity to an OR with zero, which passes every bit
+  /// through. Using vectorchain.binary as it has no folder, so the OR stays.
+  /// The OR is done on the value's own type. It is bitwise, so it reads a
+  /// float's bits as they are rather than converting them.
+  mlir::LogicalResult lowerIdentity(mlir::spyreop::Identity op,
+                                    mlir::PatternRewriter& rewriter,
+                                    mlir::AffineMap identity_map) const {
+    mlir::Value input = op.getInput();
+    const auto shaped = llvm::dyn_cast<mlir::ShapedType>(input.getType());
+    if (!shaped) {
+      // Still the body's scalar: the driver comes back once the block
+      // argument it reads has been replaced by a vector.
+      return mlir::failure();
+    }
+    const auto vector_type = getFlattenedVectorType(shaped);
+    if (!vector_type) return mlir::failure();
+
+    auto zero = mlir::arith::ConstantOp::create(
+        rewriter, op.getLoc(), vector_type, rewriter.getZeroAttr(vector_type));
+    auto binary_op = mlir::vectorchain::BinaryOp::create(
+        rewriter, op.getLoc(), vector_type, input, zero,
+        /*mask=*/nullptr, /*dbgName=*/nullptr,
+        mlir::vectorchain::VectorChainBinaryOperator::or0, identity_map);
+    rewriter.replaceOp(op, binary_op.getData());
+    return mlir::success();
   }
 
   // Unified helper: lowers any two-operand arith float op to
