@@ -1,4 +1,4 @@
-// RUN: dataflow-scheduler-opt --mlir-print-local-scope --indirect-addr-buf-legalization %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --mlir-print-local-scope --indirect-addr-buf-legalization %s | FileCheck %s --implicit-check-not=parallel_loop
 
 // Scatter case: the source-data load and compute precede the addr_buf fill,
 // so the block-move boundary for the window loop starts from the source
@@ -61,7 +61,7 @@
 // CHECK-SAME:          -> !ktdp.access_tile<2x64xindex>
 // CHECK:           ktdp.store {{.*}} tensor<2x64xf16>, <2x64xindex>
 // CHECK:         }
-// CHECK:       } {loop_type = #ktdf.loop_type<parallel_loop>}
+// CHECK:       }
 
 #set  = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0)>
 #set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0)>

@@ -345,16 +345,16 @@ materializeWindowLoops(mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
         mlir::arith::ConstantIndexOp::create(builder, loc, N).getResult();
     mlir::Value c1 =
         mlir::arith::ConstantIndexOp::create(builder, loc, 1).getResult();
+    // Cannot mark any of these new loops parallel: a window loop only exists
+    // because the address tensor is larger than the IAB, so every iteration
+    // refills the same fixed-size IAB. Each iteration's fill and reads must
+    // therefore complete before the next iteration's fill, which rules out
+    // reordering (e.g. tiling it inside the entry loop).
     auto for_op = mlir::scf::ForOp::create(builder, loc, c0, cN, c1);
-
-    // Annotate with loop_type = parallel_loop.
-    auto parallel_attr =
-        mlir::ktdf::LoopTypeAttr::get(ctx, mlir::ktdf::LoopType::ParallelLoop);
-    for_op->setAttr("loop_type", parallel_attr);
     window_ivs.push_back(for_op.getInductionVar());
 
-    LDBG(1) << "  emitted parallel scf.for for window k=" << k
-            << " trip_count=" << N << " at " << for_op.getLoc();
+    LDBG(1) << "  emitted scf.for for window k=" << k << " trip_count=" << N
+            << " at " << for_op.getLoc();
 
     mlir::Block* dst_block = for_op.getBody();
 

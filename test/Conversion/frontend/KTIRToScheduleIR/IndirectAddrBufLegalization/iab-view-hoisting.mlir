@@ -1,4 +1,4 @@
-// RUN: dataflow-scheduler-opt --mlir-print-local-scope --indirect-addr-buf-legalization %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --mlir-print-local-scope --indirect-addr-buf-legalization %s | FileCheck %s --implicit-check-not=parallel_loop
 
 // IAB view hoisting: verifies that the ind_addr_buf memref view is a pure
 // descriptor hoisted above the entire window/entry loop nest (constructed
@@ -45,7 +45,7 @@
 // CHECK-SAME:       -> !ktdp.access_tile<1x1x2x64xindex>
 // CHECK:          ktdp.store {{.*}} tensor<1x1x2x64xf16>, <1x1x2x64xindex>
 // CHECK:        }
-// CHECK:      } {loop_type = #ktdf.loop_type<parallel_loop>}
+// CHECK:      }
 
 #set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 #set2 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0)>

@@ -1,4 +1,4 @@
-// RUN: dataflow-scheduler-opt --mlir-print-local-scope --indirect-addr-buf-legalization %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --mlir-print-local-scope --indirect-addr-buf-legalization %s | FileCheck %s --implicit-check-not=parallel_loop
 
 // W=2 scatter case: the IAB is 3-D (3×2×32), so two window loops are needed.
 // The source-data load and compute precede the addr_buf fill (scatter order).
@@ -64,8 +64,8 @@
 // CHECK-SAME:            -> !ktdp.access_tile<2x64xindex>
 // CHECK:             ktdp.store {{.*}} tensor<2x64xf16>, <2x64xindex>
 // CHECK:           }
-// CHECK:         } {loop_type = #ktdf.loop_type<parallel_loop>}
-// CHECK:       } {loop_type = #ktdf.loop_type<parallel_loop>}
+// CHECK:         }
+// CHECK:       }
 
 // Affine sets for a 3-D IAB (3×2×32).
 // #set_ab: coordinate set for the 3×2×32 global addr_buf.
