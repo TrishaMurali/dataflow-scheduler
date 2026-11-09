@@ -95,7 +95,6 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // whether an indirect address buffer fill is on a memory its unit can read.
   pm.addPass(createIndirectAddrBufFillLegalizationPass());
   pm.addPass(createAccessGranularityLegalizationPass());
-  pm.addPass(createSplatLegalizationPass());
   pm.addPass(createNormalizeSCFForLoopsPass());
   // Canonicalize to get rid of intervening code and single iteration loops
   pm.addPass(mlir::createCanonicalizerPass());
@@ -108,6 +107,9 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // Canonicalize before data-transfer-alignment to fold trivial arith ops
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(createDataTransferAlignmentPass());
+  // Data transfer alignment emits the splat and extract transfers that need
+  // legalizing, alongside any that path expansion placed.
+  pm.addPass(createSplatLegalizationPass());
   pm.addPass(mlir::ktdf::createReductionDimChunkingPass());
   pm.addPass(mlir::ktdf::createSplitReductionInnerOuterDimPass());
   pm.addPass(mlir::ktdf::createReductionLoopExposurePass());
