@@ -1003,6 +1003,21 @@ static bool needsExpansion(llvm::ArrayRef<DataFlow> flows,
   return false;
 }
 
+/// Return true if some stage of \p sorted_stages was given an applicable unit
+/// by \p plan that its `applicable_units` attribute does not hold yet.
+static bool hasUnrecordedStageUnits(llvm::ArrayRef<StageNode*> sorted_stages,
+                                    const PathExpansionPlan& plan) {
+  return llvm::any_of(sorted_stages, [&](StageNode* stage) {
+    const std::optional<ResourceType>& unit =
+        plan.getStageInfo(stage).applicable_unit;
+    if (!unit) return false;
+    mlir::ArrayAttr recorded =
+        mlir::cast<mlir::ktdf::StageOp>(stage->getOperation())
+            .getApplicableUnitsAttr();
+    return !recorded || !llvm::is_contained(recorded.getValue(), *unit);
+  });
+}
+
 //===----------------------------------------------------------------------===//
 // Step 1: Add Stages Along Each Path
 //===----------------------------------------------------------------------===//
@@ -2063,8 +2078,12 @@ std::unique_ptr<PathExpansionPlan> planPathExpansion(
     return nullptr;
   }
 
-  // PREP 5: Check whether path expansion is needed
-  if (!needsExpansion(flows, arch_graph)) {
+  // PREP 5: Check whether path expansion is needed. A pipeline with no units
+  // attribute to stages still will be rewritten, so that the newly generated
+  // stages has correct units attribute. Also destination of fifos will be
+  // updated to units that run in each end, i.e. from L1 to L1LU/L1SU.
+  if (!needsExpansion(flows, arch_graph) &&
+      !hasUnrecordedStageUnits(sorted_stages, *plan)) {
     plan->changed = false;
     LDBG(1) << "Pipeline already legal";
     return plan;
