@@ -210,34 +210,6 @@ static std::optional<AccessInfo> getAccessInfo(
                                                          resource_kinds);
 }
 
-/// Returns true if the unit enclosing `op` has a SIMD feature with splat
-/// capability declared in the arch spec.
-static bool canSplat(mlir::Operation* op,
-                     const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
-  auto kind = getUnitKind(op);
-  if (!kind) return false;
-  auto simd = resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(kind);
-  return simd && simd.canSplat();
-}
-
-/// Returns true if the unit enclosing `op` has a Store feature with a 2-byte
-/// access_granularity entry for ct_local, meaning it supports extract stores.
-static bool canExtract(mlir::Operation* op,
-                       const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
-  auto kind = getUnitKind(op);
-  if (!kind) return false;
-  auto space =
-      mlir::cast<mlir::MemRefType>(
-          mlir::cast<mlir::ktdf::DataTransferOp>(op).getDestination().getType())
-          .getMemorySpace();
-  auto info = accessInfoFrom<mlir::ktdf_arch::feature::Store>(kind, space,
-                                                              resource_kinds);
-  if (!info || !info->granularities) return false;
-  return llvm::any_of(info->granularities, [&](auto entry) {
-    return entry.getSizeInWords() * info->word_bytes == 2;
-  });
-}
-
 /// True if the unit running `dt` can address single elements of its memref
 /// operand, i.e. it can swap strides itself. DMA-style block units cannot.
 static bool isElementAddressable(
@@ -564,10 +536,10 @@ static void widenTransfer(mlir::ktdf::DataTransferOp op,
 /// Turns an element-addressable FIFO transfer into a scalar splat / extract of
 /// the widened staging buffer. The splat load applies the stride swap, reading
 /// at [.., col, .., row]; the extract store keeps natural order [.., row, .., col].
+/// Whether the unit supports splat is left to the SplatLegalization pass.
 static void scalarizeTransfer(
     mlir::ktdf::DataTransferOp op, const TransferStep& step,
     std::pair<mlir::Value, mlir::Value> row_col,
-    const mlir::ktdf_arch::ResourceKinds& resource_kinds,
     const scheduler::arch_view::MemoryTree& memory_tree,
     mlir::OpBuilder& builder) {
   bool to_fifo = op.isSourceMemRef() && op.isDestFifo();
@@ -576,11 +548,8 @@ static void scalarizeTransfer(
   mlir::Value memref = to_fifo ? op.getSource() : op.getDestination();
   if (!isPerCoreScratchpad(memref, memory_tree)) return;
 
-  std::optional<mlir::ktdf::TransferMode> mode;
-  if (to_fifo && !canSplat(op, resource_kinds)) return;
-  if (to_fifo) mode = mlir::ktdf::TransferMode::Splat;
-  if (from_fifo && canExtract(op, resource_kinds))
-    mode = mlir::ktdf::TransferMode::Extract;
+  mlir::ktdf::TransferMode mode = to_fifo ? mlir::ktdf::TransferMode::Splat
+                                          : mlir::ktdf::TransferMode::Extract;
 
   Access src = sourceAccess(op), dst = destAccess(op);
   Access& mem = to_fifo ? src : dst;
@@ -667,8 +636,7 @@ static mlir::LogicalResult alignTransferStep(
     if (owner == pipeline) continue;
     auto [it, inserted] = element_loops.try_emplace(owner.getOperation());
     if (inserted) it->second = wrapInElementLoops(owner, innermost_size, builder);
-    scalarizeTransfer(dt, step, it->second, resource_kinds, memory_tree,
-                      builder);
+    scalarizeTransfer(dt, step, it->second, memory_tree, builder);
   }
 
   // Transfers were rewritten against the old layout; fix the views last.
