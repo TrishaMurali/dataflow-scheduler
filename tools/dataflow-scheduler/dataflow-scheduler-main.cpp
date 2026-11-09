@@ -28,6 +28,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchDialect.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/Process.h"
@@ -95,6 +96,9 @@ auto getDeviceName(const std::filesystem::path& path) -> StringRef {
   // Device specs may reference #ktdp.memory_space<...> in memory `kind`
   // attributes, so the ktdp dialect must be available when parsing the file.
   registry.insert<mlir::ktdp::KtdpDialect>();
+  // Device specs may also reference spyreop attributes, such as
+  // #spyreop.compare_predicate<...>.
+  registry.insert<mlir::spyreop::SpyreOpDialect>();
   // A device's patterns may match an attribute the scheduler's own ops carry,
   // such as #ktdf.splat<...>, which is only an attribute here if ktdf is too.
   registry.insert<ktdf::KTDFDialect>();

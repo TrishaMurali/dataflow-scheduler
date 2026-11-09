@@ -30,10 +30,12 @@
 #include <mlir/Tools/mlir-opt/MlirOptMain.h>
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchDialect.h"
 #include "dataflow-scheduler/Pipeline.h"
 #include "dataflow-scheduler/RegisterEverything.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
 using namespace mlir;
 
@@ -77,6 +79,14 @@ auto main(int argc, char** argv) -> int {
   scheduler::registerDialects(registry);
   registerAllExtensions(registry);
   scheduler::registerExtensions(registry);
+  // Device files can use spyreop attributes, such as
+  // #spyreop.compare_predicate<...>.  A device is only read once a pass is
+  // already running, and MLIR cannot load a new dialect at that point, so load
+  // spyreop as soon as ktdf_arch is loaded, while the input is still parsed.
+  registry.addExtension(
+      +[](MLIRContext* context, ktdf_arch::KTDFArchDialect*) {
+        context->getOrLoadDialect<spyreop::SpyreOpDialect>();
+      });
 
   return asMainReturnCode(MlirOptMain(
       argc, argv, "DataflowScheduler modular optimizer driver\n", registry));

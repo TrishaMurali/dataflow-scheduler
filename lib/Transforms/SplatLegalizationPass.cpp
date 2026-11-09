@@ -48,6 +48,7 @@
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -98,6 +99,57 @@ static mlir::LogicalResult validateSplatCapability(
   return mlir::success();
 }
 
+/// Check that the source buffer of @p transfer is big enough for a load of
+/// @p load_elements along its innermost dimension, counting from where the
+/// load starts.  When the start index is not a constant, the check assumes the
+/// load starts at 0, which only catches a buffer that is too small for any
+/// start.  Emits an error and fails when the load would run off the end.
+static mlir::LogicalResult checkSourceFitsWiderLoad(
+    mlir::ktdf::DataTransferOp transfer, int64_t load_elements) {
+  auto src_type = mlir::cast<mlir::MemRefType>(transfer.getSource().getType());
+  if (src_type.getRank() == 0) return mlir::success();
+
+  // A dynamic size cannot be checked here, so give it the benefit of the doubt.
+  const int64_t inner_size = src_type.getShape().back();
+  if (mlir::ShapedType::isDynamic(inner_size)) return mlir::success();
+
+  // Work out where the load starts along the innermost dimension.  The start
+  // is either an index operand or, when a map is present, the map's last
+  // result applied to the index operands.  Only a start that folds to a
+  // constant is used.
+  int64_t start = 0;
+  auto indices = transfer.getSourceIndices();
+  if (auto map = transfer.getSourceMap()) {
+    if (map->getNumResults() > 0) {
+      llvm::SmallVector<mlir::Attribute> operands;
+      for (mlir::Value index : indices) {
+        auto constant = mlir::getConstantIntValue(index);
+        operands.push_back(
+            constant ? mlir::IntegerAttr::get(index.getType(), *constant)
+                     : mlir::Attribute{});
+      }
+      llvm::SmallVector<mlir::Attribute> results;
+      if (mlir::succeeded(map->getSliceMap(map->getNumResults() - 1, 1)
+                              .constantFold(operands, results)) &&
+          !results.empty()) {
+        if (auto constant = mlir::dyn_cast<mlir::IntegerAttr>(results.front()))
+          start = constant.getInt();
+      }
+    }
+  } else if (!indices.empty()) {
+    if (auto constant = mlir::getConstantIntValue(indices.back()))
+      start = *constant;
+  }
+
+  if (start + load_elements <= inner_size) return mlir::success();
+  return transfer.emitError()
+         << "splat-legalization: the hardware loads " << load_elements
+         << " elements for this splat, but its source buffer has only "
+         << inner_size - start
+         << " element(s) from where the load starts. Make the source buffer "
+            "big enough for a load of that size.";
+}
+
 /// Legalize `transfer`'s load to the arch's access granularity and name, on
 /// every read of it, the shuffle that finishes the splat.  A no-op when the
 /// granularity is no wider than the source, i.e. when the hardware can splat
@@ -127,6 +179,13 @@ mlir::LogicalResult legalizeSplatTransfer(
 
   LDBG(1) << "legalizing splat load from " << src_elements << " to "
           << load_elements << " elements for " << transfer;
+
+  // The wider load reads past the element the splat asked for, so make sure
+  // the source buffer really has that many elements from where the load
+  // starts.  Nothing resizes the buffer here: the extra elements are only read,
+  // never used, but they still have to exist.
+  if (mlir::failed(checkSourceFitsWiderLoad(transfer, load_elements)))
+    return mlir::failure();
 
   // The size operand carries the load width, so the lowering pass reads it
   // straight off the transfer and no extra attribute is needed for it.

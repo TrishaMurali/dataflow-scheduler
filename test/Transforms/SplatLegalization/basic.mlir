@@ -47,7 +47,7 @@ ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<"
 
 module {
   func.func @splat_f32(%alloc_a: memref<1x1x32xf32, "L1">,
-                       %alloc_b: memref<1x1x1xf32, "L1">) {
+                       %alloc_b: memref<1x1x2xf32, "L1">) {
     %out = tensor.empty() : tensor<1x1x32xf32>
     ktdf.pipeline {
       %slots:5 = ktdf.private -> (
@@ -74,10 +74,11 @@ module {
         ktdf.data_transfer from %alloc_a[0, 0, 0] size [1, 1, 32]
                            to %slots#0 size [32]
             : memref<1x1x32xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
+        // The buffer holds 2 elements so the wider load stays inside it.
         ktdf.data_transfer from %alloc_b[0, 0, 0] size [1, 1, 1]
                            to %slots#1 size [32]
                            {transfer_mode = #ktdf.transfer_mode<splat>}
-            : memref<1x1x1xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
+            : memref<1x1x2xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
       } {applicable_units = ["L1LU"]}
       // Compute stage.
       ktdf.stage depends_in(%slots#3) depends_out(%slots#4) {

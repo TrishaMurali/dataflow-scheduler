@@ -38,6 +38,10 @@
 //      slot accordingly.
 //   3. Skips transfers with dynamic sizes, non-memref sources (FIFO-to-memref),
 //      and stages with no unambiguous load unit (no applicable_units).
+//   4. Skips splat transfers.  A splat's source size says how many elements
+//      the program wants copied, and splat-legalization needs that number to
+//      tell whether the hardware will load more than was asked for.  Widening
+//      it here would hide that, so splat-legalization widens splats itself.
 //
 // Notes on scope:
 //   - Only load (read) widening is handled here; write widening requires
@@ -185,13 +189,18 @@ static mlir::LogicalResult widenTransfer(mlir::RewriterBase& rewriter,
 }
 
 /// Inspect @p transfer and widen it to the load unit's access granularity if
-/// required.  Non-load transfers (source is a FIFO) and transfers with dynamic
-/// sizes are skipped silently.
+/// required.  Non-load transfers (source is a FIFO), splat transfers and
+/// transfers with dynamic sizes are skipped silently.
 static mlir::LogicalResult legalizeTransfer(
     mlir::RewriterBase& rewriter, mlir::ktdf::DataTransferOp transfer,
     const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
   // Only loads (memref source) are handled here.
   if (!transfer.isSourceMemRef()) return mlir::success();
+
+  // Leave splats to splat-legalization.  It has to see how many elements the
+  // splat really asked for, and widening the source here would overwrite that.
+  if (transfer.getTransferMode() == mlir::ktdf::TransferMode::Splat)
+    return mlir::success();
 
   auto static_src_sizes = transfer.getStaticSourceSizesArray();
   if (!static_src_sizes || static_src_sizes->empty()) return mlir::success();

@@ -64,3 +64,31 @@ module {
     return
   }
 }
+
+// ---------------------------------------------------------------------------
+// f32 splat: left alone.  The same load would widen from 1 to 2 if it were not
+// a splat, but splat-legalization has to see that only one element was asked
+// for, so the source keeps size [1, 1, 1].
+// ---------------------------------------------------------------------------
+// CHECK-LABEL: func.func @skip_splat_f32
+// CHECK: ktdf.data_transfer from %{{.*}}[0, 0, 0] size [1, 1, 1] to %{{.*}} size [32]
+// CHECK-SAME:   transfer_mode = #ktdf.transfer_mode<splat>
+// CHECK-SAME:   : memref<1x1x1xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
+
+module {
+  func.func @skip_splat_f32(%src: memref<1x1x1xf32, "L1">) {
+    ktdf.pipeline {
+      %p:2 = ktdf.private -> (!ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>, !ktdf.token) {
+        %slot = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
+        %t = ktdf.create_token : !ktdf.token
+        ktdf.private_yield %slot, %t : !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>, !ktdf.token
+      }
+      ktdf.stage depends_in(none) depends_out(%p#1) {
+        ktdf.data_transfer from %src[0, 0, 0] size [1, 1, 1] to %p#0 size [32]
+            {transfer_mode = #ktdf.transfer_mode<splat>}
+            : memref<1x1x1xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
+      } {applicable_units = ["L1LU"]}
+    }
+    return
+  }
+}
