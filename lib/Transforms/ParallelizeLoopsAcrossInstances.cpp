@@ -299,6 +299,27 @@ std::optional<Candidate> findCandidate(
                    trip,     balance_status, std::move(applicable_groups)};
 }
 
+/// Returns true if @p inner would distribute its loop over groups that the
+/// loop of @p outer, which encloses @p inner's pipeline, already distributes
+/// over.
+///
+/// Each group instance can run only one share of the iterations. If a loop
+/// is split across the groups and a loop nested inside it is split across
+/// those same groups again, the two splits compete for the same instances,
+/// and only the shares where both pick the same instance get any hardware to
+/// run on. Nesting across different groups (e.g. one level per core and one
+/// per corelet inside it) has no such conflict and is allowed.
+[[nodiscard]] auto distributesOverSameGroups(const Candidate& outer,
+                                             const Candidate& inner) -> bool {
+  if (!outer.loop->isAncestor(inner.pipeline)) {
+    return false;
+  }
+  return llvm::any_of(inner.applicable_groups,
+                      [&](mlir::ktdf_arch::GroupOp group) {
+                        return outer.applicable_groups.contains(group);
+                      });
+}
+
 //===----------------------------------------------------------------------===//
 // Transformation
 //===----------------------------------------------------------------------===//
@@ -376,13 +397,27 @@ struct ParallelizeLoopsAcrossInstancesPass
         device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
 
     // Pre-order walk over pipelines. Collect candidates first, then rewrite,
-    // so the walk's iterator is not invalidated by op erasure.
+    // so the walk's iterator is not invalidated by op erasure. Pre-order
+    // visits an outer pipeline before the pipelines nested in its stages, so
+    // when two candidates would distribute over the same groups, the outer
+    // one is kept (see distributesOverSameGroups).
     llvm::SmallVector<Candidate> candidates;
     module_op.walk<mlir::WalkOrder::PreOrder>(
         [&](mlir::ktdf::PipelineOp pipeline) {
-          if (auto c = findCandidate(pipeline, resource_kinds)) {
-            candidates.push_back(*c);
+          auto c = findCandidate(pipeline, resource_kinds);
+          if (!c) return;
+          const Candidate* outer =
+              llvm::find_if(candidates, [&](const Candidate& accepted) {
+                return distributesOverSameGroups(accepted, *c);
+              });
+          if (outer != candidates.end()) {
+            mlir::scf::ForOp outer_loop = outer->loop;
+            LDBG(1) << " skip pipeline at " << pipeline.getLoc()
+                    << ": enclosing loop at " << outer_loop.getLoc()
+                    << " is already distributed over the same groups";
+            return;
           }
+          candidates.push_back(*c);
         });
 
     for (const Candidate& c : candidates) {
