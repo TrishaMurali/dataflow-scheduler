@@ -650,8 +650,6 @@ struct DataTransferAlignmentPass
     : public scheduler::impl::DataTransferAlignmentPassBase<
           DataTransferAlignmentPass> {
   void runOnOperation() override {
-    llvm::errs() << "[" PASS_NAME "] running on: " << getOperation()->getName()
-                 << "\n";
     LDBG(1) << "========= " PASS_NAME " =========";
 
     auto& device_manager = getAnalysis<mlir::ktdf_arch::DeviceManager>();
