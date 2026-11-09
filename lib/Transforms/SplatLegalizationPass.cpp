@@ -150,6 +150,19 @@ static mlir::LogicalResult checkSourceFitsWiderLoad(
             "big enough for a load of that size.";
 }
 
+/// Validate that @p transfer's store unit declares extract capability.
+static mlir::LogicalResult validateExtractCapability(
+    mlir::ktdf::DataTransferOp transfer,
+    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+  const auto simd = resource_kinds.getFeature<mlir::ktdf_arch::feature::SIMD>(
+      resolveLoadUnitKind(transfer));
+  if (!simd || !simd.canExtract())
+    return transfer.emitError(
+        "extract data_transfer requires the store unit to declare "
+        "ktdf_arch.feature.simd = { extract, ... }");
+  return mlir::success();
+}
+
 /// Legalize `transfer`'s load to the arch's access granularity and name, on
 /// every read of it, the shuffle that finishes the splat.  A no-op when the
 /// granularity is no wider than the source, i.e. when the hardware can splat
@@ -228,11 +241,22 @@ struct SplatLegalizationPass
         device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
 
     llvm::SmallVector<mlir::ktdf::DataTransferOp> splats;
+    llvm::SmallVector<mlir::ktdf::DataTransferOp> extracts;
     module_op.walk([&](mlir::ktdf::DataTransferOp transfer) {
       if (transfer.isDestFifo() &&
           transfer.getTransferMode() == mlir::ktdf::TransferMode::Splat)
         splats.push_back(transfer);
+      else if (transfer.isSourceFifo() &&
+               transfer.getTransferMode() == mlir::ktdf::TransferMode::Extract)
+        extracts.push_back(transfer);
     });
+
+    for (auto transfer : extracts) {
+      if (mlir::failed(validateExtractCapability(transfer, resource_kinds))) {
+        signalPassFailure();
+        return;
+      }
+    }
 
     mlir::IRRewriter rewriter(&getContext());
     for (auto transfer : splats) {

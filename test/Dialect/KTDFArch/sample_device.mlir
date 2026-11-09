@@ -105,11 +105,12 @@
     ktdf_arch.feature.store = {
       access_granularity = #ktdf_arch.map<
         "L1" = [
-          {size_in_words = 64, align_in_words = 64}, 
+          {size_in_words = 64, align_in_words = 64},
           {size_in_words = 2, align_in_words = 2}
         ]
       >
-    }
+    },
+    ktdf_arch.feature.simd = { extract }
   }
 }
 #L1SU_CORE_FIFO = {
