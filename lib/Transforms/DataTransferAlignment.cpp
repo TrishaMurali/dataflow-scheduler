@@ -562,7 +562,8 @@ static void widenTransfer(mlir::ktdf::DataTransferOp op,
 }
 
 /// Turns an element-addressable FIFO transfer into a scalar splat / extract of
-/// the widened staging buffer at [.., col, .., row], i.e. the stride swap.
+/// the widened staging buffer. The splat load applies the stride swap, reading
+/// at [.., col, .., row]; the extract store keeps natural order [.., row, .., col].
 static void scalarizeTransfer(
     mlir::ktdf::DataTransferOp op, const TransferStep& step,
     std::pair<mlir::Value, mlir::Value> row_col,
@@ -592,8 +593,9 @@ static void scalarizeTransfer(
     mem.indices.resize(
         rank, mlir::arith::ConstantIndexOp::create(builder, op.getLoc(), 0)
                   .getResult());
-  mem.indices[widenedDim(step.permutation, rank)] = row_col.second;
-  mem.indices[rank - 1] = row_col.first;
+  auto [row, col] = row_col;
+  mem.indices[widenedDim(step.permutation, rank)] = to_fifo ? col : row;
+  mem.indices[rank - 1] = to_fifo ? row : col;
   mem.map = mlir::AffineMap::getMultiDimIdentityMap(rank, op->getContext());
 
   rewriteTransfer(op, src, dst, mode, builder);
