@@ -710,17 +710,80 @@ std::pair<mlir::Value, mlir::Value> wrapInElementLoops(
   return {row_loop.getInductionVar(), col_loop.getInductionVar()};
 }
 
-/// Legalizes all global transfer chains of `pipeline`. The first strided input
-/// chain fixes the contiguous dim and alignment factor; every chain shares that
-/// factor and the pipeline's loops, but each input decides for itself whether
-/// its splat swaps strides (strided input) or keeps natural order (row-major).
+/// Aligns and legalizes a single transfer chain.
+mlir::LogicalResult alignTransferChain(
+    mlir::ktdf::PipelineOp pipeline, const TransferChain& chain,
+    llvm::ArrayRef<int64_t> perm, int64_t factor, int64_t dim,
+    int64_t innermost_size, const mlir::ktdf_arch::ResourceKinds& resource_kinds,
+    const scheduler::arch_view::MemoryTree& memory_tree,
+    llvm::DenseMap<mlir::Operation*, std::pair<mlir::Value, mlir::Value>>&
+        element_loops,
+    mlir::OpBuilder& builder) {
+  // Shrink the loops walking `dim` (for input chains).
+  if (chain.is_input) {
+    mlir::Value tile = tileSizeOfDim(chain.hops.front(), dim);
+    for (mlir::scf::ForOp loop :
+         collectTargetLoops(pipeline, innermost_size, tile)) {
+      if (mlir::failed(shrinkLoop(loop, factor, builder))) {
+        return mlir::failure();
+      }
+    }
+  }
+
+  // Widen the staging buffers of this chain.
+  llvm::SetVector<mlir::Value> staging_buffers;
+  for (mlir::ktdf::DataTransferOp transfer : chain.hops) {
+    for (mlir::Value operand :
+         {transfer.getSource(), transfer.getDestination()}) {
+      if (isPerCoreScratchpad(operand, memory_tree)) {
+        staging_buffers.insert(operand);
+      }
+    }
+  }
+  for (mlir::Value buffer : staging_buffers) {
+    if (mlir::failed(
+            widenStagingAlloc(buffer, pipeline, perm, factor, builder))) {
+      return mlir::failure();
+    }
+  }
+
+  // Rewrite each transfer. Block units just move wider blocks. Element
+  // units become scalar splat / extract inside element loops.
+  for (mlir::ktdf::DataTransferOp transfer : chain.hops) {
+    if (!isElementAddressable(transfer, resource_kinds)) {
+      widenTransfer(transfer, perm, factor, builder);
+      continue;
+    }
+    // Transfers of the outer pipeline do not touch a compute FIFO.
+    auto nested = transfer->getParentOfType<mlir::ktdf::PipelineOp>();
+    if (nested == pipeline) {
+      continue;
+    }
+    // Wrap nested pipeline once in element loops.
+    auto [it, first_use] = element_loops.try_emplace(nested.getOperation());
+    if (first_use) {
+      it->second = wrapInElementLoops(nested, innermost_size, builder);
+    }
+    scalarizeTransfer(transfer, perm, chain.needsStrideSwap(), it->second,
+                      memory_tree, builder);
+  }
+
+  // Rewrite the strided global view to row-major order.
+  if (!memrefPermutation(chain.global).empty()) {
+    rewriteToMemoryOrder(chain.global);
+  }
+  return mlir::success();
+}
+
+/// Legalizes all global transfer chains of `pipeline` by aligning each chain
+/// one at a time.
 mlir::LogicalResult alignTransferChains(
     mlir::ktdf::PipelineOp pipeline, llvm::ArrayRef<TransferChain> chains,
     const mlir::ktdf_arch::ResourceKinds& resource_kinds,
     const scheduler::arch_view::MemoryTree& memory_tree,
     mlir::OpBuilder& builder) {
-  //  The first strided input defines the alignment. If every global is
-  //    already in memory order there is nothing to do.
+  // The first strided input defines the alignment. If every global is
+  // already in memory order there is nothing to do.
   const TransferChain* strided = llvm::find_if(
       chains, [](const TransferChain& chain) { return chain.needsStrideSwap(); });
   if (strided == chains.end()) {
@@ -736,8 +799,8 @@ mlir::LogicalResult alignTransferChains(
   const int64_t dim = cdim->first;              // logical dim with stride 1
   const int64_t innermost_size = cdim->second;  // its extent in the global
 
-  //  A single widening must serve every strided global, so they must all
-  //    have their unit stride on the same dim.
+  // A single widening must serve every strided global, so they must all
+  // have their unit stride on the same dim.
   for (const TransferChain& chain : chains) {
     if (!chain.permutation.empty() && chain.permutation.back() != perm.back()) {
       return chain.hops.front()->emitError()
@@ -746,98 +809,26 @@ mlir::LogicalResult alignTransferChains(
     }
   }
 
-  // Alignment factor of an input chain: how many of its original transfers
-  //    along `dim` fit in one contiguous block of the global.
-  auto alignmentFactor =
-      [&](const TransferChain& chain) -> mlir::FailureOr<int64_t> {
-    mlir::ktdf::DataTransferOp first = chain.hops.front();
-    auto sizes = first.getStaticSourceSizesArray();
-    if (!sizes || static_cast<size_t>(dim) >= sizes->size()) {
-      return first->emitError() << PASS_NAME ": static sizes are required";
-    }
-    return innermost_size / std::max<int64_t>(1, (*sizes)[dim]);
-  };
-  mlir::FailureOr<int64_t> strided_factor = alignmentFactor(*strided);
-  if (mlir::failed(strided_factor)) {
-    return mlir::failure();
+  // Alignment factor: how many original transfers along `dim` fit in one
+  // contiguous block of the global.
+  mlir::ktdf::DataTransferOp first = strided->hops.front();
+  auto sizes = first.getStaticSourceSizesArray();
+  if (!sizes || static_cast<size_t>(dim) >= sizes->size()) {
+    return first->emitError() << PASS_NAME ": static sizes are required";
   }
-  const int64_t factor = *strided_factor;
+  const int64_t factor = innermost_size / std::max<int64_t>(1, (*sizes)[dim]);
   if (factor <= 1) {
     return mlir::success();
   }
 
-  // Shrink the loops walking `dim`. The loops are shared, so every input
-  // must agree on the factor.
-  llvm::SetVector<mlir::scf::ForOp> loops;
-  for (const TransferChain& chain : chains) {
-    if (!chain.is_input) {
-      continue;
-    }
-    mlir::FailureOr<int64_t> chain_factor = alignmentFactor(chain);
-    if (mlir::failed(chain_factor)) {
-      return mlir::failure();
-    }
-    if (*chain_factor != factor) {
-      return chain.hops.front()->emitError()
-             << PASS_NAME ": inputs of one pipeline must share the same "
-                          "alignment factor";
-    }
-    mlir::Value tile = tileSizeOfDim(chain.hops.front(), dim);
-    loops.insert_range(collectTargetLoops(pipeline, innermost_size, tile));
-  }
-  for (mlir::scf::ForOp loop : loops) {
-    if (mlir::failed(shrinkLoop(loop, factor, builder))) {
-      return mlir::failure();
-    }
-  }
-
-  // Widen the staging buffers of every chain.
-  llvm::SetVector<mlir::Value> staging_buffers;
-  for (const TransferChain& chain : chains) {
-    for (mlir::ktdf::DataTransferOp transfer : chain.hops) {
-      for (mlir::Value operand : {transfer.getSource(), transfer.getDestination()}) {
-        if (isPerCoreScratchpad(operand, memory_tree)) {
-          staging_buffers.insert(operand);
-        }
-      }
-    }
-  }
-  for (mlir::Value buffer : staging_buffers) {
-    if (mlir::failed(widenStagingAlloc(buffer, pipeline, perm, factor, builder))) {
-      return mlir::failure();
-    }
-  }
-
-  // Rewrite each transfer. Block units just move wider blocks. Element
-  //    units become scalar splat / extract inside element loops, where only
-  //    strided inputs swap {row, col}.
+  // Align each transfer chain one at a time.
   llvm::DenseMap<mlir::Operation*, std::pair<mlir::Value, mlir::Value>>
-      element_loops;  // nested pipeline -> its {row, col} induction variables
+      element_loops;
   for (const TransferChain& chain : chains) {
-    for (mlir::ktdf::DataTransferOp transfer : chain.hops) {
-      if (!isElementAddressable(transfer, resource_kinds)) {
-        widenTransfer(transfer, perm, factor, builder);
-        continue;
-      }
-      // Transfers of the outer pipeline do not touch a compute FIFO.
-      auto nested = transfer->getParentOfType<mlir::ktdf::PipelineOp>();
-      if (nested == pipeline) {
-        continue;
-      }
-      // Wrap each nested pipeline once, however many chains pass through it.
-      auto [it, first_use] = element_loops.try_emplace(nested.getOperation());
-      if (first_use) {
-        it->second = wrapInElementLoops(nested, innermost_size, builder);
-      }
-      scalarizeTransfer(transfer, perm, chain.needsStrideSwap(), it->second,
-                        memory_tree, builder);
-    }
-  }
-
-  // Rewrite the strided global views to row-major order.
-  for (const TransferChain& chain : chains) {
-    if (!memrefPermutation(chain.global).empty()) {
-      rewriteToMemoryOrder(chain.global);
+    if (mlir::failed(alignTransferChain(pipeline, chain, perm, factor, dim,
+                                        innermost_size, resource_kinds,
+                                        memory_tree, element_loops, builder))) {
+      return mlir::failure();
     }
   }
   return mlir::success();
