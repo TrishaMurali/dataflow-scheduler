@@ -107,10 +107,15 @@ struct Access {
   }
 };
 
-/// Index and size of the contiguous (unit-stride) dim of `memref`; failure if
-/// there is none or its size is dynamic. Size-1 dims are skipped
-mlir::FailureOr<std::pair<int64_t, int64_t>> contiguousDim(
-    mlir::MemRefType memref) {
+/// The contiguous (unit-stride) dim of a memref.
+struct ContiguousDim {
+  int64_t dim;   // logical dim with stride 1
+  int64_t size;  // its extent
+};
+
+/// The contiguous (unit-stride) dim of `memref`; failure if there is none or
+/// its size is dynamic. Size-1 dims are skipped.
+mlir::FailureOr<ContiguousDim> contiguousDim(mlir::MemRefType memref) {
   llvm::SmallVector<int64_t> strides;
   int64_t offset;
   if (mlir::failed(memref.getStridesAndOffset(strides, offset))) {
@@ -119,7 +124,7 @@ mlir::FailureOr<std::pair<int64_t, int64_t>> contiguousDim(
   for (auto [idx, p] : llvm::enumerate(llvm::zip(strides, memref.getShape()))) {
     auto [stride, size] = p;
     if (stride == 1 && size != 1 && !mlir::ShapedType::isDynamic(size)) {
-      return std::pair{static_cast<int64_t>(idx), size};
+      return ContiguousDim{static_cast<int64_t>(idx), size};
     }
   }
   return mlir::failure();
@@ -500,7 +505,8 @@ mlir::LogicalResult widenStagingAlloc(mlir::Value val,
   }
   shape[dim] *= factor;
 
-  // Reallocate the staging buffer with updated shape and update private result type.
+  // Reallocate the staging buffer with the updated shape and update the
+  // private result type.
   auto new_type = mlir::MemRefType::get(shape, type.getElementType(),
                                         mlir::MemRefLayoutAttrInterface{},
                                         type.getMemorySpace());
@@ -571,7 +577,8 @@ void rewriteToMemoryOrder(mlir::Value val) {
     strides[i] = strides[i + 1] * shape[i + 1];
   }
 
-  // Update construct_memory_view attributes and propagate new layout downstream.
+  // Update construct_memory_view attributes and propagate the new layout
+  // downstream.
   construct.setStaticStridesAttr(mlir::DenseI64ArrayAttr::get(ctx, strides));
   construct.setStaticSizesAttr(mlir::DenseI64ArrayAttr::get(ctx, shape));
   construct.getResult().setType(mlir::MemRefType::get(
@@ -621,7 +628,8 @@ void widenAccess(mlir::Value memref, Access& access,
     return;
   }
 
-  // Strided global operand: reorder access map and sizes into memory order before scaling.
+  // Strided global operand: reorder access map and sizes into memory order
+  // before scaling.
   llvm::SmallVector<unsigned> order(own.begin(), own.end());
   access.map = mlir::AffineMap::getPermutationMap(order, builder.getContext())
                    .compose(access.map);
@@ -674,7 +682,8 @@ void scalarizeTransfer(
   mlir::OpFoldResult one = builder.getIndexAttr(1);
   llvm::fill(mem.sizes, one);
 
-  // Swap strides on strided-input splat loads [.., col, .., row]; keep natural order otherwise [.., row, .., col].
+  // Swap strides on strided-input splat loads [.., col, .., row]; keep natural
+  // order otherwise [.., row, .., col].
   size_t rank = mlir::cast<mlir::MemRefType>(memref.getType()).getRank();
   builder.setInsertionPoint(op);
   if (mem.indices.size() < rank) {
@@ -710,15 +719,34 @@ std::pair<mlir::Value, mlir::Value> wrapInElementLoops(
   return {row_loop.getInductionVar(), col_loop.getInductionVar()};
 }
 
+/// {row, col} induction variables of the element loops already created,
+/// keyed by the pipeline they wrap.
+using ElementLoopMap =
+    llvm::DenseMap<mlir::Operation*, std::pair<mlir::Value, mlir::Value>>;
+
+/// Per-core staging buffers touched by the hops of `chain`, in discovery order.
+llvm::SetVector<mlir::Value> collectStagingBuffers(
+    const TransferChain& chain,
+    const scheduler::arch_view::MemoryTree& memory_tree) {
+  llvm::SetVector<mlir::Value> staging_buffers;
+  for (mlir::ktdf::DataTransferOp transfer : chain.hops) {
+    for (mlir::Value operand :
+         {transfer.getSource(), transfer.getDestination()}) {
+      if (isPerCoreScratchpad(operand, memory_tree)) {
+        staging_buffers.insert(operand);
+      }
+    }
+  }
+  return staging_buffers;
+}
+
 /// Aligns and legalizes a single transfer chain.
 mlir::LogicalResult alignTransferChain(
     mlir::ktdf::PipelineOp pipeline, const TransferChain& chain,
     llvm::ArrayRef<int64_t> perm, int64_t factor, int64_t dim,
     int64_t innermost_size, const mlir::ktdf_arch::ResourceKinds& resource_kinds,
     const scheduler::arch_view::MemoryTree& memory_tree,
-    llvm::DenseMap<mlir::Operation*, std::pair<mlir::Value, mlir::Value>>&
-        element_loops,
-    mlir::OpBuilder& builder) {
+    ElementLoopMap& element_loops, mlir::OpBuilder& builder) {
   // Shrink the loops walking `dim` (for input chains).
   if (chain.is_input) {
     mlir::Value tile = tileSizeOfDim(chain.hops.front(), dim);
@@ -731,16 +759,7 @@ mlir::LogicalResult alignTransferChain(
   }
 
   // Widen the staging buffers of this chain.
-  llvm::SetVector<mlir::Value> staging_buffers;
-  for (mlir::ktdf::DataTransferOp transfer : chain.hops) {
-    for (mlir::Value operand :
-         {transfer.getSource(), transfer.getDestination()}) {
-      if (isPerCoreScratchpad(operand, memory_tree)) {
-        staging_buffers.insert(operand);
-      }
-    }
-  }
-  for (mlir::Value buffer : staging_buffers) {
+  for (mlir::Value buffer : collectStagingBuffers(chain, memory_tree)) {
     if (mlir::failed(
             widenStagingAlloc(buffer, pipeline, perm, factor, builder))) {
       return mlir::failure();
@@ -769,7 +788,7 @@ mlir::LogicalResult alignTransferChain(
   }
 
   // Rewrite the strided global view to row-major order.
-  if (!memrefPermutation(chain.global).empty()) {
+  if (!chain.permutation.empty()) {
     rewriteToMemoryOrder(chain.global);
   }
   return mlir::success();
@@ -796,8 +815,8 @@ mlir::LogicalResult alignTransferChains(
   if (mlir::failed(cdim)) {
     return mlir::success();
   }
-  const int64_t dim = cdim->first;              // logical dim with stride 1
-  const int64_t innermost_size = cdim->second;  // its extent in the global
+  const int64_t dim = cdim->dim;
+  const int64_t innermost_size = cdim->size;
 
   // A single widening must serve every strided global, so they must all
   // have their unit stride on the same dim.
@@ -822,8 +841,7 @@ mlir::LogicalResult alignTransferChains(
   }
 
   // Align each transfer chain one at a time.
-  llvm::DenseMap<mlir::Operation*, std::pair<mlir::Value, mlir::Value>>
-      element_loops;
+  ElementLoopMap element_loops;
   for (const TransferChain& chain : chains) {
     if (mlir::failed(alignTransferChain(pipeline, chain, perm, factor, dim,
                                         innermost_size, resource_kinds,
