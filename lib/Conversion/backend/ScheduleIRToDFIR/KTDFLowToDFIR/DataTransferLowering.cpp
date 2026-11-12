@@ -26,9 +26,9 @@
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Mapping.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/ResourceKinds.h"
-#include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
 #include "dataflow-scheduler/Dialect/VectorChain/VectorChain.h"
@@ -703,8 +703,7 @@ struct LowerDataTransferPattern
     // equality check and use the destination size as the transfer width.
     // An extract is the reverse: the destination is the narrower slice.
     const auto transfer_mode = data_transfer_op.getTransferMode();
-    const bool is_extract =
-        transfer_mode == mlir::ktdf::TransferMode::Extract;
+    const bool is_extract = transfer_mode == mlir::ktdf::TransferMode::Extract;
     if (!is_extract && transfer_mode != mlir::ktdf::TransferMode::Copy &&
         src_total_elements > dst_total_elements) {
       data_transfer_op.emitError(
@@ -1083,8 +1082,7 @@ struct LowerDataTransferPattern
       mlir::ktdf::DataTransferOp data_transfer_op, mlir::Value dst_memref,
       mlir::ValueRange dst_indices, llvm::ArrayRef<int64_t> dst_static_sizes,
       unsigned num_dims, mlir::VectorType vector_type, mlir::AffineMap dst_map,
-      mlir::ktdf::FifoSlotType src_fifo_slot_type,
-      bool is_extract = false,
+      mlir::ktdf::FifoSlotType src_fifo_slot_type, bool is_extract = false,
       int64_t dst_total_elements = 0) const {
     // Build store_set from destination sizes
     auto store_set =
